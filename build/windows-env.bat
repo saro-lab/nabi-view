@@ -3,6 +3,7 @@ rem Called inside the launcher's SETLOCAL: never change the user's saved PATH.
 rem Prefer PATH tools, then common installs, then this checkout's local tools.
 call :add_tool cmake "%ProgramFiles%\CMake\bin"
 call :add_tool cmake "%LocalAppData%\Programs\CMake\bin"
+for /d %%D in ("%~dp0..\ai\runtime\cmake-*") do call :add_tool cmake "%%~fD\bin"
 call :add_tool perl "%ProgramFiles%\Git\usr\bin"
 call :add_tool perl "%LocalAppData%\Programs\Git\usr\bin"
 for /f "delims=" %%G in ('where git.exe 2^>nul') do call :add_tool perl "%%~dpG..\usr\bin"

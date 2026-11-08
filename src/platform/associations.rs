@@ -113,6 +113,11 @@ fn is_default(ext: &str) -> Option<bool> {
 }
 #[cfg(windows)]
 fn connect(_: &str) -> Result<(), String> {
+    // MSIX owns the association registrations and removes them on uninstall.
+    // Do not register a version-specific WindowsApps executable in HKCU.
+    if has_package_identity()? {
+        return open_default_apps("ms-settings:defaultapps");
+    }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let open = format!("\"{}\" \"%1\"", exe.display());
     let root = "HKCU\\Software\\Classes\\NabiView.Image";
@@ -187,6 +192,25 @@ fn connect(_: &str) -> Result<(), String> {
             "/f",
         ],
     )?;
+    open_default_apps("ms-settings:defaultapps?registeredAppUser=NABI%20VIEW")
+}
+
+#[cfg(windows)]
+fn has_package_identity() -> Result<bool, String> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentPackageFullName(length: *mut u32, name: *mut u16) -> i32;
+    }
+    let mut length = 0;
+    match unsafe { GetCurrentPackageFullName(&mut length, std::ptr::null_mut()) } {
+        0 | 122 => Ok(true), // ERROR_INSUFFICIENT_BUFFER: identity exists.
+        15700 => Ok(false),  // APPMODEL_ERROR_NO_PACKAGE: portable build.
+        error => Err(format!("Could not query Windows package identity: {error}")),
+    }
+}
+
+#[cfg(windows)]
+fn open_default_apps(uri: &str) -> Result<(), String> {
     #[link(name = "shell32")]
     unsafe extern "system" {
         fn ShellExecuteW(
@@ -198,9 +222,7 @@ fn connect(_: &str) -> Result<(), String> {
             show: i32,
         ) -> isize;
     }
-    let uri: Vec<u16> = "ms-settings:defaultapps?registeredAppUser=Nabi%20View\0"
-        .encode_utf16()
-        .collect();
+    let uri: Vec<u16> = uri.encode_utf16().chain(Some(0)).collect();
     let result = unsafe {
         ShellExecuteW(
             0,
