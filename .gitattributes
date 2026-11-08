@@ -1,0 +1,5 @@
+# POSIX scripts must remain runnable after a Windows checkout.
+*.sh text eol=lf
+*.bat text eol=crlf
+# Keep recorded upstream license hashes stable on Windows checkouts.
+licenses/upstream/** text eol=lf

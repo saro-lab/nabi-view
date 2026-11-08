@@ -1,0 +1,64 @@
+# Rust build output (including nested local test projects)
+target/
+/dist/
+
+# OS and local editor state
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+
+# Private AI workspace (ignore both a directory and a symlink/junction)
+/ai
+/docs
+/assets/icons/README.md
+/AGENTS.md
+/AGENTS.override.md
+/CLAUDE.md
+/CLAUDE.local.md
+/GEMINI.md
+/QWEN.md
+/CODEX.md
+/COPILOT.md
+/.aider*
+/.cursorrules
+/.cursorignore
+/.windsurfrules
+/.mcp.json
+/opencode.json
+/opencode.jsonc
+/.github/copilot-instructions.md
+/.github/instructions
+/.github/prompts
+/.claude
+/.cursor
+/.gemini
+/.qwen
+/.windsurf
+/.opencode
+/.roo
+/.kilocode
+/.continue
+/.junie
+/.codex
+/.agents
+
+# Generated local environments and artwork
+/tmp/img/
+/generated_images/
+**/runtime/
+**/.runtime/
+**/.venv/
+**/venv/
+**/node_modules/
+**/__pycache__/
+*.py[cod]
+*.rs.bk
+
+# Mobile IDE state and generated Android output
+**/.gradle/
+**/local.properties
+**/xcuserdata/
+*.xcuserstate
+/platforms/android/app/build/
+/platforms/android/build/

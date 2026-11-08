@@ -1,0 +1,13 @@
+[package]
+name = "nabi-view-android"
+version = "1.0.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+path = "lib.rs"
+
+[dependencies]
+nabi-view = { path = "../../.." }

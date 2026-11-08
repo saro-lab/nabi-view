@@ -1,0 +1,121 @@
+name: Desktop builds
+
+on:
+  workflow_dispatch:
+    inputs:
+      cross_builds:
+        description: Also try Linux ARM64 and Windows GNU using cross-rs
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  PYTHON: python
+
+jobs:
+  native:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            target: windows-x64
+            triple: x86_64-pc-windows-msvc
+          - os: ubuntu-24.04
+            target: linux-x64
+            triple: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: macos-universal
+            triple: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add '${{ matrix.triple }}'
+      - name: Add Intel Mac target
+        if: runner.os == 'macOS'
+        run: rustup target add x86_64-apple-darwin
+      - name: Install Mac codec build tools
+        if: runner.os == 'macOS'
+        run: brew install cmake nasm pkg-config
+      - name: Install Windows assembler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          'C:/Program Files/NASM' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install Linux build and test libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake nasm perl pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libvulkan1
+      - name: Check codec build tools
+        run: |
+          cmake --version
+          nasm -v
+          perl -v
+      - name: Check locale catalogs and native declarations
+        run: |
+          rustup component add rustfmt
+          python build/locales.py --check
+      - name: Test on the host
+        run: cargo test --locked --release --target '${{ matrix.triple }}'
+      - name: Build and package
+        if: runner.os != 'macOS'
+        run: sh build.sh --package
+      - name: Build and package Universal Mac bundle
+        if: runner.os == 'macOS'
+        run: sh build.sh macos-universal --package
+      - name: Archive Mac bundle preserving permissions
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent 'target/package/universal-apple-darwin/NABI VIEW.app' target/package/universal-apple-darwin/nabi-view-universal-apple-darwin.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nabi-view-${{ matrix.target }}
+          path: |
+            target/package/**/*.zip
+            target/package/**/*.tar.gz
+          if-no-files-found: error
+
+  cross:
+    if: inputs.cross_builds
+    name: Cross / ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [linux-arm64, windows-gnu]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install Rust and cross
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          cargo install cross --git https://github.com/cross-rs/cross --locked --root "$PWD/ai/runtime/cross"
+          echo "$PWD/ai/runtime/cross/bin" >> "$GITHUB_PATH"
+      - name: Cross compile and package
+        run: sh build.sh '${{ matrix.target }}' --cross --package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nabi-view-cross-${{ matrix.target }}
+          path: |
+            target/package/**/*.zip
+            target/package/**/*.tar.gz
+          if-no-files-found: error

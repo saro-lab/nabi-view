@@ -1,0 +1,170 @@
+[
+  {
+    "name": "ab_glyph",
+    "version": "0.2.32",
+    "license": "Apache-2.0",
+    "url": "https://github.com/alexheretic/ab-glyph"
+  },
+  {
+    "name": "android-activity",
+    "version": "0.6.1",
+    "license": "MIT OR Apache-2.0",
+    "url": "https://github.com/rust-mobile/android-activity"
+  },
+  {
+    "name": "block",
+    "version": "0.1.6",
+    "license": "MIT",
+    "url": "http://github.com/SSheldon/rust-block"
+  },
+  {
+    "name": "cc",
+    "version": "1.11.0",
+    "license": "MIT OR Apache-2.0",
+    "url": "https://github.com/rust-lang/cc-rs"
+  },
+  {
+    "name": "Chromium DMG layout",
+    "version": "",
+    "license": "BSD-3-Clause",
+    "url": "https://chromium.googlesource.com/chromium/src/+/main/chrome/installer/mac/"
+  },
+  {
+    "name": "dirs",
+    "version": "6.0.0",
+    "license": "MIT OR Apache-2.0",
+    "url": "https://github.com/soc/dirs-rs"
+  },
+  {
+    "name": "ds_store",
+    "version": "",
+    "license": "MIT",
+    "url": "https://github.com/al45tair/ds_store"
+  },
+  {
+    "name": "eframe",
+    "version": "0.31.1",
+    "license": "MIT OR Apache-2.0",
+    "url": "https://github.com/emilk/egui/tree/master/crates/eframe"
+  },
+  {
+    "name": "epaint",
+    "version": "0.31.1",
+    "license": "MIT OR Apache-2.0",
+    "url": "https://github.com/emilk/egui/tree/master/crates/epaint"
+  },
+  {
+    "name": "flate2",
+    "version": "1.1.10",
+    "license": "MIT OR Apache-2.0",
+    "url": "https://github.com/rust-lang/flate2-rs"
+  },
+  {
+    "name": "fontdb",
+    "version": "0.24.0",
+    "license": "MIT",
+    "url": "https://github.com/RazrFalcon/fontdb"
+  },
+  {
+    "name": "image",
+    "version": "0.25.10",
+    "license": "MIT OR Apache-2.0",
+    "url": "https://github.com/image-rs/image"
+  },
+  {
+    "name": "jxl-oxide",
+    "version": "0.12.6",
+    "license": "MIT OR Apache-2.0",
+    "url": "https://github.com/tirr-c/jxl-oxide.git"
+  },
+  {
+    "name": "kamadak-exif",
+    "version": "0.6.1",
+    "license": "BSD-2-Clause",
+    "url": "https://github.com/kamadak/exif-rs"
+  },
+  {
+    "name": "libavif-sys",
+    "version": "0.17.0+libavif.1.0.4",
+    "license": "BSD-2-Clause",
+    "url": "https://github.com/njaard/libavif-rs"
+  },
+  {
+    "name": "mac_alias",
+    "version": "",
+    "license": "MIT",
+    "url": "https://github.com/al45tair/mac_alias"
+  },
+  {
+    "name": "resvg",
+    "version": "0.49.0",
+    "license": "Apache-2.0 OR MIT",
+    "url": "https://github.com/linebender/resvg"
+  },
+  {
+    "name": "rfd",
+    "version": "0.15.4",
+    "license": "MIT",
+    "url": "https://github.com/PolyMeilex/rfd"
+  },
+  {
+    "name": "rusqlite",
+    "version": "0.32.1",
+    "license": "MIT",
+    "url": "https://github.com/rusqlite/rusqlite"
+  },
+  {
+    "name": "serde",
+    "version": "1.0.229",
+    "license": "MIT OR Apache-2.0",
+    "url": "https://github.com/serde-rs/serde"
+  },
+  {
+    "name": "serde_json",
+    "version": "1.0.154",
+    "license": "MIT OR Apache-2.0",
+    "url": "https://github.com/serde-rs/json"
+  },
+  {
+    "name": "tempfile",
+    "version": "3.27.0",
+    "license": "MIT OR Apache-2.0",
+    "url": "https://github.com/Stebalien/tempfile"
+  },
+  {
+    "name": "trash",
+    "version": "5.2.8",
+    "license": "MIT",
+    "url": "https://github.com/ArturKovacs/trash"
+  },
+  {
+    "name": "ttf-parser",
+    "version": "0.25.1",
+    "license": "MIT OR Apache-2.0",
+    "url": "https://github.com/harfbuzz/ttf-parser"
+  },
+  {
+    "name": "wgpu",
+    "version": "24.0.5",
+    "license": "MIT OR Apache-2.0",
+    "url": "https://github.com/gfx-rs/wgpu"
+  },
+  {
+    "name": "windows",
+    "version": "0.62.2",
+    "license": "MIT OR Apache-2.0",
+    "url": "https://github.com/microsoft/windows-rs"
+  },
+  {
+    "name": "windows-core",
+    "version": "0.62.2",
+    "license": "MIT OR Apache-2.0",
+    "url": "https://github.com/microsoft/windows-rs"
+  },
+  {
+    "name": "zbus",
+    "version": "5.19.0",
+    "license": "MIT",
+    "url": "https://github.com/z-galaxy/zbus/"
+  }
+]
