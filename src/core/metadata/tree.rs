@@ -39,6 +39,18 @@ impl Node {
         }
     }
 
+    // `query` is already lowercased. Containers match by key only; their
+    // values are matched through their children.
+    fn matches(&self, query: &str) -> bool {
+        let contains = |text: &str| text.to_lowercase().contains(query);
+        contains(&self.key)
+            || match &self.kind {
+                Kind::Text(text) => contains(text),
+                Kind::Scalar(value) => contains(&value.to_string()),
+                Kind::Object | Kind::Array => false,
+            }
+    }
+
     fn chunks(&self) -> usize {
         match &self.kind {
             Kind::Text(text) => text.len().div_ceil(VALUE_CHUNK_BYTES).max(1),
@@ -213,7 +225,50 @@ impl Tree {
     // internally to bound each text layout job, never into user-facing pages.
     pub fn rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
-        let mut stack: Vec<_> = self.roots.iter().rev().map(|&id| (id, 0)).collect();
+        for &root in &self.roots {
+            self.push_subtree(root, 0, &mut rows);
+        }
+        rows
+    }
+
+    /// Rows whose key or value contains `query`, ignoring case. Ancestors stay
+    /// as the path to a match, and a matching branch keeps all its descendants.
+    pub fn filtered_rows(&self, query: &str) -> Vec<Row> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return self.rows();
+        }
+        let mut rows = Vec::new();
+        for &root in &self.roots {
+            self.push_matches(root, 0, &query, &mut rows);
+        }
+        rows
+    }
+
+    fn push_matches(&self, id: usize, depth: usize, query: &str, rows: &mut Vec<Row>) -> bool {
+        let node = &self.nodes[id];
+        if node.matches(query) {
+            self.push_subtree(id, depth, rows);
+            return true;
+        }
+        let start = rows.len();
+        rows.push(Row {
+            node: id,
+            chunk: 0,
+            depth,
+        });
+        let mut found = false;
+        for &child in &node.children {
+            found |= self.push_matches(child, depth + 1, query, rows);
+        }
+        if !found {
+            rows.truncate(start);
+        }
+        found
+    }
+
+    fn push_subtree(&self, id: usize, depth: usize, rows: &mut Vec<Row>) {
+        let mut stack = vec![(id, depth)];
         while let Some((id, depth)) = stack.pop() {
             let node = &self.nodes[id];
             for chunk in 0..node.chunks() {
@@ -225,7 +280,6 @@ impl Tree {
             }
             stack.extend(node.children.iter().rev().map(|&id| (id, depth + 1)));
         }
-        rows
     }
 }
 
@@ -469,6 +523,56 @@ mod tests {
         );
         assert_eq!(tree.copy_text(tree.roots[0]), value);
         assert_eq!(tree.copy_text(tree.roots[1]), value);
+    }
+
+    #[test]
+    fn filter_matches_keys_or_values_and_keeps_the_path_to_each_match() {
+        let mut metadata = Metadata::default();
+        metadata.add("Software", "ComfyUI");
+        metadata.add(
+            "prompt",
+            serde_json::json!({
+                "3": {"class_type": "KSampler", "inputs": {"seed": 314159, "cfg": 6.5}},
+                "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "Starry Night"}}
+            })
+            .to_string(),
+        );
+        let tree = Tree::new(&metadata);
+        let shown = |query: &str| {
+            tree.filtered_rows(query)
+                .iter()
+                .map(|row| (tree.nodes[row.node].key.as_str(), row.depth))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tree.filtered_rows("").len(), tree.rows().len());
+        assert_eq!(tree.filtered_rows("   ").len(), tree.rows().len());
+        // A value match keeps its ancestors but not its siblings.
+        assert_eq!(
+            shown("  starry "),
+            [("prompt", 0), ("6", 1), ("inputs", 2), ("text", 3)]
+        );
+        // A key match keeps its whole branch.
+        assert_eq!(
+            shown("INPUTS"),
+            [
+                ("prompt", 0),
+                ("3", 1),
+                ("inputs", 2),
+                ("cfg", 3),
+                ("seed", 3),
+                ("6", 1),
+                ("inputs", 2),
+                ("text", 3),
+            ]
+        );
+        assert_eq!(
+            shown("1415"),
+            [("prompt", 0), ("3", 1), ("inputs", 2), ("seed", 3)]
+        );
+        assert_eq!(shown("comfy"), [("Software", 0)]);
+        // Container summaries such as "{…} (2)" are not values.
+        assert!(shown("…").is_empty());
+        assert!(shown("missing").is_empty());
     }
 
     #[test]

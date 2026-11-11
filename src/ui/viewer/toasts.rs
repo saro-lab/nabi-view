@@ -48,15 +48,8 @@ impl Viewer {
                 };
                 crate::i18n::value_label("layout", tr(layout))
             }
-            "fit" | "fill" | "actual" | "width" | "height" => {
-                let label = match id {
-                    "fit" => "fit-entire-image",
-                    "fill" => "fill-viewer",
-                    "actual" => "actual-size-100",
-                    "width" => "fit-width",
-                    _ => "fit-height",
-                };
-                crate::i18n::value_label("image-display", tr(label))
+            id if limits::VIEW_MODES.contains(&id) => {
+                crate::i18n::value_label("image-display", tr(command_label(id)))
             }
             "in" | "out" => crate::i18n::value_label(
                 "zoom",
@@ -76,6 +69,13 @@ impl Viewer {
             "slideshow" => toggle("slideshow", self.slideshow),
             "random" if !self.random_prompt => toggle("random-order", self.random),
             "fullscreen" => toggle("full-screen", self.fullscreen),
+            "orientation"
+            | "orientation-auto"
+            | "orientation-portrait"
+            | "orientation-landscape" => crate::i18n::value_label(
+                "screen-orientation",
+                tr(orientation_command(&self.settings.orientation)),
+            ),
             "maximize" => tr(if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
                 "window-restored"
             } else {
@@ -104,6 +104,27 @@ impl Viewer {
         }
     }
 
+    /// The latest error, shown under the top bar until dismissed.
+    pub(super) fn notice_overlay(&mut self, ctx: &egui::Context) {
+        if self.last_error.is_empty() {
+            return;
+        }
+        egui::Area::new(egui::Id::unique("notice"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(ctx.viewport_rect().min + egui::vec2(14., 52.))
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.small_button("×").clicked() {
+                        self.last_error.clear();
+                    }
+                    ui.label(
+                        RichText::new(crate::i18n::value_label("error-details", &self.last_error))
+                            .color(WARNING),
+                    );
+                });
+            });
+    }
+
     pub(super) fn toast_overlay(&mut self, ctx: &egui::Context) {
         let Some(toast) = &self.toast else { return };
         let now = std::time::Instant::now();
@@ -112,7 +133,7 @@ impl Viewer {
             return;
         }
         ctx.request_repaint_after(toast.deadline - now);
-        egui::Area::new(egui::Id::new("viewer-toast"))
+        egui::Area::new(egui::Id::unique("viewer-toast"))
             .order(egui::Order::Tooltip)
             .anchor(
                 if crate::i18n::is_rtl() {
@@ -125,7 +146,7 @@ impl Viewer {
             .interactable(false)
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_max_width((ctx.screen_rect().width() - 48.).clamp(80., 360.));
+                    ui.set_max_width((ctx.viewport_rect().width() - 48.).clamp(80., 360.));
                     ui.label(RichText::new(&toast.message).color(INK));
                 });
             });

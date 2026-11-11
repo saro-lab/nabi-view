@@ -39,7 +39,7 @@ impl Viewer {
                 || self.zoom_override.is_some()
                 || self.zoom > 1.1
             {
-                4096
+                MAX_DECODE_SIDE
             } else {
                 self.fit_limit
             };
@@ -47,6 +47,10 @@ impl Viewer {
                 pic.last_used = self.frame;
                 if pic.requested >= limit
                     || pic.original.iter().copied().max().unwrap_or(0) <= pic.requested
+                    // Detail crops improve a manual/actual-size view without
+                    // decoding a second full raster beside the crop worker.
+                    || (pic.animation.is_none() && (self.zoom_override.is_some()
+                        || self.settings.view_mode == "actual" || self.zoom > 1.1))
                 {
                     if self.tickets[slot].as_ref().is_some_and(|t| &t.1 != path) {
                         self.media.clear_slot(slot);
@@ -60,11 +64,7 @@ impl Viewer {
             {
                 continue;
             }
-            let id = if slot == 0 {
-                self.media.request_image(path.clone(), limit)
-            } else {
-                self.media.request_image_in_slot(slot, path.clone(), limit)
-            };
+            let id = self.media.request_image_in_slot(slot, path.clone(), limit);
             self.tickets[slot] = Some((id, path.clone(), limit));
         }
     }
@@ -90,6 +90,9 @@ impl Viewer {
         if self.cache_budget() > previous {
             self.prefetch_blocked.clear();
         }
+        if self.cache_budget() == 0 {
+            self.details.clear();
+        }
         if !self.memory_policy.background_allowed() {
             self.cancel_prefetch();
             self.media.clear_thumbnail();
@@ -112,6 +115,7 @@ impl Viewer {
             .map(|p| &p.handle)
             .chain(self.presentation.images.iter().map(|p| &p.handle))
             .chain(self.thumbs.values())
+            .chain(self.details.textures())
             .filter(|handle| textures.insert(handle.id()))
             .map(|handle| handle.byte_size())
             .fold(0usize, usize::saturating_add);
@@ -121,7 +125,24 @@ impl Viewer {
             .flat_map(|p| &p.animation)
             .map(media::animation::Animation::retained_bytes)
             .fold(0usize, usize::saturating_add);
-        texture_bytes.saturating_add(animation_bytes)
+        let mut hdr_ids = HashSet::new();
+        let hdr_bytes = self
+            .pictures
+            .values()
+            .filter_map(|p| p.hdr.as_ref())
+            .chain(
+                self.presentation
+                    .images
+                    .iter()
+                    .filter_map(|p| p.hdr.as_ref()),
+            )
+            .chain(self.details.hdr_textures())
+            .filter(|hdr| hdr_ids.insert(hdr.id()))
+            .map(|hdr| hdr.bytes())
+            .fold(0usize, usize::saturating_add);
+        texture_bytes
+            .saturating_add(animation_bytes)
+            .saturating_add(hdr_bytes)
     }
 
     pub(super) fn nearby_cache_paths(&self) -> Vec<PathBuf> {
@@ -175,12 +196,28 @@ impl Viewer {
             .collect();
         candidates.sort_unstable();
         let mut references = HashMap::<_, usize>::new();
+        let mut hdr_references = HashMap::<_, usize>::new();
+        for hdr in self
+            .pictures
+            .values()
+            .filter_map(|p| p.hdr.as_ref())
+            .chain(
+                self.presentation
+                    .images
+                    .iter()
+                    .filter_map(|p| p.hdr.as_ref()),
+            )
+            .chain(self.details.hdr_textures())
+        {
+            *hdr_references.entry(hdr.id()).or_default() += 1;
+        }
         for handle in self
             .pictures
             .values()
             .map(|p| &p.handle)
             .chain(self.presentation.images.iter().map(|p| &p.handle))
             .chain(self.thumbs.values())
+            .chain(self.details.textures())
         {
             *references.entry(handle.id()).or_default() += 1;
         }
@@ -191,6 +228,13 @@ impl Viewer {
                 break;
             }
             if let Some(picture) = self.pictures.remove(&path) {
+                if let Some(hdr) = &picture.hdr {
+                    let count = hdr_references.get_mut(&hdr.id()).unwrap();
+                    *count -= 1;
+                    if *count == 0 {
+                        bytes = bytes.saturating_sub(hdr.bytes());
+                    }
+                }
                 if let Some(frame) = &picture.animation {
                     bytes = bytes.saturating_sub(frame.retained_bytes());
                 }
@@ -221,6 +265,7 @@ impl Viewer {
         if !self.memory_policy.background_allowed()
             || self.files.is_empty()
             || self.listing.is_some()
+            || self.details.pending()
         {
             self.cancel_prefetch();
             return;
@@ -272,11 +317,16 @@ impl Viewer {
     pub(super) fn refresh_folder(&mut self, mut files: Vec<PathBuf>, changed: &[PathBuf]) {
         if self.random {
             files = reconcile_random(&self.files, &files);
+        } else {
+            files = self.sorted_files(files);
         }
         let focused_path = self.files.get(self.focus_index).cloned();
         let focus_index = refreshed_focus_index(&self.files, self.focus_index, &files);
         let live: HashSet<_> = files.iter().collect();
         self.checked.retain(|path| live.contains(path));
+        for path in changed {
+            self.details.invalidate(path);
+        }
         let changed: HashSet<_> = changed.iter().collect();
         let valid = |p: &PathBuf| live.contains(p) && !changed.contains(p);
         self.pictures.retain(|p, _| valid(p));
@@ -331,6 +381,11 @@ impl Viewer {
                     self.listing = None;
                     match result {
                         Ok(files) => {
+                            self.sorting.stamps = self.media.folder_stamps(id);
+                            #[cfg(any(target_os = "ios", target_os = "android", test))]
+                            if let Some(selection) = &self.mobile_selection {
+                                selection.apply_sort_metadata(&mut self.sorting.stamps);
+                            }
                             self.refresh_folder(files, &[]);
                             self.replay_pending_navigation(ctx);
                         }
@@ -345,7 +400,14 @@ impl Viewer {
                     if self.folder_watch == Some(id) && self.folder.as_ref() == Some(&path) =>
                 {
                     match result {
-                        Ok(update) => self.refresh_folder(update.files, &update.changed),
+                        Ok(update) => {
+                            self.sorting.stamps = self.media.folder_stamps(id);
+                            #[cfg(any(target_os = "ios", target_os = "android", test))]
+                            if let Some(selection) = &self.mobile_selection {
+                                selection.apply_sort_metadata(&mut self.sorting.stamps);
+                            }
+                            self.refresh_folder(update.files, &update.changed);
+                        }
                         Err(error) => self.last_error = error,
                     }
                 }
@@ -370,6 +432,14 @@ impl Viewer {
                             self.pictures.insert(
                                 path,
                                 Picture {
+                                    hdr: frame
+                                        .hdr
+                                        .and_then(|hdr| {
+                                            self.render_state.as_ref().and_then(|state| {
+                                                crate::ui::hdr::Texture::new(state, hdr)
+                                            })
+                                        })
+                                        .map(std::sync::Arc::new),
                                     animation: frame.animation,
                                     handle,
                                     original: frame.original_size,
@@ -395,7 +465,8 @@ impl Viewer {
                     }
                     match result {
                         Ok(frame) => {
-                            let bytes = frame.image.pixels.len() * 4;
+                            let bytes = frame.image.pixels.len() * 4
+                                + frame.hdr.as_ref().map_or(0, |hdr| hdr.bytes() * 3 / 2);
                             self.trim_cache(bytes);
                             if self.cache_bytes().saturating_add(bytes) > self.cache_budget() {
                                 continue;
@@ -405,8 +476,8 @@ impl Viewer {
                             let visible = thumbnail_range(
                                 self.files.len(),
                                 self.focus_index,
-                                ctx.screen_rect().width() - THUMBNAIL_MARGIN * 2.,
-                                ctx.style().spacing.item_spacing.x,
+                                ctx.viewport_rect().width() - THUMBNAIL_MARGIN * 2.,
+                                ctx.global_style().spacing.item_spacing.x,
                             );
                             if self.thumbs.len() >= 120.max(visible.len() * 2) {
                                 let keep = visible.start.saturating_sub(15)
@@ -444,7 +515,8 @@ impl Viewer {
                     }
                     match result {
                         Ok(frame) => {
-                            let bytes = frame.image.pixels.len() * 4;
+                            let bytes = frame.image.pixels.len() * 4
+                                + frame.hdr.as_ref().map_or(0, |hdr| hdr.bytes() * 3 / 2);
                             if self.pictures.len() >= self.settings.cache_image_limit
                                 || self.cache_bytes().saturating_add(bytes) > self.cache_budget()
                             {
@@ -456,6 +528,14 @@ impl Viewer {
                             self.pictures.insert(
                                 path,
                                 Picture {
+                                    hdr: frame
+                                        .hdr
+                                        .and_then(|hdr| {
+                                            self.render_state.as_ref().and_then(|state| {
+                                                crate::ui::hdr::Texture::new(state, hdr)
+                                            })
+                                        })
+                                        .map(std::sync::Arc::new),
                                     animation: frame.animation,
                                     handle: ctx.load_texture(
                                         format!("prefetch-{id}"),

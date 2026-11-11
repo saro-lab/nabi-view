@@ -406,6 +406,8 @@ fn metadata_width_is_limited_to_each_half_and_follows_spread_reading_direction()
     window.pointer(window.screen_size.x * 0.75, right_before.y + 30.);
     window.draw_events(
         vec![Event::MouseWheel {
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
             unit: egui::MouseWheelUnit::Point,
             delta: egui::vec2(0., -32.),
             modifiers: egui::Modifiers::NONE,
@@ -558,4 +560,139 @@ fn metadata_json_tree_keeps_all_children_visible_while_copying_leaves_and_branch
         window.draw(None).0.contains(&text_row),
         "JSON values always remain visible"
     );
+}
+
+#[test]
+fn metadata_filter_shows_matching_keys_or_values_and_types_over_shortcuts() {
+    let mut window = TestWindow::sample();
+    window.draw(Some(Key::ArrowRight));
+    window.draw(Some(Key::Tab));
+    window.wait_for("CLIPTextEncode");
+    let class_row = "- class_type: CLIPTextEncode";
+    let text_row = "- text: Illustrated ocean waves under a warm sun";
+    let filter_id = egui::Id::unique(("metadata-filter", 0usize));
+    assert!(
+        window
+            .draw(None)
+            .0
+            .contains(crate::i18n::tr("shortcut-filter"))
+    );
+    assert!(
+        window.ctx.memory(|m| m.focused()).is_none(),
+        "Opening metadata must not focus the filter"
+    );
+    let field = window.ctx.read_response(filter_id).unwrap();
+    click_metadata_without_window_drag(&mut window, field.rect.center());
+    assert!(window.ctx.memory(|m| m.has_focus(filter_id)));
+
+    // `I` and arrows are text editing keys here, not viewer shortcuts.
+    let none = egui::Modifiers::NONE;
+    window.draw_events(
+        vec![
+            key_event(Key::I, true, false, none),
+            Event::Text("I".into()),
+            key_event(Key::I, false, false, none),
+            Event::Text("LLUSTRATED".into()),
+            key_event(Key::ArrowLeft, true, false, none),
+            key_event(Key::ArrowLeft, false, false, none),
+        ],
+        none,
+    );
+    let visible = window.draw(None).0;
+    assert!(visible.contains(text_row) && visible.contains("- inputs: {…} (1)"));
+    assert!(
+        !visible.contains(class_row),
+        "Unmatched siblings are hidden"
+    );
+    assert!(visible.contains("PNG"), "The summary is not filtered");
+    let highlights: Vec<_> = window
+        .paint
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            Shape::Rect(rect)
+                if rect.fill == Color32::from_rgba_premultiplied(150, 112, 0, 150) =>
+            {
+                Some(rect.rect)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !highlights.is_empty() && highlights.iter().all(|rect| rect.width() < 120.),
+        "Only the matched words are highlighted: {highlights:?}"
+    );
+    // The field spans the panel width and has no border, even while focused.
+    let field = window.ctx.read_response(filter_id).unwrap();
+    assert!(field.rect.width() > 300., "{:?}", field.rect);
+    assert!(window.paint.iter().all(|shape| match &shape.shape {
+        Shape::Rect(rect) if rect.rect.intersects(field.rect) => rect.stroke.is_empty(),
+        _ => true,
+    }));
+
+    // Enter releases focus; the filter then follows navigation.
+    window.draw(Some(Key::Enter));
+    assert!(!window.ctx.memory(|m| m.has_focus(filter_id)));
+    window.draw(Some(Key::ArrowLeft));
+    window.wait_for("01 Alpine Light.png");
+    window.draw(Some(Key::ArrowRight));
+    window.wait_for(text_row);
+    assert!(!window.draw(None).0.contains(class_row));
+
+    // Escape clears a filter first, keeping focus, then releases focus.
+    let field = window.ctx.read_response(filter_id).unwrap();
+    click_metadata_without_window_drag(&mut window, field.rect.center());
+    let escape = |window: &mut TestWindow| {
+        window.draw(Some(Key::Escape));
+        assert!(
+            !window
+                .viewport_commands
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::Close)),
+            "Escape in the filter must not close the window"
+        );
+    };
+    escape(&mut window);
+    window.wait_for(class_row);
+    assert!(window.ctx.memory(|m| m.has_focus(filter_id)));
+    escape(&mut window);
+    assert!(!window.ctx.memory(|m| m.has_focus(filter_id)));
+    assert!(
+        window.draw(None).0.contains(class_row),
+        "Metadata stays open"
+    );
+
+    // Closing the inspector starts the next one with an empty filter.
+    window.draw_events(
+        vec![
+            key_event(Key::I, true, false, none),
+            key_event(Key::I, false, false, none),
+        ],
+        none,
+    );
+    assert!(!window.draw(None).0.contains(class_row));
+    window.draw(Some(Key::Tab));
+    window.wait_for(class_row);
+    assert!(window.draw(None).0.contains(text_row));
+}
+
+#[test]
+fn metadata_font_setting_reaches_the_rendered_inspector() {
+    let mut window = TestWindow::sample_with_settings(&crate::core::settings::Settings {
+        metadata_font_size: 24,
+        reduce_motion: true,
+        ..Default::default()
+    });
+    window.draw(Some(Key::Tab));
+    window.wait_for("314159");
+    assert!(window.paint.iter().any(|shape| {
+        match &shape.shape {
+            Shape::Text(text) if text.galley.job.text.contains("314159") => text
+                .galley
+                .job
+                .sections
+                .iter()
+                .all(|section| section.format.font_id.size == 24.),
+            _ => false,
+        }
+    }));
 }

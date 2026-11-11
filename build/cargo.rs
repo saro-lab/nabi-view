@@ -37,12 +37,14 @@ fn main() {
     println!("cargo:rerun-if-changed=src/platform/macos/trash.m");
     println!("cargo:rerun-if-changed=src/platform/macos/fullscreen.m");
     println!("cargo:rerun-if-changed=src/platform/macos/display_sleep.m");
+    println!("cargo:rerun-if-changed=src/platform/macos/access.m");
     cc::Build::new()
         .file(bridge)
         .file("src/platform/apple/locale.m")
         .file("src/platform/macos/fullscreen.m")
         .file("src/platform/macos/trash.m")
         .file("src/platform/macos/display_sleep.m")
+        .file("src/platform/macos/access.m")
         .flag("-fobjc-arc")
         .compile("nabi_open_documents");
     println!("cargo:rustc-link-lib=framework=AppKit");
@@ -51,6 +53,7 @@ fn main() {
     println!("cargo:rustc-link-lib=framework=ImageIO");
     println!("cargo:rustc-link-lib=framework=CoreGraphics");
     println!("cargo:rustc-link-lib=framework=IOKit");
+    println!("cargo:rustc-link-lib=framework=Security");
 }
 
 fn windows_icon() {

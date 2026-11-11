@@ -27,19 +27,76 @@ impl Viewer {
         }
     }
 
-    pub(super) fn open_from_user(&mut self, path: PathBuf) {
-        if !path.is_dir() && !media::is_supported(&path) {
+    pub(super) fn open_from_user(&mut self, path: PathBuf) -> bool {
+        #[cfg(all(target_os = "macos", not(test)))]
+        let access = {
+            match crate::platform::mac_access::resolve(&path) {
+                Ok(access) => access,
+                Err(error) => {
+                    self.last_error = error;
+                    let folder =
+                        !media::is_supported(&path) && !crate::core::archive::is_archive(&path);
+                    match crate::platform::mac_access::pick_again(&path, folder) {
+                        Ok(Some(access)) => access,
+                        Ok(None) => return false,
+                        Err(error) => {
+                            self.last_error = error;
+                            return false;
+                        }
+                    }
+                }
+            }
+        };
+        #[cfg(all(target_os = "macos", not(test)))]
+        let path = access.path.clone();
+        #[cfg(any(target_os = "ios", target_os = "android", test))]
+        if crate::core::documents::source_record(&path).is_some() {
+            // A source marker is an opaque read grant, not a local image/directory.
+            self.open(path);
+            return true;
+        }
+        if !path.is_dir() && !media::is_supported(&path) && archive::target(&path).is_none() {
             self.last_error = format!("Unsupported image: {}", path.display());
+            return false;
         } else if self.files.is_empty() && self.listing.is_none() {
             self.open(path);
         } else {
             self.new_window(Some(&path));
         }
+        true
     }
 
     pub(super) fn open(&mut self, path: PathBuf) {
+        #[cfg(all(target_os = "macos", not(test)))]
+        let access = match crate::platform::mac_access::resolve(&path) {
+            Ok(access) => access,
+            Err(error) => {
+                self.last_error = error;
+                return;
+            }
+        };
+        #[cfg(all(target_os = "macos", not(test)))]
+        let path = access.path.clone();
+        // Leaving a folder keeps its page for the recent list.
+        self.remember_page();
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        if crate::platform::mobile::reopen(&path) {
+            self.library.open = false;
+            return;
+        }
+        #[cfg(test)]
+        let path = crate::core::documents::source_local_path(&path).unwrap_or(path);
         self.toast = None;
         let path = normalize_open_path(path);
+        // An archive, or a page inside one, opens the archive like a folder.
+        if let Some((source, start)) = archive::target(&path) {
+            self.open_archive(source, start, None);
+            #[cfg(all(target_os = "macos", not(test)))]
+            {
+                self.mac_access = Some(access);
+            }
+            return;
+        }
         let directory = path.is_dir();
         if !directory && !media::is_supported(&path) {
             self.last_error = format!("Unsupported image: {}", path.display());
@@ -61,7 +118,37 @@ impl Viewer {
         if self.folder != folder {
             self.checked.clear();
         }
+        self.reset_view();
+        #[cfg(all(target_os = "macos", not(test)))]
+        {
+            self.mac_access = Some(access);
+        }
+        self.files = focused_path.into_iter().collect();
+        self.folder = folder.clone();
+        // Desktop phone preview uses real folders; only native mobile imports
+        // are temporary copies that must never be saved as recent folders.
+        self.library.remember = folder
+            .clone()
+            .filter(|_| !crate::core::NATIVE_MOBILE)
+            .filter(|dir| {
+                crate::app::sample_path()
+                    .and_then(|p| p.parent().map(Path::to_owned))
+                    .as_ref()
+                    != Some(dir)
+            });
+        self.queue_images();
+        self.listing = folder.map(|p| self.media.request_folder(p));
+        self.folder_watch = self.listing;
+    }
+
+    /// Drops everything shown for the previous folder or archive.
+    pub(super) fn reset_view(&mut self) {
+        #[cfg(all(target_os = "macos", not(test)))]
+        {
+            self.mac_access = None;
+        }
         self.random_prompt = false;
+        self.details.clear();
         self.media.clear_slot(0);
         self.media.clear_slot(1);
         self.tickets = [None, None];
@@ -70,7 +157,10 @@ impl Viewer {
         self.pending_steps.clear();
         self.inspector.invalidate();
         self.span_cache.get_mut().take();
-        self.files = focused_path.into_iter().collect();
+        // Deletes the files extracted from the previous archive.
+        self.archives.close();
+        self.files.clear();
+        self.sorting.stamps.clear();
         self.focus_index = 0;
         self.pan = Vec2::ZERO;
         self.canvas_drag = None;
@@ -88,30 +178,20 @@ impl Viewer {
         self.thumbs.clear();
         self.thumb_ticket = None;
         self.thumb_errors.clear();
-        self.recent_open = false;
+        self.library.open = false;
         self.move_dialog = None;
-        self.folder = folder.clone();
-        // Desktop phone preview uses real folders; only native mobile imports
-        // are temporary copies that must never be saved as recent folders.
-        self.remember = folder
-            .clone()
-            .filter(|_| !cfg!(any(target_os = "ios", target_os = "android")))
-            .filter(|dir| {
-                crate::app::sample_path()
-                    .and_then(|p| p.parent().map(Path::to_owned))
-                    .as_ref()
-                    != Some(dir)
-            });
-        self.queue_images();
-        self.listing = folder.map(|p| self.media.request_folder(p));
-        self.folder_watch = self.listing;
+    }
+
+    /// The saved spread applies only while the display is in landscape.
+    pub(super) fn spread_active(&self) -> bool {
+        self.settings.spread && self.landscape
     }
 
     pub(super) fn focus_span(&self) -> (usize, usize) {
         let key = (
             self.focus_index,
             self.files.len(),
-            self.settings.spread,
+            self.spread_active(),
             self.settings.cover,
             self.layout_monitor,
         );
@@ -126,7 +206,7 @@ impl Viewer {
         let span = adaptive_focus_span(
             self.focus_index,
             self.files.len(),
-            self.settings.spread,
+            self.spread_active(),
             self.settings.cover,
             |index| {
                 self.page_sizes
@@ -141,7 +221,7 @@ impl Viewer {
 
     pub(super) fn move_page(&mut self, ctx: &egui::Context, forward: bool) {
         if self.listing.is_some() {
-            if self.pending_steps.len() < i16::MAX as usize {
+            if self.pending_steps.len() < MAX_PENDING_STEPS {
                 self.pending_steps.push((forward, false));
             }
             return;

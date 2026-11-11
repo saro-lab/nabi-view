@@ -181,7 +181,7 @@ fn pinned_canvas_drives_zoom_and_preserves_manual_scale() {
 
 #[test]
 fn dragging_letterbox_or_photo_moves_the_window_without_panning() {
-    let mut window = TestWindow::sample();
+    let mut window = TestWindow::sample_with_modifier_gestures();
     window.wait_for("");
     let before = window.photo_rects();
     let margin = egui::pos2(
@@ -224,7 +224,7 @@ fn modified_drag_moves_the_photo_without_moving_the_window() {
             ..Default::default()
         },
     ] {
-        let mut window = TestWindow::sample();
+        let mut window = TestWindow::sample_with_modifier_gestures();
         window.wait_for("");
         let before = window.photo_rects();
         let delta = egui::vec2(72., -38.);
@@ -249,7 +249,7 @@ fn modified_drag_moves_the_photo_without_moving_the_window() {
 
 #[test]
 fn image_drag_keeps_its_mode_when_the_modifier_is_released() {
-    let mut window = TestWindow::sample();
+    let mut window = TestWindow::sample_with_modifier_gestures();
     window.wait_for("");
     let before = window.photo_rects();
     let start = before.1.center();
@@ -309,7 +309,7 @@ fn dragging_an_empty_black_canvas_moves_the_window() {
 #[test]
 fn returning_to_window_cancels_an_interrupted_image_drag() {
     for lose_focus in [false, true] {
-        let mut window = TestWindow::sample();
+        let mut window = TestWindow::sample_with_modifier_gestures();
         window.wait_for("");
         let start = window.photo_rects().1.center();
         let modifiers = egui::Modifiers::CTRL;
@@ -395,13 +395,13 @@ fn leaving_and_reentering_in_one_frame_does_not_keep_the_old_click_target() {
     assert!(
         window
             .ctx
-            .read_response(egui::Id::new(("titlebar", "settings-close")))
+            .read_response(egui::Id::unique(("titlebar", "settings-close")))
             .is_some()
     );
     assert!(
         window
             .ctx
-            .read_response(egui::Id::new(("menu-command", "open")))
+            .read_response(egui::Id::unique(("menu-command", "open")))
             .is_none()
     );
 }
@@ -409,7 +409,7 @@ fn leaving_and_reentering_in_one_frame_does_not_keep_the_old_click_target() {
 #[test]
 fn refocusing_waits_for_actual_pointer_movement_on_all_window_drag_surfaces() {
     for surface in ["canvas", "chrome", "settings", "menu", "recent", "backdrop"] {
-        let mut window = TestWindow::sample();
+        let mut window = TestWindow::sample_with_modifier_gestures();
         window.wait_for("");
         window.draw(Some(Key::H));
         window.draw(None);
@@ -425,7 +425,7 @@ fn refocusing_waits_for_actual_pointer_movement_on_all_window_drag_surfaces() {
                 if surface == "recent" {
                     let button = window
                         .ctx
-                        .read_response(egui::Id::new(("menu-command", "recent")))
+                        .read_response(egui::Id::unique(("menu-command", "recent")))
                         .unwrap();
                     window.click(button.rect.center());
                 }
@@ -435,8 +435,8 @@ fn refocusing_waits_for_actual_pointer_movement_on_all_window_drag_surfaces() {
                 if surface == "backdrop" {
                     egui::pos2(24., 180.)
                 } else {
-                    let id = egui::Id::new(if surface == "recent" {
-                        "recent-folders"
+                    let id = egui::Id::unique(if surface == "recent" {
+                        "library"
                     } else {
                         "command-menu"
                     });
@@ -506,7 +506,7 @@ fn chrome_icons_follow_requested_order_and_pin_keeps_them_visible() {
         .map(|name| window.titlebar_icon(name).rect)
         .collect();
     assert!(
-        (rects.last().unwrap().right() - (1080. - 14.)).abs() < 1.,
+        (rects.last().unwrap().right() - (1080. - 4.)).abs() < 1.,
         "Titlebar icons must stay attached to the right edge: {:?}",
         rects
     );
@@ -742,7 +742,7 @@ fn zoom_percent_rejects_invalid_values_and_clamps_buttons_at_limits() {
     assert_photo_scale(&window, 1.);
     window.click(zoom_widget(&window, "zoom-value").rect.center());
     for invalid in [
-        "9.99", "3000.01", "123.456", "NaN", "inf", "1e2", "", "-100",
+        "19.99", "3000.01", "123.456", "NaN", "inf", "1e2", "", "-100",
     ] {
         replace_zoom_text(&mut window, invalid);
         window.draw(Some(Key::Enter));
@@ -753,12 +753,12 @@ fn zoom_percent_rejects_invalid_values_and_clamps_buttons_at_limits() {
         );
         assert_photo_scale(&window, 1.);
     }
-    replace_zoom_text(&mut window, "10.00");
+    replace_zoom_text(&mut window, "20.00");
     window.draw(Some(Key::Enter));
     window.draw(None);
-    assert_photo_scale(&window, 0.1);
+    assert_photo_scale(&window, 0.2);
     window.click(window.label_position("−"));
-    assert_photo_scale(&window, 0.1);
+    assert_photo_scale(&window, 0.2);
     window.click(zoom_widget(&window, "zoom-value").rect.center());
     replace_zoom_text(&mut window, "3000.00");
     window.draw(Some(Key::Enter));
@@ -871,7 +871,7 @@ fn modified_wheel_zooms_and_visits_actual_size_in_both_directions() {
             ..Default::default()
         },
     ] {
-        let mut window = TestWindow::sample();
+        let mut window = TestWindow::sample_with_modifier_gestures();
         window
             .ctx
             .set_pixels_per_point(if modifiers.mac_cmd { 2. } else { 1. });
@@ -879,6 +879,8 @@ fn modified_wheel_zooms_and_visits_actual_size_in_both_directions() {
         window.wait_for("1 / 5");
         window.draw(Some(Key::H));
         let wheel = |y| Event::MouseWheel {
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
             unit: egui::MouseWheelUnit::Line,
             delta: egui::vec2(0., y),
             modifiers,
@@ -904,7 +906,7 @@ fn modified_wheel_zooms_and_visits_actual_size_in_both_directions() {
             window.draw(None);
             assert_photo_scale(&window, next);
         }
-        for (percent, direction, expected) in [("10", -1., 0.1), ("3000", 1., 30.)] {
+        for (percent, direction, expected) in [("20", -1., 0.2), ("3000", 1., 30.)] {
             window.click(zoom_widget(&window, "zoom-value").rect.center());
             replace_zoom_text(&mut window, percent);
             window.draw(Some(Key::Enter));
@@ -914,4 +916,51 @@ fn modified_wheel_zooms_and_visits_actual_size_in_both_directions() {
             assert_photo_scale(&window, expected);
         }
     }
+}
+
+#[test]
+fn portrait_monitor_hides_the_spread_control_with_its_separator() {
+    let separators_before_random = |window: &TestWindow| {
+        let random = window.titlebar_icon("random").rect;
+        window
+            .paint
+            .iter()
+            .filter(|shape| {
+                matches!(&shape.shape,
+                    Shape::LineSegment { points, .. }
+                        if (points[0].x - points[1].x).abs() < 0.1
+                            && points[0].x < random.left()
+                            && (points[0].y - points[1].y).abs() > 10.
+                            && points[0].y >= window.screen_size.y - 45.
+                )
+            })
+            .count()
+    };
+    let mut window = TestWindow::sample();
+    window.reveal_controls();
+    window.wait_for("1 / 5");
+    assert!(window.titlebar_icon("spread").rect.is_positive());
+    assert_eq!(separators_before_random(&window), 2);
+
+    window.monitor_size = Some(egui::vec2(1080., 1920.));
+    for _ in 0..3 {
+        window.draw(None);
+    }
+    assert!(
+        window
+            .ctx
+            .read_response(egui::Id::unique(("titlebar", "spread")))
+            .is_none(),
+        "Spread control shown on a portrait monitor"
+    );
+    assert_eq!(separators_before_random(&window), 1);
+    // Layout shortcuts do nothing while only one page can be shown.
+    window.draw(Some(Key::OpenBracket));
+    assert!(!saved_viewer_settings(&window).spread);
+
+    window.monitor_size = Some(egui::vec2(1920., 1080.));
+    for _ in 0..3 {
+        window.draw(None);
+    }
+    assert!(window.titlebar_icon("spread").rect.is_positive());
 }

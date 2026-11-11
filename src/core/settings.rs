@@ -1,8 +1,41 @@
 //! Portable settings schema; no UI or persistence handles.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::ops::RangeInclusive;
+
 const VERSION: u32 = 1;
 pub(crate) const MAX_RECENT: usize = 500;
+/// Allowed values, shared by validation, the settings screen and commands.
+pub(crate) const RECENT_LIMIT: RangeInclusive<usize> = 1..=MAX_RECENT;
+/// Every duration setting is in milliseconds and moves in 0.1 s steps.
+pub(crate) const TIME_MS: RangeInclusive<u32> = 100..=100_000;
+pub(crate) const TIME_STEP_MS: u32 = 100;
+pub(crate) const SMALL_IMAGE_PERCENT: RangeInclusive<u32> = 50..=500;
+pub(crate) const CACHE_IMAGE_LIMIT: RangeInclusive<usize> = 2..=10_000;
+pub(crate) const CACHE_MEMORY_MB: RangeInclusive<u32> = 32..=4096;
+pub(crate) const DISK_CACHE_MB: RangeInclusive<u32> = 32..=16_384;
+pub(crate) const METADATA_FONT_SIZE: RangeInclusive<u32> = 10..=32;
+pub(crate) const SORT_BY: &[&str] = &["natural", "name", "modified", "size"];
+pub(crate) const VIEW_MODES: &[&str] = &["fit", "fill", "actual", "width", "height"];
+/// Shortcut rows, and the length of each command ID and chord.
+pub(crate) const MAX_SHORTCUTS: usize = 256;
+const MAX_SHORTCUT_TEXT: usize = 128;
+
+fn default_sort_by() -> String {
+    "natural".into()
+}
+fn default_checker() -> bool {
+    true
+}
+fn default_metadata_font_size() -> u32 {
+    12
+}
+fn default_disk_cache_enabled() -> bool {
+    true
+}
+fn default_disk_cache_mb() -> u32 {
+    1024
+}
 fn default_recent_moves() -> usize {
     10
 }
@@ -33,6 +66,10 @@ fn default_prevent_display_sleep() -> bool {
 fn default_cursor_hide() -> u32 {
     2000
 }
+fn default_orientation() -> String {
+    "auto".into()
+}
+pub(crate) const ORIENTATIONS: &[&str] = &["auto", "portrait", "landscape"];
 pub const MIN_WINDOW_SIZE: [f32; 2] = [560., 420.];
 pub const DEFAULT_WINDOW_SIZE: [f32; 2] = [1080., 760.];
 
@@ -47,6 +84,94 @@ pub fn valid_window_size(size: [f32; 2]) -> bool {
 pub struct KeyboardShortcut {
     pub action: String,
     pub key: String,
+}
+
+/// Wheel gestures either turn pages or zoom.
+pub(crate) const WHEEL_ACTIONS: &[&str] = &["page", "zoom", "none"];
+/// Primary-button drags either move the window or pan the image. A pan that
+/// starts on the background instead of an image moves the window.
+pub(crate) const DRAG_ACTIONS: &[&str] = &["window", "pan", "none"];
+/// Clicks open the menu, do nothing, or run any command ID.
+pub(crate) const CLICK_MENU: &str = "menu";
+pub(crate) const MOUSE_NONE: &str = "none";
+
+/// Desktop mouse gestures. "Primary" is Ctrl on Windows/Linux and ⌘ on macOS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MouseSettings {
+    pub wheel: String,
+    pub primary_wheel: String,
+    pub reverse_wheel: bool,
+    pub right_click: String,
+    pub middle_click: String,
+    /// Left-button double click.
+    pub double_click: String,
+    pub back_button: String,
+    pub forward_button: String,
+    pub drag: String,
+    pub primary_drag: String,
+}
+
+impl Default for MouseSettings {
+    fn default() -> Self {
+        Self {
+            wheel: "zoom".into(),
+            primary_wheel: MOUSE_NONE.into(),
+            reverse_wheel: false,
+            right_click: CLICK_MENU.into(),
+            middle_click: "recent".into(),
+            double_click: "fullscreen".into(),
+            back_button: "prev".into(),
+            forward_button: "next".into(),
+            drag: "pan".into(),
+            primary_drag: MOUSE_NONE.into(),
+        }
+    }
+}
+
+pub(crate) fn valid_click_action(action: &str) -> bool {
+    matches!(action, CLICK_MENU | MOUSE_NONE)
+        || crate::core::commands::COMMANDS
+            .iter()
+            .any(|command| command.0 == action)
+}
+
+impl MouseSettings {
+    /// Unknown values (from a newer or hand-edited file) fall back per gesture.
+    pub(crate) fn normalize(&mut self) {
+        let defaults = Self::default();
+        for (value, default, allowed) in [
+            (&mut self.wheel, defaults.wheel, WHEEL_ACTIONS),
+            (
+                &mut self.primary_wheel,
+                defaults.primary_wheel,
+                WHEEL_ACTIONS,
+            ),
+            (&mut self.drag, defaults.drag, DRAG_ACTIONS),
+            (&mut self.primary_drag, defaults.primary_drag, DRAG_ACTIONS),
+        ] {
+            if !allowed.contains(&value.as_str()) {
+                *value = default;
+            }
+        }
+        for (value, default) in [
+            (&mut self.right_click, defaults.right_click),
+            (&mut self.middle_click, defaults.middle_click),
+            (&mut self.double_click, defaults.double_click),
+            (&mut self.back_button, defaults.back_button),
+            (&mut self.forward_button, defaults.forward_button),
+        ] {
+            if !valid_click_action(value) {
+                *value = default;
+            }
+        }
+    }
+
+    pub(crate) fn is_valid(&self) -> bool {
+        let mut normalized = self.clone();
+        normalized.normalize();
+        normalized == *self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +196,25 @@ pub struct Settings {
     #[serde(default)]
     pub show_thumbnails: bool,
     pub view_mode: String,
+    #[serde(default = "default_sort_by")]
+    pub sort_by: String,
+    #[serde(default)]
+    pub sort_descending: bool,
+    #[serde(default)]
+    pub background_rgb: [u8; 3],
+    #[serde(default = "default_checker")]
+    pub transparency_checker: bool,
+    #[serde(default = "default_metadata_font_size")]
+    pub metadata_font_size: u32,
+    #[serde(default)]
+    pub reduce_motion: bool,
+    #[serde(default = "default_disk_cache_enabled")]
+    pub disk_cache_enabled: bool,
+    #[serde(default = "default_disk_cache_mb")]
+    pub disk_cache_mb: u32,
+    /// Phone screen orientation lock: auto, portrait or landscape.
+    #[serde(default = "default_orientation")]
+    pub orientation: String,
     #[serde(default = "default_slide")]
     pub slide_ms: u32,
     #[serde(default = "default_delay")]
@@ -89,6 +233,8 @@ pub struct Settings {
     pub recent_limit: usize,
     #[serde(default = "default_recent_moves")]
     pub recent_move_limit: usize,
+    #[serde(default)]
+    pub mouse: MouseSettings,
     pub shortcuts: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyboard_shortcuts: Option<Vec<KeyboardShortcut>>,
@@ -102,6 +248,10 @@ pub struct Settings {
     pub trash_shortcut_migrated: bool,
     #[serde(default)]
     pub move_shortcut_migrated: bool,
+    #[serde(default)]
+    pub settings_shortcut_migrated: bool,
+    #[serde(default)]
+    pub bookmark_shortcut_migrated: bool,
 }
 
 impl Default for Settings {
@@ -119,6 +269,15 @@ impl Default for Settings {
             flip_vertical: false,
             show_thumbnails: false,
             view_mode: "fit".into(),
+            sort_by: default_sort_by(),
+            sort_descending: false,
+            background_rgb: [0, 0, 0],
+            transparency_checker: default_checker(),
+            metadata_font_size: default_metadata_font_size(),
+            reduce_motion: false,
+            disk_cache_enabled: default_disk_cache_enabled(),
+            disk_cache_mb: default_disk_cache_mb(),
+            orientation: default_orientation(),
             slide_ms: default_slide(),
             key_delay_ms: default_delay(),
             key_repeat_ms: default_repeat(),
@@ -129,6 +288,7 @@ impl Default for Settings {
             remember_recent: true,
             recent_limit: 50,
             recent_move_limit: default_recent_moves(),
+            mouse: MouseSettings::default(),
             shortcuts: BTreeMap::new(),
             keyboard_shortcuts: Some(crate::core::commands::default_shortcut_rows()),
             close_all_shortcut_migrated: true,
@@ -136,12 +296,22 @@ impl Default for Settings {
             slideshow_shortcuts_migrated: true,
             trash_shortcut_migrated: true,
             move_shortcut_migrated: true,
+            settings_shortcut_migrated: true,
+            bookmark_shortcut_migrated: true,
         }
     }
 }
 
+const SETTINGS_CTRL_S: &str = "Ctrl+S";
+
+fn is_settings_ctrl_s(row: &KeyboardShortcut) -> bool {
+    row.action == "settings" && row.key == SETTINGS_CTRL_S
+}
+
 impl Settings {
-    pub(crate) fn normalize_shortcuts(&mut self) {
+    pub(crate) fn normalize(&mut self) {
+        // Every load, save and import path normalizes here first.
+        self.mouse.normalize();
         if self.keyboard_shortcuts.is_none() {
             self.keyboard_shortcuts = Some(
                 self.shortcuts
@@ -167,6 +337,12 @@ impl Settings {
         let mut current_defaults = crate::core::commands::default_shortcut_rows();
         if !self.move_shortcut_migrated {
             current_defaults.retain(|row| row.action != "move");
+        }
+        if !self.settings_shortcut_migrated {
+            current_defaults.retain(|row| !is_settings_ctrl_s(row));
+        }
+        if !self.bookmark_shortcut_migrated {
+            current_defaults.retain(|row| row.action != "bookmark");
         }
         let mut defaults = current_defaults.clone();
         // Run earlier upgrades against the historical defaults first.
@@ -241,7 +417,7 @@ impl Settings {
             self.trash_shortcut_migrated = true;
         }
         if !self.move_shortcut_migrated {
-            if !cfg!(any(target_os = "ios", target_os = "android"))
+            if !crate::core::NATIVE_MOBILE
                 && let Some(rows) = &mut self.keyboard_shortcuts
                 && !rows.is_empty()
                 && !rows
@@ -255,16 +431,66 @@ impl Settings {
             }
             self.move_shortcut_migrated = true;
         }
+        if !self.settings_shortcut_migrated {
+            // Add Ctrl+S beside the existing settings binding only while that
+            // chord is still free; empty lists stay deliberately empty.
+            let chord = crate::core::commands::canonical_chord(SETTINGS_CTRL_S);
+            if let Some(rows) = &mut self.keyboard_shortcuts
+                && !rows.is_empty()
+                && !rows
+                    .iter()
+                    .any(|row| crate::core::commands::canonical_chord(&row.key) == chord)
+            {
+                // Keep the default order: right after the existing settings key.
+                let at = rows
+                    .iter()
+                    .rposition(|row| row.action == "settings")
+                    .map_or(rows.len(), |index| index + 1);
+                rows.insert(
+                    at,
+                    KeyboardShortcut {
+                        action: "settings".into(),
+                        key: SETTINGS_CTRL_S.into(),
+                    },
+                );
+            }
+            self.settings_shortcut_migrated = true;
+        }
+        if !self.bookmark_shortcut_migrated {
+            // Add B for bookmarks only while that key is free; empty lists stay
+            // deliberately empty and a removed binding is never restored.
+            if !crate::core::NATIVE_MOBILE
+                && let Some(rows) = &mut self.keyboard_shortcuts
+                && !rows.is_empty()
+                && !rows
+                    .iter()
+                    .any(|row| row.action == "bookmark" || row.key == "B")
+            {
+                // Keep the default order: right after the recent-folders key.
+                let at = rows
+                    .iter()
+                    .rposition(|row| row.action == "recent")
+                    .map_or(rows.len(), |index| index + 1);
+                rows.insert(
+                    at,
+                    KeyboardShortcut {
+                        action: "bookmark".into(),
+                        key: "B".into(),
+                    },
+                );
+            }
+            self.bookmark_shortcut_migrated = true;
+        }
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if !(50..=500).contains(&self.small_image_percent) {
+        if !SMALL_IMAGE_PERCENT.contains(&self.small_image_percent) {
             return Err("Small image maximum size must be 50–500%.".into());
         }
-        if !(2..=10_000).contains(&self.cache_image_limit) {
+        if !CACHE_IMAGE_LIMIT.contains(&self.cache_image_limit) {
             return Err("Cache image limit must be 2–10000.".into());
         }
-        if !(32..=4096).contains(&self.cache_memory_mb) {
+        if !CACHE_MEMORY_MB.contains(&self.cache_memory_mb) {
             return Err("Cache memory limit must be 32–4096 MiB.".into());
         }
         if self.schema_version != VERSION {
@@ -273,11 +499,20 @@ impl Settings {
                 self.schema_version
             ));
         }
-        if !matches!(
-            self.view_mode.as_str(),
-            "fit" | "fill" | "actual" | "width" | "height"
-        ) {
+        if !SORT_BY.contains(&self.sort_by.as_str()) {
+            return Err("Invalid image sort order.".into());
+        }
+        if !METADATA_FONT_SIZE.contains(&self.metadata_font_size) {
+            return Err("Metadata font size must be 10–32 points.".into());
+        }
+        if !DISK_CACHE_MB.contains(&self.disk_cache_mb) {
+            return Err("Disk cache limit must be 32–16384 MiB.".into());
+        }
+        if !VIEW_MODES.contains(&self.view_mode.as_str()) {
             return Err("Invalid image fit mode.".into());
+        }
+        if !ORIENTATIONS.contains(&self.orientation.as_str()) {
+            return Err("Invalid screen orientation.".into());
         }
         if [
             self.slide_ms,
@@ -287,38 +522,37 @@ impl Settings {
             self.cursor_hide_ms,
         ]
         .iter()
-        .any(|ms| !(100..=100_000).contains(ms))
+        .any(|ms| !TIME_MS.contains(ms))
         {
             return Err("Time settings must be 0.1–100.0 seconds.".into());
         }
-        if !(1..=MAX_RECENT).contains(&self.recent_move_limit) {
+        if !RECENT_LIMIT.contains(&self.recent_move_limit) {
             return Err(format!("Recent move limit must be 1–{MAX_RECENT}."));
         }
-        if !(1..=MAX_RECENT).contains(&self.recent_limit) {
+        if !RECENT_LIMIT.contains(&self.recent_limit) {
             return Err(format!("Recent item limit must be 1–{MAX_RECENT}."));
         }
-        if self.shortcuts.len() > 256
-            || self.shortcuts.iter().any(|(id, chord)| {
-                id.is_empty()
-                    || id.len() > 128
-                    || chord.len() > 128
-                    || id.chars().any(char::is_control)
-                    || chord.chars().any(char::is_control)
-            })
-        {
-            return Err("Invalid shortcut settings format.".into());
+        if !self.mouse.is_valid() {
+            return Err("Invalid mouse settings.".into());
         }
-        if self.keyboard_shortcuts.as_ref().is_some_and(|rows| {
-            rows.len() > 256
-                || rows.iter().any(|row| {
-                    row.action.is_empty()
-                        || row.action.len() > 128
-                        || row.key.is_empty()
-                        || row.key.len() > 128
-                        || row.action.chars().any(char::is_control)
-                        || row.key.chars().any(char::is_control)
+        let text_ok =
+            |text: &str| text.len() <= MAX_SHORTCUT_TEXT && !text.chars().any(char::is_control);
+        // The legacy map may hold an empty chord for an unbound command.
+        let legacy_ok = self.shortcuts.len() <= MAX_SHORTCUTS
+            && self
+                .shortcuts
+                .iter()
+                .all(|(id, chord)| !id.is_empty() && text_ok(id) && text_ok(chord));
+        let rows_ok = self.keyboard_shortcuts.as_ref().is_none_or(|rows| {
+            rows.len() <= MAX_SHORTCUTS
+                && rows.iter().all(|row| {
+                    !row.action.is_empty()
+                        && !row.key.is_empty()
+                        && text_ok(&row.action)
+                        && text_ok(&row.key)
                 })
-        }) {
+        });
+        if !legacy_ok || !rows_ok {
             return Err("Invalid shortcut settings format.".into());
         }
         crate::core::commands::validate_keys(self)
@@ -344,6 +578,15 @@ impl Settings {
             flip_vertical,
             show_thumbnails,
             view_mode,
+            sort_by,
+            sort_descending,
+            background_rgb,
+            transparency_checker,
+            metadata_font_size,
+            reduce_motion,
+            disk_cache_enabled,
+            disk_cache_mb,
+            orientation,
             slide_ms,
             key_delay_ms,
             key_repeat_ms,
@@ -354,6 +597,7 @@ impl Settings {
             remember_recent,
             recent_limit,
             recent_move_limit,
+            mouse,
             keyboard_shortcuts
         );
         for (command, chord) in &after.shortcuts {

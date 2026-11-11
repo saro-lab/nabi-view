@@ -1,4 +1,4 @@
-//! Platform-independent phone layout and gesture decisions.
+//! Platform-independent phone/tablet layout and gesture decisions.
 use eframe::egui::Pos2;
 #[cfg(any(target_os = "ios", target_os = "android", test))]
 use eframe::egui::{Rect, Vec2};
@@ -11,8 +11,6 @@ pub(crate) fn preview_enabled() -> bool {
 pub(crate) fn set_preview(enabled: bool) {
     PREVIEW.set(enabled);
 }
-
-pub(crate) const BAR_HEIGHT: f32 = 52.;
 
 pub(crate) use crate::core::commands::mobile_supported as supported;
 
@@ -98,7 +96,8 @@ mod tests {
         let safe = safe_rect(screen, [177., 0., 102., 0.], 3.);
         assert_eq!(safe.min.y, 59.);
         assert_eq!(safe.max.y, 810.);
-        assert!(!supported("trash"));
+        assert!(supported("trash") && supported("fullscreen") && supported("import"));
+        assert!(!supported("reveal") && !supported("move") && !supported("new-window"));
         assert!(supported("open"));
     }
 }

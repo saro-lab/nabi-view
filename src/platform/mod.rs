@@ -4,6 +4,8 @@ pub(crate) mod display_sleep;
 pub(crate) mod fonts;
 pub(crate) mod locale;
 #[cfg(target_os = "macos")]
+pub(crate) mod mac_access;
+#[cfg(target_os = "macos")]
 pub(crate) mod mac_open;
 #[cfg(any(target_os = "ios", target_os = "android"))]
 pub(crate) mod mobile;

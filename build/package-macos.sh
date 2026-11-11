@@ -86,7 +86,9 @@ else
     done
     [ -n "$python" ] || { echo 'Python 3.9+ is required. Set PYTHON to its executable path.' >&2; exit 1; }
 fi
-build_dir=$(cargo metadata --offline --format-version=1 --no-deps --locked | "$python" -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
+cargo_metadata=$(cargo metadata --offline --format-version=1 --no-deps --locked)
+build_dir=$(printf '%s' "$cargo_metadata" | "$python" -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
+version=$(printf '%s' "$cargo_metadata" | "$python" -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "nabi-view"))')
 package_target=$target
 [ "$target" != universal ] || package_target=universal-apple-darwin
 output_dir="$build_dir/package/$package_target"
@@ -112,15 +114,18 @@ if [ "$dry_run" = true ]; then
             echo 'cargo fetch --locked'
             for arch in $targets; do
                 printf 'cargo build --locked --release --bin nabi-view --target %s\n' "$arch"
+                printf 'cargo build --locked --release -p nabi-preview --target %s\n' "$arch"
             done
         else
             for arch in $targets; do
                 printf 'Use existing release binary: %s/%s/release/nabi-view\n' "$build_dir" "$arch"
+                printf 'Use existing preview library: %s/%s/release/libnabi_preview.dylib\n' "$build_dir" "$arch"
             done
             echo 'cargo fetch --locked (license notice sources)'
         fi
         printf '"%s" build/notices.py\n' "$python"
         [ "$target" != universal ] || echo 'lipo -create <arm64 binary> <x86_64 binary> -output <bundle executable>'
+        echo 'Build and embed Quick Look thumbnail/preview extensions with the shared decoder.'
         printf 'Bundle resources, ad-hoc sign and verify: %s\n' "$output"
     fi
     if [ "$dmg" = true ]; then
@@ -139,7 +144,9 @@ if [ "$no_build" = false ]; then
     required_tools="$required_tools cargo rustc cmake perl xcrun"
 fi
 for tool in $required_tools; do
-    command -v "$tool" >/dev/null 2>&1 || { echo "Required tool not found: $tool" >&2; exit 1; }
+    executable=$tool
+    [ "$tool" != cmake ] || executable=${CMAKE:-cmake}
+    command -v "$executable" >/dev/null 2>&1 || { echo "Required tool not found: $executable" >&2; exit 1; }
 done
 if [ "$dmg" = true ]; then
     for tool in hdiutil; do
@@ -169,6 +176,7 @@ if [ "$no_build" = false ]; then
     cargo fetch --locked
     for arch in $targets; do
         cargo build --locked --release --bin nabi-view --target "$arch"
+        cargo build --locked --release -p nabi-preview --target "$arch"
     done
 fi
 
@@ -253,6 +261,7 @@ else
     app="$staging/NABI VIEW.app"
     mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
     install -m 644 platforms/macos/Info.plist "$app/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$app/Contents/Info.plist"
     if [ "$target" = universal ]; then
         xcrun lipo -create \
             "$build_dir/aarch64-apple-darwin/release/nabi-view" \
@@ -263,10 +272,10 @@ else
     else
         install -m 755 "$build_dir/$target/release/nabi-view" "$app/Contents/MacOS/nabi-view"
     fi
-    ditto assets/field-notes "$app/Contents/Resources/field-notes"
-    install -m 644 assets/icons/nabi-icon.icns "$app/Contents/Resources/NabiView.icns"
+    "$python" build/package_resources.py --macos "$app/Contents/Resources"
     install -m 644 target/notices/THIRD_PARTY_NOTICES.txt "$app/Contents/Resources/THIRD_PARTY_NOTICES.txt"
     install -m 644 LICENSE THIRD_PARTY.md "$app/Contents/Resources/"
+    "$python" build/package-previews.py macos --target "$target" --app "$app" --no-build
     codesign --force --sign - "$app"
     codesign --verify --strict "$app"
 fi

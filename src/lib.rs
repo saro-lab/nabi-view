@@ -3,6 +3,7 @@ mod app;
 mod core;
 mod i18n;
 mod platform;
+pub mod preview;
 mod storage;
 #[cfg(test)]
 mod test_support;

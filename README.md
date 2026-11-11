@@ -14,7 +14,7 @@ Third-party components retain their own licenses; see [Third-party notices](THIR
 
 ## Build
 
-Install Rust stable with Cargo, Git, CMake, Perl and Python 3.9+.
+Install Rust through rustup, plus Git, CMake, Perl and Python 3.9+.
 Intel/x64 builds also require NASM. Get the source:
 
 ```sh
@@ -22,7 +22,9 @@ git clone https://github.com/saro-lab/nabi-view.git
 cd nabi-view
 ```
 
-Run the following commands from the repository root.
+Run `rustup show` from the repository root to install the Rust version and
+components declared in `rust-toolchain.toml`. The target commands below use
+that same toolchain. Run all build commands from the repository root.
 
 ### Windows
 
@@ -83,7 +85,7 @@ Output: `target/mobile/<target>/NABI VIEW.app`.
 
 ### Android (development)
 
-On macOS or Linux, install JDK 17, Gradle 8.11.1, Android SDK Platform 35,
+On macOS or Linux, install JDK 17, Gradle 8.11.1, Android SDK Platform 36,
 Build Tools 35 and an Android NDK (r28 or newer recommended by the build script).
 Set the paths to your installed SDK and NDK, then build an ARM64 debug APK:
 
@@ -95,3 +97,13 @@ sh build/android.sh --build-only
 ```
 
 Output: `target/android/gradle/app/outputs/apk/debug/app-debug.apk`.
+
+## Main libraries
+
+- **egui / eframe** — cross-platform UI, windows and input handling.
+- **wgpu** — GPU rendering and texture uploads.
+- **image / png / jxl-oxide / libavif / resvg** — raster image, JPEG XL, AVIF and SVG decoding.
+- **moxcms** — ICC profile color conversion.
+- **zip / sevenz-rust2** — ZIP and 7z archive reading.
+- **SQLite (rusqlite) / Serde** — local history, bookmarks and JSON settings.
+- **rfd / native OS APIs** — file dialogs, permissions, platform image codecs and system integration.

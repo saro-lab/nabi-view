@@ -1,0 +1,19 @@
+[package]
+name = "nabi-preview"
+version = "1.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+name = "nabi_preview"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[[bin]]
+name = "nabi-thumbnailer"
+path = "src/main.rs"
+
+[dependencies]
+nabi-view = { path = "../../.." }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+tempfile = "3.27.0"

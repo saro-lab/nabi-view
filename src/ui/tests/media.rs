@@ -23,7 +23,8 @@ fn supplied_gif_plays_in_viewer() {
                 .iter()
                 .filter(|(id, _)| *id == texture)
             {
-                if let egui::ImageData::Color(image) = &delta.image {
+                let egui::ImageData::Color(image) = &delta.image;
+                {
                     assert_eq!(image.size, [400, 369]);
                     if image.pixels != previous {
                         changes += 1;
@@ -38,7 +39,7 @@ fn supplied_gif_plays_in_viewer() {
 }
 
 #[test]
-fn transparency_backdrop_stays_behind_image_without_changing_alpha() {
+fn transparency_backdrop_is_canvas_only_without_changing_alpha() {
     let folder = tempfile::tempdir().unwrap();
     let path = folder.path().join("alpha.png");
     let source = image::RgbaImage::from_fn(96, 64, |x, _| {
@@ -65,13 +66,11 @@ fn transparency_backdrop_stays_behind_image_without_changing_alpha() {
         .iter()
         .find(|(id, _)| *id == photo)
         .unwrap();
-    let egui::ImageData::Color(pixels) = &delta.1.image else {
-        panic!("Expected color pixels");
-    };
+    let egui::ImageData::Color(pixels) = &delta.1.image;
     assert_eq!(pixels.pixels[0].a(), 0);
     assert_eq!(pixels.pixels[40].a(), 128);
     assert_eq!(pixels.pixels[80].a(), 255);
-    for _ in 0..2 {
+    for controls_visible in [false, true] {
         let (clip, photo_rect) = window.photo_rects();
         let photo_index = window
             .paint
@@ -81,14 +80,17 @@ fn transparency_backdrop_stays_behind_image_without_changing_alpha() {
             Shape::Mesh(mesh) if mesh.texture_id == photo)
             })
             .unwrap();
-        let checker_index = window
+        let checkers: Vec<_> = window
             .paint
             .iter()
-            .position(|shape| {
+            .enumerate()
+            .filter(|(_, shape)| {
                 matches!(&shape.shape,
             Shape::Mesh(mesh) if crate::ui::transparency::is_backdrop(&window.ctx, mesh.texture_id))
             })
-            .unwrap();
+            .collect();
+        assert_eq!(checkers.len(), 1, "Only the canvas gets a checkerboard");
+        let checker_index = checkers[0].0;
         assert!(checker_index < photo_index);
         let Shape::Mesh(checker) = &window.paint[checker_index].shape else {
             unreachable!()
@@ -99,6 +101,15 @@ fn transparency_backdrop_stays_behind_image_without_changing_alpha() {
             4,
             "Checker work must not grow with zoom"
         );
+        if controls_visible {
+            assert!(
+                window.paint.iter().any(|shape| {
+                    matches!(&shape.shape, Shape::Mesh(mesh)
+                        if mesh.texture_id == photo && shape.clip_rect.height() == 57.)
+                }),
+                "The thumbnail must reuse the image texture with its original alpha"
+            );
+        }
         window.reveal_controls();
         window.click(window.label_position("+"));
     }

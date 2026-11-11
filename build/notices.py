@@ -161,10 +161,10 @@ def catalog(packages):
     heading = [
         "NABI VIEW — Third-party software and font notices",
         "Generated from cargo metadata --locked --offline for all resolved targets.",
-        "This inventory also includes platform-specific and build-time packages.",
+        "This inventory also includes platform-specific, build-time and test-only packages.",
         "Numbers beside file names refer to the full texts below.",
         "",
-        f"{len(packages)} packages. {len(missing)} packages need upstream attribution review.",
+        f"{len(packages)} packages. Packages requiring upstream attribution review: {len(missing)}.",
     ]
     if missing:
         heading += ["Review the upstream notices of these packages before distributing the demo:", ", ".join(missing)]
@@ -173,15 +173,26 @@ def catalog(packages):
     return "\n\n".join(blocks) + "\n", missing
 
 
+def is_vendored(pkg):
+    return (ROOT / "vendor").resolve() in Path(pkg["manifest_path"]).resolve().parents
+
+
+def first_party_members(metadata):
+    """Workspace membership also includes third-party crates for regression tests."""
+    workspace = set(metadata["workspace_members"])
+    return {pkg["id"] for pkg in metadata["packages"]
+            if pkg["id"] in workspace and not is_vendored(pkg)}
+
+
 def direct_dependencies(metadata):
     """Flat app credits: direct dependencies and explicitly vendored code only."""
-    workspace = set(metadata["workspace_members"])
+    workspace = first_party_members(metadata)
     direct = {dep["pkg"] for node in metadata["resolve"]["nodes"]
               if node["id"] in workspace for dep in node["deps"]
               if any(kind["kind"] != "dev" for kind in dep["dep_kinds"])}
     entries = []
     for pkg in metadata["packages"]:
-        vendored = (ROOT / "vendor") in Path(pkg["manifest_path"]).parents
+        vendored = is_vendored(pkg)
         if pkg["id"] in workspace or (pkg["id"] not in direct and not vendored):
             continue
         entries.append({"name": pkg["name"], "version": pkg["version"],
@@ -217,7 +228,7 @@ def main():
     if not SUMMARY.is_file() or SUMMARY.read_text(encoding="utf-8") != summary:
         raise SystemExit("Direct-dependency credits are out of date. Run "
                          "python3 build/notices.py --update-summary, then rebuild the app.")
-    workspace = set(metadata["workspace_members"])
+    workspace = first_party_members(metadata)
     packages = sorted((p for p in metadata["packages"] if p["id"] not in workspace),
                       key=lambda p: (p["name"], p["version"], p["id"]))
     result, missing = catalog(packages)

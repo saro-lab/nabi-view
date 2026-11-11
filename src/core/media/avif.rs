@@ -3,7 +3,7 @@
 //! The decoder borrows compressed input, owns its YUV planes, and never retains
 //! the Rust-owned RGBA destination. No decoder or borrowed plane leaves this worker.
 use super::{
-    AnimationFrame, CancelReader, Frame, MAX_EDGE, MAX_FILE_BYTES, MAX_PIXELS, output_size,
+    AnimationFrame, CancelReader, Frame, MAX_EDGE, MAX_FILE_BYTES, MAX_PIXELS, color, output_size,
 };
 use eframe::egui;
 use image::{DynamicImage, GenericImageView};
@@ -68,11 +68,39 @@ pub(super) fn decode(path: &Path, max_side: u32, live: &dyn Fn() -> bool) -> Res
                 )
             }),
             image: frame.image,
+            hdr: frame.hdr,
             original_size: size,
         });
         Ok(false)
     })?;
     first.ok_or("Empty AVIF animation".into())
+}
+
+/// Decode the first page and crop in oriented original-pixel coordinates.
+/// AV1 decoding remains bounded full-frame work; this is not random-access I/O.
+pub(super) fn decode_region(
+    path: &Path,
+    area: super::regions::Area,
+    max_side: u32,
+    live: &dyn Fn() -> bool,
+) -> Result<super::regions::Pixels, String> {
+    let started = Instant::now();
+    let file = File::open(path).map_err(|e| e.to_string())?;
+    let mut data = Vec::new();
+    CancelReader { file, live }
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut data)
+        .map_err(|e| e.to_string())?;
+    if data.len() as u64 > MAX_FILE_BYTES {
+        return Err("AVIF exceeds 256 MiB file limit".into());
+    }
+    check_work(live, started)?;
+    let mut decoder = Decoder::new(&data)?;
+    decoder.next()?;
+    check_work(live, started)?;
+    let (image, hdr, _) = decoder.rgba_region(max_side, Some(area))?;
+    check_work(live, started)?;
+    Ok((image, hdr))
 }
 
 pub(super) fn visit(
@@ -103,7 +131,7 @@ pub(super) fn visit(
         check_work(live, started)?;
         decoder.next()?;
         check_work(live, started)?;
-        let (image, size) = decoder.rgba(max_side)?;
+        let (image, hdr, size) = decoder.rgba(max_side)?;
         check_work(live, started)?;
         if original_size.is_some_and(|previous| previous != size) {
             return Err("AVIF sequence changes image dimensions".into());
@@ -112,6 +140,7 @@ pub(super) fn visit(
         if !emit(
             AnimationFrame {
                 image,
+                hdr,
                 delay: decoder.delay()?,
             },
             size,
@@ -341,36 +370,46 @@ impl<'input> Decoder<'input> {
         Ok(crop)
     }
 
-    fn rgba(&self, max_side: u32) -> Result<(egui::ColorImage, [u32; 2]), String> {
+    fn rgba(
+        &self,
+        max_side: u32,
+    ) -> Result<(egui::ColorImage, Option<color::HdrImage>, [u32; 2]), String> {
+        self.rgba_region(max_side, None)
+    }
+
+    fn rgba_region(
+        &self,
+        max_side: u32,
+        region: Option<super::regions::Area>,
+    ) -> Result<(egui::ColorImage, Option<color::HdrImage>, [u32; 2]), String> {
         let [width, height] = self.dimensions()?;
         let crop = self.clean_aperture()?;
         let image = self.image()?;
-        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        if u64::from(width) * u64::from(height) * 8 > super::MAX_DECODE_BYTES {
+            return Err("AVIF 16-bit RGBA exceeds 256 MiB decode limit".into());
+        }
+        let mut pixels = vec![0u16; width as usize * height as usize * 4];
         let mut rgb = std::mem::MaybeUninit::<ffi::avifRGBImage>::uninit();
         // SAFETY: SetDefaults initializes every RGB field. Conversion writes
-        // tightly packed, 8-bit RGBA into the checked Rust allocation, and does
+        // tightly packed, 16-bit RGBA into the checked Rust allocation, and does
         // not retain its pointer. Never call avifRGBImageFreePixels on this Vec.
         unsafe {
             ffi::avifRGBImageSetDefaults(rgb.as_mut_ptr(), image);
             let mut rgb = rgb.assume_init();
-            rgb.depth = 8;
+            rgb.depth = 16;
             rgb.format = ffi::AVIF_RGB_FORMAT_RGBA;
             rgb.alphaPremultiplied = 0;
-            rgb.pixels = pixels.as_mut_ptr();
-            rgb.rowBytes = width * 4;
+            rgb.pixels = pixels.as_mut_ptr().cast();
+            rgb.rowBytes = width * 8;
             check(ffi::avifImageYUVToRGB(image, &mut rgb))?;
         }
-        let rgba =
-            image::RgbaImage::from_raw(width, height, pixels).ok_or("Invalid AVIF RGBA buffer")?;
-        let mut rgba = DynamicImage::ImageRgba8(rgba);
+        let rgba = image::ImageBuffer::<image::Rgba<u16>, _>::from_raw(width, height, pixels)
+            .ok_or("Invalid AVIF RGBA buffer")?;
+        let mut rgba = DynamicImage::ImageRgba16(rgba);
         // Apply the validated clean aperture before resizing and orientation.
         // Pixel aspect ratio (pasp) is not corrected by this display path yet.
         if crop.x != 0 || crop.y != 0 || crop.width != width || crop.height != height {
             rgba = rgba.crop_imm(crop.x, crop.y, crop.width, crop.height);
-        }
-        let [out_w, out_h] = output_size(crop.width, crop.height, max_side);
-        if [out_w, out_h] != [crop.width, crop.height] {
-            rgba = rgba.thumbnail_exact(out_w, out_h);
         }
         // libavif exposes container transforms but does not apply them to RGB.
         // HEIF applies rotation before mirroring; irot is counter-clockwise.
@@ -390,15 +429,41 @@ impl<'input> Decoder<'input> {
         } else {
             [crop.width, crop.height]
         };
-        let (out_w, out_h) = rgba.dimensions();
-        let rgba = rgba.into_rgba8();
-        Ok((
-            egui::ColorImage::from_rgba_unmultiplied(
-                [out_w as usize, out_h as usize],
-                rgba.as_raw(),
-            ),
-            size,
-        ))
+        if let Some(area) = region {
+            if area.width == 0
+                || area.height == 0
+                || area.x.checked_add(area.width).is_none_or(|x| x > size[0])
+                || area.y.checked_add(area.height).is_none_or(|y| y > size[1])
+            {
+                return Err("AVIF region exceeds image bounds".into());
+            }
+            rgba = rgba.crop_imm(area.x, area.y, area.width, area.height);
+        }
+        let (w, h) = rgba.dimensions();
+        let [out_w, out_h] = if let Some(area) = region {
+            super::regions::output(area, max_side)
+        } else {
+            output_size(w, h, max_side)
+        };
+        if [out_w, out_h] != [w, h] {
+            rgba = rgba.thumbnail_exact(out_w, out_h);
+        }
+        rgba = if matches!(image.transferCharacteristics, 16 | 18) {
+            color::cicp_hdr(rgba, image.colorPrimaries, image.transferCharacteristics)?
+        } else {
+            let icc = if image.icc.size == 0 || image.icc.size > color::MAX_PROFILE_BYTES {
+                None
+            } else {
+                if image.icc.data.is_null() {
+                    return Err("Invalid AVIF ICC data".into());
+                }
+                // SAFETY: libavif owns the validated live profile for this decoder.
+                Some(unsafe { std::slice::from_raw_parts(image.icc.data, image.icc.size) })
+            };
+            color::to_srgb(rgba, icc)?
+        };
+        let (display, hdr) = color::display(rgba);
+        Ok((display, hdr, size))
     }
 
     fn delay(&self) -> Result<Duration, String> {
@@ -457,6 +522,50 @@ mod tests {
     use super::*;
 
     use super::super::animation_fixtures::avif_sample as sample;
+
+    #[test]
+    fn avif_profile_hdr_and_native_region_keep_color_data() {
+        let data = std::fs::read(sample()).unwrap();
+        let mut decoder = Decoder::new(&data).unwrap();
+        decoder.next().unwrap();
+        let (base, _, _) = decoder.rgba(1024).unwrap();
+        let profile = moxcms::ColorProfile::new_adobe_rgb().encode().unwrap();
+        // SAFETY: this test owns the decoder and libavif copies the supplied ICC.
+        unsafe {
+            ffi::avifImageSetProfileICC(
+                decoder.ptr.as_mut().image,
+                profile.as_ptr(),
+                profile.len(),
+            );
+        }
+        let (colored, _, _) = decoder.rgba(1024).unwrap();
+        assert_ne!(base.pixels, colored.pixels);
+        unsafe {
+            let image = &mut *decoder.ptr.as_mut().image;
+            image.colorPrimaries = 9;
+            image.transferCharacteristics = 16;
+        }
+        let (_, hdr, _) = decoder.rgba(1024).unwrap();
+        let hdr = hdr.unwrap();
+        // This fixture's first frame has dark PQ code values. Absolute
+        // >1 reference values are checked by the PQ transfer unit test.
+        assert!(hdr.rgba.chunks_exact(4).any(|p| p[0] > 0.));
+        assert!(hdr.rgba.iter().all(|v| v.is_finite()));
+        let area = super::super::regions::Area {
+            x: 10,
+            y: 20,
+            width: 20,
+            height: 30,
+        };
+        let (_, region, size) = decoder.rgba_region(1024, Some(area)).unwrap();
+        let region = region.unwrap();
+        assert_eq!(size, [498, 286]);
+        assert_eq!(region.size, [20, 30]);
+        assert_eq!(
+            &region.rgba[..4],
+            &hdr.rgba[(20 * 498 + 10) * 4..(20 * 498 + 10) * 4 + 4]
+        );
+    }
 
     #[test]
     fn avif_inspector_recognizes_avis_and_reads_resolution_and_frame_count() {
@@ -594,7 +703,7 @@ mod tests {
         let data = std::fs::read(sample()).unwrap();
         let mut decoder = Decoder::new(&data).unwrap();
         decoder.next().unwrap();
-        let (full, _) = decoder.rgba(1024).unwrap();
+        let (full, _, _) = decoder.rgba(1024).unwrap();
         // SAFETY: the test owns the decoder exclusively and changes only its
         // transform metadata. The decoded image and planes remain unchanged.
         unsafe {
@@ -619,14 +728,14 @@ mod tests {
             [crop.x, crop.y, crop.width, crop.height],
             [148, 92, 202, 102]
         );
-        let (cropped, original_size) = decoder.rgba(1024).unwrap();
+        let (cropped, _, original_size) = decoder.rgba(1024).unwrap();
         assert_eq!(original_size, [102, 202]);
         assert_eq!(cropped.size, [102, 202]);
         // Counter-clockwise rotation then horizontal mirror reverses both
         // source axes: output first/last pixels are crop bottom-right/top-left.
         assert_eq!(cropped.pixels[0], full.pixels[(92 + 101) * 498 + 148 + 201]);
         assert_eq!(*cropped.pixels.last().unwrap(), full.pixels[92 * 498 + 148]);
-        let (thumbnail, thumbnail_original) = decoder.rgba(64).unwrap();
+        let (thumbnail, _, thumbnail_original) = decoder.rgba(64).unwrap();
         assert_eq!(thumbnail_original, [102, 202]);
         assert_eq!(thumbnail.size[1], 64);
         // SAFETY: same exclusive metadata mutation as above.

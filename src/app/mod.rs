@@ -8,15 +8,15 @@ use crate::{
     storage,
     ui::{mobile as mobile_ui, viewer},
 };
-
-pub(crate) fn is_mobile() -> bool {
-    cfg!(any(target_os = "ios", target_os = "android")) || mobile_ui::preview_enabled()
-}
-
 use eframe::egui;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 use std::path::Path;
 use std::path::PathBuf;
+
+/// Touch UI for native phones/tablets or the resizable desktop mobile preview.
+pub(crate) fn is_mobile() -> bool {
+    crate::core::NATIVE_MOBILE || mobile_ui::preview_enabled()
+}
 
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 fn bundled_file(relative: &Path) -> Option<PathBuf> {
@@ -146,8 +146,7 @@ pub fn run_desktop() -> eframe::Result {
             })
             .with_clamp_size_to_monitor_size(true)
             .with_resizable(true)
-            .with_drag_and_drop(true)
-            .with_app_id("nabi-view"),
+            .with_drag_and_drop(true),
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
@@ -172,13 +171,12 @@ pub fn run_desktop() -> eframe::Result {
 #[cfg(any(target_os = "ios", target_os = "android"))]
 fn run_mobile(options: eframe::NativeOptions) -> eframe::Result {
     let store = mobile::store();
-    let initial = sample_path();
     eframe::run_native(
         "NABI VIEW",
         options,
         Box::new(move |cc| {
             mobile::set_context(cc.egui_ctx.clone());
-            let viewer = viewer::Viewer::new(cc, initial, store);
+            let viewer = viewer::Viewer::new(cc, None, store);
             crate::platform::fonts::install(cc.egui_ctx.clone());
             Ok(Box::new(viewer))
         }),

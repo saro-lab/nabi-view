@@ -344,7 +344,6 @@ mod platform {
                     match parsing_name(created) {
                         Ok(name) => {
                             outcome.token = Some(Token::Exact(name));
-                            outcome.completed = true;
                         }
                         Err(error) => {
                             outcome.error = Some(format!(
@@ -748,7 +747,81 @@ mod platform {
     }
 }
 
-#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+#[cfg(any(target_os = "ios", target_os = "android"))]
+mod platform {
+    pub use super::parking::{Token, restore, trash};
+}
+
+/// Phones view private copies of picked documents. Removing an image parks
+/// its copy beside the import batch, outside the listed folder, so it leaves
+/// the list and can be restored. The batch removes parked copies when dropped.
+#[cfg(any(target_os = "ios", target_os = "android", test))]
+mod parking {
+    use super::*;
+    #[derive(Clone, Debug)]
+    pub struct Token(PathBuf);
+
+    pub fn trash(path: &Path) -> Result<Token, String> {
+        let invalid = || "Invalid image path.".to_owned();
+        let name = path.file_name().ok_or_else(invalid)?;
+        let holding = path
+            .parent()
+            .and_then(crate::core::documents::removed_directory)
+            .ok_or_else(invalid)?;
+        std::fs::create_dir_all(&holding).map_err(|e| e.to_string())?;
+        let slot = tempfile::Builder::new()
+            .prefix("item-")
+            .tempdir_in(&holding)
+            .map_err(|e| e.to_string())?
+            .keep();
+        let parked = slot.join(name);
+        if let Err(error) = std::fs::rename(path, &parked) {
+            let _ = std::fs::remove_dir(&slot);
+            return Err(error.to_string());
+        }
+        Ok(Token(parked))
+    }
+
+    pub fn restore(token: &Token, original: &Path) -> Result<PathBuf, String> {
+        std::fs::rename(&token.0, original).map_err(|e| e.to_string())?;
+        if let Some(slot) = token.0.parent() {
+            let _ = std::fs::remove_dir(slot);
+        }
+        Ok(original.to_owned())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn parks_outside_the_batch_and_restores() {
+            let cache = tempfile::tempdir().unwrap();
+            let batch = cache.path().join("selection-test");
+            std::fs::create_dir(&batch).unwrap();
+            let image = batch.join("a.png");
+            std::fs::write(&image, b"image").unwrap();
+            let token = trash(&image).unwrap();
+            assert!(!image.exists());
+            assert!(
+                token
+                    .0
+                    .starts_with(cache.path().join("selection-test.removed"))
+            );
+            assert_eq!(std::fs::read_dir(&batch).unwrap().count(), 0);
+            assert_eq!(restore(&token, &image).unwrap(), image);
+            assert_eq!(std::fs::read(&image).unwrap(), b"image");
+            assert!(!token.0.exists());
+        }
+    }
+}
+
+#[cfg(not(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android"
+)))]
 mod platform {
     use super::*;
     #[derive(Clone, Debug)]

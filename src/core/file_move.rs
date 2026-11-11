@@ -12,7 +12,7 @@ pub(crate) struct MoveResult {
 }
 
 pub(crate) fn move_files(paths: Vec<PathBuf>, destination: &Path) -> MoveResult {
-    let destination = fs::canonicalize(destination).and_then(|path| {
+    let destination = crate::core::paths::canonicalize(destination).and_then(|path| {
         if path.is_dir() {
             Ok(path)
         } else {

@@ -13,7 +13,8 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
     ("maximize", "maximize-restore", ""),
     ("open", "open-image", "Primary+O"),
     ("folder", "open-folder", "Primary+Shift+O"),
-    ("recent", "recent", "Primary+Alt+Shift+O"),
+    ("recent", "recent-and-bookmarks", "Primary+Alt+Shift+O"),
+    ("bookmark", "add-bookmark", "B"),
     ("reveal", "reveal-in-file-manager", "L"),
     ("prev", "previous-page-or-spread", "Left"),
     ("next", "next-page-or-spread", "Right"),
@@ -61,6 +62,11 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
     ("export", "export-settings", ""),
     ("import", "import-settings", ""),
     ("licenses", "open-source-licenses", ""),
+    ("share", "share", ""),
+    ("orientation", "screen-orientation", ""),
+    ("orientation-auto", "orientation-auto", ""),
+    ("orientation-portrait", "orientation-portrait", ""),
+    ("orientation-landscape", "orientation-landscape", ""),
 ];
 
 pub(crate) const DEFAULT_ALTERNATE_SHORTCUTS: &[(&str, &str)] = &[
@@ -75,12 +81,14 @@ pub(crate) const DEFAULT_ALTERNATE_SHORTCUTS: &[(&str, &str)] = &[
     ("close-window", "Escape"),
     ("fullscreen", "F"),
     ("metadata", "I"),
+    // Control+S on every platform (Ctrl+S on Windows/Linux, ⌃S on macOS).
+    ("settings", "Ctrl+S"),
 ];
 
 pub(crate) fn default_shortcut_rows() -> Vec<KeyboardShortcut> {
     let mut rows = Vec::new();
     for &(action, _, primary) in COMMANDS {
-        if cfg!(any(target_os = "ios", target_os = "android")) && !mobile_supported(action) {
+        if crate::core::NATIVE_MOBILE && !mobile_supported(action) {
             continue;
         }
         if !primary.is_empty() {
@@ -171,9 +179,9 @@ pub(crate) fn validate_keys(s: &Settings) -> Result<(), String> {
 }
 pub(crate) fn validate_keys_for_platform(s: &Settings, macos: bool) -> Result<(), String> {
     let mut normalized = s.clone();
-    normalized.normalize_shortcuts();
+    normalized.normalize();
     let rows = normalized.keyboard_shortcuts.as_deref().unwrap_or_default();
-    if rows.len() > 256 {
+    if rows.len() > crate::core::settings::MAX_SHORTCUTS {
         return Err(tr("a-maximum-of-256-shortcuts-can-be-registered").into());
     }
     let mut assigned = HashMap::new();
@@ -185,7 +193,7 @@ pub(crate) fn validate_keys_for_platform(s: &Settings, macos: bool) -> Result<()
         if let Some(other) = assigned.insert(canonical_chord_for_platform(&row.key, macos), label) {
             return Err(format!(
                 "{} conflicts: {} / {}.",
-                shortcut_label(&row.key),
+                shortcut_label_for_platform(&row.key, macos),
                 tr(other),
                 tr(label)
             ));
@@ -209,7 +217,51 @@ pub(crate) fn validate_chord(id: &str, chord: &str) -> Result<(), String> {
     }
     Ok(())
 }
+/// Modifier presses are reported as keys by egui 0.37, but are not complete chords.
+pub(crate) fn modifier_key_name(name: &str) -> bool {
+    matches!(
+        name,
+        "AltLeft"
+            | "AltRight"
+            | "ControlLeft"
+            | "ControlRight"
+            | "ShiftLeft"
+            | "ShiftRight"
+            | "SuperLeft"
+            | "SuperRight"
+            | "Fn"
+    )
+}
 const KEY_NAMES: &[&str] = &[
+    "AudioVolumeDown",
+    "AudioVolumeMute",
+    "AudioVolumeUp",
+    "BrowserBack",
+    "BrowserFavorites",
+    "BrowserForward",
+    "BrowserHome",
+    "BrowserRefresh",
+    "BrowserSearch",
+    "BrowserStop",
+    "CapsLock",
+    "Clear",
+    "Eject",
+    "Help",
+    "IntlBackslash",
+    "LaunchApp1",
+    "LaunchApp2",
+    "LaunchMail",
+    "MediaPlayPause",
+    "MediaStop",
+    "MediaTrackNext",
+    "MediaTrackPrevious",
+    "Menu",
+    "NumLock",
+    "Pause",
+    "Power",
+    "PrintScreen",
+    "ScrollLock",
+    "Sleep",
     "Down",
     "Left",
     "Right",
@@ -320,26 +372,24 @@ const KEY_NAMES: &[&str] = &[
 ];
 
 pub(crate) fn mobile_supported(command: &str) -> bool {
-    // Phone layout does not remove the desktop host's folder access. Native
-    // mobile pickers currently stage individual documents without saved access.
-    if cfg!(any(target_os = "ios", target_os = "android")) && matches!(command, "folder" | "recent")
-    {
-        return false;
-    }
+    // Recent items/bookmarks use local source IDs whose native access grants
+    // are resolved on reopen. They never point at temporary imported files.
+    // Phones share the current image instead of revealing it in a file manager.
     !matches!(
         command,
-        "new-window"
-            | "reveal"
-            | "move"
-            | "trash"
-            | "undo-trash"
-            | "close-window"
-            | "close-all"
-            | "minimize"
-            | "maximize"
-            | "fullscreen"
-            | "export"
-            | "import"
+        "new-window" | "reveal" | "move" | "close-window" | "close-all" | "minimize" | "maximize"
+    )
+}
+
+/// Commands that only exist in the phone layout.
+pub(crate) fn mobile_only(command: &str) -> bool {
+    matches!(
+        command,
+        "share"
+            | "orientation"
+            | "orientation-auto"
+            | "orientation-portrait"
+            | "orientation-landscape"
     )
 }
 
@@ -351,6 +401,7 @@ mod tests {
         let expected: std::collections::BTreeSet<_> = eframe::egui::Key::ALL
             .iter()
             .map(|key| key.name())
+            .filter(|name| !modifier_key_name(name))
             .collect();
         assert_eq!(
             KEY_NAMES

@@ -16,7 +16,7 @@ fn shortcut_editing_and_search_block_repeated_quit_and_native_close() {
             None,
             Ok(store),
         );
-        app.recent_open = false;
+        app.library.open = false;
         app.settings_open = true;
         if editing {
             app.shortcut_editor = Some(settings::ShortcutEditor {
@@ -35,19 +35,45 @@ fn shortcut_editing_and_search_block_repeated_quit_and_native_close() {
             ctrl: !cfg!(target_os = "macos"),
             ..Default::default()
         };
-        for _ in 0..3 {
-            let input = egui::RawInput {
-                modifiers,
+        // egui 0.37 reports modifier keys too: they must not finish key capture.
+        let _ = ctx.run_pass(
+            egui::RawInput {
                 events: vec![egui::Event::Key {
-                    key: Key::Q,
+                    key: if cfg!(target_os = "macos") {
+                        Key::SuperLeft
+                    } else {
+                        Key::ControlLeft
+                    },
                     physical_key: None,
                     pressed: true,
                     repeat: false,
                     modifiers,
                 }],
                 ..Default::default()
+            },
+            |ctx| app.keyboard(ctx),
+        );
+        if editing {
+            assert!(app.shortcut_editor.as_ref().unwrap().listening);
+            assert!(app.shortcut_editor.as_ref().unwrap().key.is_empty());
+        } else {
+            assert!(app.shortcut_search.as_ref().unwrap().is_empty());
+        }
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                events: vec![
+                    egui::Event::ModifiersChanged(modifiers),
+                    egui::Event::Key {
+                        key: Key::Q,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    },
+                ],
+                ..Default::default()
             };
-            let output = ctx.run(input, |ctx| app.keyboard(ctx));
+            let output = ctx.run_pass(input, |ctx| app.keyboard(ctx));
             assert!(
                 !output
                     .viewport_output
@@ -71,8 +97,10 @@ fn shortcut_editing_and_search_block_repeated_quit_and_native_close() {
             .unwrap()
             .events
             .push(egui::ViewportEvent::Close);
-        let output = ctx.run(input.clone(), |ctx| {
-            app.update(ctx, &mut eframe::Frame::_new_kittest())
+        let output = ctx.run_ui(input.clone(), |ui| {
+            let mut frame = eframe::Frame::_new_kittest();
+            app.logic(ui.ctx(), &mut frame);
+            app.ui(ui, &mut frame);
         });
         assert!(
             output
@@ -80,10 +108,27 @@ fn shortcut_editing_and_search_block_repeated_quit_and_native_close() {
                 .values()
                 .any(|v| v.commands.contains(&egui::ViewportCommand::CancelClose))
         );
+        // A minimized window only receives logic, but capture must still guard it.
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .minimized = Some(true);
+        let output = ctx.run_logic(&input, |ctx| {
+            app.logic(ctx, &mut eframe::Frame::_new_kittest());
+        });
+        assert!(
+            output
+                .viewport_commands
+                .values()
+                .any(|commands| { commands.contains(&egui::ViewportCommand::CancelClose) })
+        );
         // An intentional all-window request from another viewer still wins.
         app.closing_all = true;
-        let output = ctx.run(input, |ctx| {
-            app.update(ctx, &mut eframe::Frame::_new_kittest())
+        let output = ctx.run_ui(input, |ui| {
+            let mut frame = eframe::Frame::_new_kittest();
+            app.logic(ui.ctx(), &mut frame);
+            app.ui(ui, &mut frame);
         });
         assert!(
             !output
@@ -92,6 +137,99 @@ fn shortcut_editing_and_search_block_repeated_quit_and_native_close() {
                 .any(|v| v.commands.contains(&egui::ViewportCommand::CancelClose))
         );
     }
+}
+
+#[test]
+fn hidden_window_processes_close_all_without_ui() {
+    use eframe::App;
+    use std::time::{Duration, Instant};
+
+    let root = crate::test_support::root();
+    std::fs::create_dir_all(&root).unwrap();
+    let directory = tempfile::tempdir_in(root).unwrap();
+    let ctx = egui::Context::default();
+    let mut app = Viewer::new(
+        &eframe::CreationContext::_new_kittest(ctx.clone()),
+        None,
+        Err(String::new()),
+    );
+    let path = directory.path().join("close-all");
+    app.close_signal = Some(crate::platform::close_signal::CloseSignal::new(
+        path.clone(),
+        ctx.clone(),
+    ));
+    let mut sender = crate::platform::close_signal::CloseSignal::new(path, ctx.clone());
+    let mut input = egui::RawInput {
+        focused: false,
+        ..Default::default()
+    };
+    input
+        .viewports
+        .get_mut(&egui::ViewportId::ROOT)
+        .unwrap()
+        .minimized = Some(true);
+    sender.broadcast().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let output = ctx.run_logic(&input, |ctx| {
+            app.logic(ctx, &mut eframe::Frame::_new_kittest());
+        });
+        if output
+            .viewport_commands
+            .values()
+            .any(|commands| commands.contains(&egui::ViewportCommand::Close))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "hidden window ignored close-all");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(app.closing_all);
+}
+
+#[test]
+fn mobile_safe_area_is_applied_once_to_viewport_content_and_popups() {
+    let ctx = egui::Context::default();
+    let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(390., 844.));
+    let safe = Rect::from_min_max(egui::pos2(0., 59.), egui::pos2(390., 810.));
+    let native = egui::SafeAreaInsets(egui::epaint::MarginF32 {
+        top: 59.,
+        bottom: 34.,
+        ..Default::default()
+    });
+    let pointer = egui::pos2(120., 200.);
+    // Native integrations only send the inset again on a window-state change.
+    for native_insets in [Some(native), None] {
+        let mut input = egui::RawInput {
+            screen_rect: Some(screen),
+            safe_area_insets: native_insets,
+            events: vec![egui::Event::PointerMoved(pointer)],
+            ..Default::default()
+        };
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .native_pixels_per_point = Some(3.);
+        prepare_mobile_safe_area(&ctx, &mut input, [177., 0., 102., 0.]);
+        assert_eq!(input.screen_rect, Some(safe));
+        assert_eq!(input.safe_area_insets, Some(Default::default()));
+        let _ = ctx.run_ui(input, |ui| {
+            assert_eq!(ui.ctx().viewport_rect(), safe);
+            assert_eq!(ui.ctx().content_rect(), safe);
+            assert_eq!(ui.max_rect(), safe);
+            assert_eq!(ui.ctx().pointer_latest_pos(), Some(pointer));
+            let clip = egui::Area::new(egui::Id::unique("safe-area-popup"))
+                .fixed_pos(safe.min)
+                .show(ui.ctx(), |popup| popup.clip_rect())
+                .inner;
+            assert_eq!(clip, safe);
+        });
+    }
+    // None must also be cleared when the integration omits the screen rectangle.
+    let mut input = egui::RawInput::default();
+    prepare_mobile_safe_area(&ctx, &mut input, [177., 0., 102., 0.]);
+    assert_eq!(input.safe_area_insets, Some(Default::default()));
 }
 
 #[test]
@@ -216,7 +354,7 @@ fn slideshow_interval_shortcuts_repeat_with_configured_timing_and_stop() {
             Err(String::new()),
         );
         app.settings.key_delay_ms = 400;
-        app.recent_open = false;
+        app.library.open = false;
         app.settings.key_repeat_ms = 200;
         if key == Key::K {
             app.save_shortcut_rows(vec![KeyboardShortcut {
@@ -233,7 +371,7 @@ fn slideshow_interval_shortcuts_repeat_with_configured_timing_and_stop() {
             modifiers: egui::Modifiers::NONE,
         };
         let tick = |app: &mut Viewer, time, events, focused| {
-            let _ = ctx.run(
+            let _ = ctx.run_pass(
                 egui::RawInput {
                     time: Some(time),
                     events,
@@ -306,14 +444,14 @@ fn setting_toasts_survive_automatic_slides_without_extending_their_lifetime() {
         Err(String::new()),
     );
     app.files = vec!["a.png".into(), "b.png".into(), "c.png".into()];
-    app.recent_open = false;
+    app.library.open = false;
     app.settings.slide_ms = 100;
     app.run("slideshow", &ctx);
     app.show_slide_interval_toast(&ctx);
     let notice = app.toast.as_ref().unwrap().message.clone();
     let expires = app.toast.as_ref().unwrap().deadline;
     let tick = |app: &mut Viewer, time| {
-        let _ = ctx.run(
+        let _ = ctx.run_pass(
             egui::RawInput {
                 time: Some(time),
                 ..Default::default()
@@ -381,10 +519,10 @@ fn slideshow_interval_shortcuts_persist_clamp_and_reschedule_playback() {
         Ok(store()),
     );
     app.files = vec!["a.png".into(), "b.png".into(), "c.png".into()];
-    app.recent_open = false;
+    app.library.open = false;
     app.run("slideshow", &ctx);
     let tick = |app: &mut Viewer, time, action| {
-        let _ = ctx.run(
+        let _ = ctx.run_pass(
             egui::RawInput {
                 time: Some(time),
                 ..Default::default()
@@ -442,10 +580,10 @@ fn slideshow_obeys_interval_pause_and_stop() {
         Err(String::new()),
     );
     app.files = vec!["a.png".into(), "b.png".into(), "c.png".into()];
-    app.recent_open = false;
+    app.library.open = false;
     app.run("slideshow", &ctx);
     let tick = |app: &mut Viewer, time| {
-        let _ = ctx.run(
+        let _ = ctx.run_pass(
             egui::RawInput {
                 time: Some(time),
                 ..Default::default()
@@ -483,7 +621,7 @@ fn pending_navigation_keeps_the_last_painted_texture_and_geometry() {
     let texture = |name: &str| {
         ctx.load_texture(
             name,
-            egui::ColorImage::new([16, 24], Color32::WHITE),
+            egui::ColorImage::filled([16, 24], Color32::WHITE),
             egui::TextureOptions::LINEAR,
         )
     };
@@ -491,6 +629,7 @@ fn pending_navigation_keeps_the_last_painted_texture_and_geometry() {
     app.pictures.insert(
         app.files[0].clone(),
         Picture {
+            hdr: None,
             animation: None,
             handle: first.clone(),
             original: [16, 24],
@@ -501,7 +640,7 @@ fn pending_navigation_keeps_the_last_painted_texture_and_geometry() {
     app.zoom = 2.;
     app.pan = egui::vec2(20., 30.);
     let draw = |app: &mut Viewer| {
-        let output = ctx.run(
+        let output = ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -509,7 +648,7 @@ fn pending_navigation_keeps_the_last_painted_texture_and_geometry() {
                 )),
                 ..Default::default()
             },
-            |ctx| app.canvas(ctx),
+            |ctx| ctx.root_ui(|ui| app.canvas(ui)),
         );
         output
             .shapes
@@ -548,6 +687,7 @@ fn pending_navigation_keeps_the_last_painted_texture_and_geometry() {
     app.pictures.insert(
         app.files[1].clone(),
         Picture {
+            hdr: None,
             animation: None,
             handle: stale,
             original: [16, 24],
@@ -564,6 +704,7 @@ fn pending_navigation_keeps_the_last_painted_texture_and_geometry() {
     app.pictures.insert(
         app.files[2].clone(),
         Picture {
+            hdr: None,
             animation: None,
             handle: current.clone(),
             original: [16, 24],
@@ -585,6 +726,7 @@ fn pending_navigation_keeps_the_last_painted_texture_and_geometry() {
     app.pictures.insert(
         app.files[0].clone(),
         Picture {
+            hdr: None,
             animation: None,
             handle: first,
             original: [16, 24],
@@ -661,7 +803,7 @@ fn imported_control_chords_execute_and_preserve_the_saved_spelling() {
             action: "flip-horizontal".into(),
             key: saved.into(),
         }]);
-        app.recent_open = false;
+        app.library.open = false;
         assert!(validate_keys(&app.settings).is_ok());
         let command = !cfg!(target_os = "macos") || saved.starts_with("Primary+");
         let modifiers = egui::Modifiers {
@@ -670,16 +812,18 @@ fn imported_control_chords_execute_and_preserve_the_saved_spelling() {
             mac_cmd: cfg!(target_os = "macos") && command,
             ..Default::default()
         };
-        let _ = ctx.run(
+        let _ = ctx.run_pass(
             egui::RawInput {
-                modifiers,
-                events: vec![egui::Event::Key {
-                    key: Key::R,
-                    physical_key: Some(Key::R),
-                    pressed: true,
-                    repeat: false,
-                    modifiers,
-                }],
+                events: vec![
+                    egui::Event::ModifiersChanged(modifiers),
+                    egui::Event::Key {
+                        key: Key::R,
+                        physical_key: Some(Key::R),
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    },
+                ],
                 ..Default::default()
             },
             |ctx| app.keyboard(ctx),
@@ -755,7 +899,7 @@ fn legacy_mapping_is_listed_without_adding_default_keys() {
         ..Default::default()
     };
     s.shortcuts.insert("new-window".into(), "D".into());
-    s.normalize_shortcuts();
+    s.normalize();
     assert!(validate_keys(&s).is_ok());
     assert_eq!(effective_keys(&s, "new-window"), vec!["D"]);
     assert!(effective_keys(&s, "next").is_empty());
@@ -763,7 +907,7 @@ fn legacy_mapping_is_listed_without_adding_default_keys() {
     assert!(s.shortcuts.is_empty());
     s.keyboard_shortcuts = Some(Vec::new());
     s.shortcuts.insert("new-window".into(), "D".into());
-    s.normalize_shortcuts();
+    s.normalize();
     assert!(effective_keys(&s, "new-window").is_empty());
 }
 #[test]
@@ -866,4 +1010,102 @@ fn shortcut_rows_are_independent_and_reset_only_changes_shortcuts() {
     assert!(app.bindings("close-window").contains(&"Escape".to_owned()));
     app.settings.rtl = true;
     assert_eq!(app.bindings("next"), vec!["Right", "D"]);
+}
+
+fn bare_viewer() -> (Viewer, egui::Context) {
+    let ctx = egui::Context::default();
+    let mut app = Viewer::new(
+        &eframe::CreationContext::_new_kittest(ctx.clone()),
+        None,
+        Err(String::new()),
+    );
+    app.last_error.clear();
+    (app, ctx)
+}
+
+#[test]
+fn phone_back_closes_the_topmost_layer_before_leaving_the_app() {
+    let (mut app, ctx) = bare_viewer();
+    // Without images the library is the start screen: back leaves the app.
+    assert!(app.library.open);
+    assert!(!app.handle_back(&ctx));
+    assert!(app.library.open);
+
+    app.files = vec!["1.png".into(), "2.png".into()];
+    app.fullscreen = true;
+    app.inspector.open = true;
+    app.settings_open = true;
+    app.menu_open = true;
+    app.random_prompt = true;
+    app.library.clear_prompt = true;
+    app.shortcut_reset_prompt = true;
+    app.held_key = Some((Key::ArrowRight, "next", 0.));
+
+    assert!(app.handle_back(&ctx));
+    assert!(!app.shortcut_reset_prompt && app.random_prompt);
+    assert!(app.held_key.is_none());
+    assert!(app.handle_back(&ctx));
+    assert!(!app.random_prompt && app.library.clear_prompt);
+    assert!(app.handle_back(&ctx));
+    assert!(!app.library.clear_prompt && app.menu_open);
+    assert!(app.handle_back(&ctx));
+    assert!(!app.menu_open && app.settings_open);
+    assert!(app.handle_back(&ctx));
+    assert!(!app.settings_open && app.library.open);
+    assert!(app.handle_back(&ctx));
+    assert!(!app.library.open && app.inspector.open);
+    assert!(app.handle_back(&ctx));
+    assert!(!app.inspector.open && app.fullscreen);
+    assert!(app.handle_back(&ctx));
+    assert!(!app.fullscreen);
+    assert!(!app.handle_back(&ctx));
+}
+
+#[test]
+fn replacing_settings_ends_shortcut_editing_and_held_input() {
+    let (mut app, _ctx) = bare_viewer();
+    app.settings_open = true;
+    app.shortcut_filter = "zoom".into();
+    app.shortcut_search = Some(String::new());
+    app.shortcut_editor = Some(settings::ShortcutEditor {
+        index: Some(0),
+        action: "open".into(),
+        key: "O".into(),
+        listening: false,
+        error: String::new(),
+    });
+    app.held_key = Some((Key::ArrowRight, "next", 0.));
+    app.held_button = Some((true, 0.));
+    let imported = Settings {
+        slide_ms: 2500,
+        ..Default::default()
+    };
+    app.replace_settings(imported.clone());
+    assert_eq!(app.settings, imported);
+    assert!(app.shortcut_editor.is_none() && app.shortcut_search.is_none());
+    assert!(app.shortcut_filter.is_empty());
+    assert!(app.held_key.is_none() && app.held_button.is_none());
+}
+
+#[test]
+fn spread_tooltips_and_setting_ranges_use_existing_catalog_keys() {
+    for key in ["two-page-spread", "spread-left", "spread-right"] {
+        assert_ne!(tr(key), key, "{key} is not in the catalog");
+    }
+    let defaults = Settings::default();
+    for ms in [
+        defaults.slide_ms,
+        defaults.key_delay_ms,
+        defaults.key_repeat_ms,
+        defaults.toast_ms,
+        defaults.cursor_hide_ms,
+    ] {
+        assert!(limits::TIME_MS.contains(&ms) && ms % limits::TIME_STEP_MS == 0);
+    }
+    assert!(limits::SMALL_IMAGE_PERCENT.contains(&defaults.small_image_percent));
+    assert!(limits::CACHE_IMAGE_LIMIT.contains(&defaults.cache_image_limit));
+    assert!(limits::CACHE_MEMORY_MB.contains(&defaults.cache_memory_mb));
+    assert!(limits::RECENT_LIMIT.contains(&defaults.recent_limit));
+    assert!(limits::RECENT_LIMIT.contains(&defaults.recent_move_limit));
+    assert!(limits::VIEW_MODES.contains(&defaults.view_mode.as_str()));
 }

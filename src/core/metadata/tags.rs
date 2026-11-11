@@ -59,7 +59,7 @@ fn le24(s: &[u8]) -> u32 {
     u32::from_le_bytes([s[0], s[1], s[2], 0])
 }
 fn dims(out: &mut Metadata, w: impl std::fmt::Display, h: impl std::fmt::Display) {
-    out.add("Dimensions", format!("{w} × {h}"));
+    out.add("Dimensions", format!("{w} × {h} px"));
 }
 fn text(s: &[u8]) -> String {
     // JPEG comments and IPTC frequently use Latin-1 when no UTF-8 marker is present.
@@ -222,6 +222,9 @@ pub fn exif(bytes: &[u8], out: &mut Metadata) {
 }
 
 pub fn icc(data: &[u8], out: &mut Metadata) {
+    if let Some(warning) = crate::core::media::color::icc_warning(data) {
+        out.warn(warning);
+    }
     out.add("ICC profile", format!("{} bytes", data.len()));
     if data.len() < 132 || &data[36..40] != b"acsp" {
         out.warn("Incomplete ICC profile header.");
@@ -782,7 +785,7 @@ mod tests {
         assert!(
             report
                 .fields
-                .contains(&("Dimensions".into(), "2 × 3".into()))
+                .contains(&("Dimensions".into(), "2 × 3 px".into()))
         );
 
         let mut riff = b"WEBPVP8X\x0a\0\0\0\x02\0\0\0\x01\0\0\x02\0\0".to_vec();
@@ -799,7 +802,7 @@ mod tests {
         assert!(
             report
                 .fields
-                .contains(&("Dimensions".into(), "2 × 3".into()))
+                .contains(&("Dimensions".into(), "2 × 3 px".into()))
         );
     }
 

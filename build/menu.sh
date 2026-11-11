@@ -79,6 +79,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$project_dir"
 if [ "$interactive" = true ]; then
     command -v rustc >/dev/null 2>&1 || fail 'Rust is required. Install it and reopen the terminal.'
     host=$(rustc -vV | sed -n 's/^host: //p' | tr -d '\r')

@@ -1,29 +1,37 @@
 mod actions;
 mod animation;
-mod canvas;
-mod chrome;
-mod image_pipeline;
-mod input;
-mod navigation;
-mod toasts;
-use crate::core::commands::*;
-use crate::i18n::{Language, tr};
+mod archive;
 #[cfg(test)]
 mod cache_memory_tests;
+mod canvas;
 mod checked_files;
+mod chrome;
 mod chrome_icons;
+mod details;
 mod forms;
+mod image_pipeline;
+mod input;
+mod library;
 mod menu;
 mod metadata;
 mod mobile_chrome;
+#[cfg(any(target_os = "ios", target_os = "android", test))]
+mod mobile_sources;
 mod move_files;
+mod navigation;
 mod overlay;
-mod recent;
 mod settings;
+mod sorting;
+mod toasts;
 mod window_frame;
+
+use crate::core::commands::*;
+use crate::core::library::Kind;
 use crate::core::media::{self, Media, MediaEvent};
-use crate::core::settings::{KeyboardShortcut, Settings};
+use crate::core::settings::{self as limits, KeyboardShortcut, Settings};
+use crate::i18n::{Language, tr};
 use crate::storage::Store;
+use chrome_icons::HoverText;
 use eframe::egui::{self, Color32, FontId, Key, Rect, RichText, Vec2};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -32,6 +40,22 @@ const BAR: Color32 = Color32::from_rgb(21, 23, 25);
 const INK: Color32 = Color32::from_rgb(236, 237, 231);
 const MUTED: Color32 = Color32::from_rgb(159, 165, 161);
 const ACCENT: Color32 = Color32::from_rgb(204, 232, 165);
+/// Notices that need attention without being failures.
+const WARNING: Color32 = Color32::from_rgb(244, 198, 145);
+/// Below this window width the bars use smaller buttons and tighter spacing.
+const NARROW_WIDTH: f32 = 700.;
+/// Smallest comfortable touch target on a phone.
+const TOUCH_TARGET: f32 = 44.;
+/// Manual zoom limits, in percent of the image's own pixels.
+const ZOOM_PERCENT: std::ops::RangeInclusive<f32> = 20. ..=3000.;
+/// One zoom-in or zoom-out step.
+const ZOOM_STEP: f32 = 1.25;
+/// Longest side decoded for a page; larger images show a reduced preview.
+const MAX_DECODE_SIDE: u32 = 4096;
+/// Longest side decoded for the thumbnail strip.
+const THUMBNAIL_DECODE_SIDE: u32 = 192;
+/// Page steps typed while a folder is still loading; later ones are dropped.
+const MAX_PENDING_STEPS: usize = i16::MAX as usize;
 const TOP_BAR_HEIGHT: f32 = 47.;
 const STATUS_BAR_HEIGHT: f32 = 45.;
 const THUMBNAIL_BAR_HEIGHT: f32 = 78.;
@@ -40,11 +64,37 @@ const THUMBNAIL_MARGIN: f32 = 12.;
 const BOTTOM_CHROME_HEIGHT: f32 = STATUS_BAR_HEIGHT + THUMBNAIL_BAR_HEIGHT;
 
 fn command_supported(id: &str) -> bool {
+    if mobile_only(id) {
+        return crate::app::is_mobile();
+    }
     (!crate::app::is_mobile() || crate::ui::mobile::supported(id))
         && (id != "reveal" || crate::platform::reveal_file::supported())
 }
 
+/// Native phones open private copies, so "trash" only removes them from the list.
+const REMOVES_FROM_LIST: bool = crate::core::NATIVE_MOBILE;
+
+fn command_label(id: &str) -> &'static str {
+    match id {
+        "trash" if REMOVES_FROM_LIST => "remove-from-list",
+        "undo-trash" if REMOVES_FROM_LIST => "restore-to-list",
+        _ => COMMANDS
+            .iter()
+            .find(|command| command.0 == id)
+            .map_or("", |command| command.1),
+    }
+}
+
+fn orientation_command(mode: &str) -> &'static str {
+    match mode {
+        "portrait" => "orientation-portrait",
+        "landscape" => "orientation-landscape",
+        _ => "orientation-auto",
+    }
+}
+
 struct Picture {
+    hdr: Option<std::sync::Arc<crate::ui::hdr::Texture>>,
     animation: Option<media::animation::Animation>,
     handle: egui::TextureHandle,
     original: [u32; 2],
@@ -56,9 +106,11 @@ type Ticket = (u64, PathBuf, u32);
 // Keep texture ownership, not just texture IDs: cache eviction must not free
 // the last successfully painted frame while another image is being decoded.
 struct PresentedImage {
+    hdr: Option<std::sync::Arc<crate::ui::hdr::Texture>>,
     handle: egui::TextureHandle,
     rect: Rect,
     clip: Rect,
+    backdrop: Rect,
 }
 
 #[derive(Default)]
@@ -68,7 +120,14 @@ struct Presentation {
 }
 
 impl Presentation {
-    fn paint(&self, ui: &egui::Ui, canvas: Rect, image_uv: Rect) {
+    fn paint(
+        &self,
+        ui: &egui::Ui,
+        canvas: Rect,
+        image_uv: Rect,
+        background: Color32,
+        checker: bool,
+    ) {
         let Some(previous) = self.canvas else { return };
         let transform = egui::emath::RectTransform::from_to(previous, canvas);
         let scale = (canvas.width() / previous.width()).min(canvas.height() / previous.height());
@@ -87,8 +146,32 @@ impl Presentation {
                 )
             };
             let painter = ui.painter().with_clip_rect(clip);
-            crate::ui::transparency::paint(&painter, rect, 12.);
-            painter.image(image.handle.id(), rect, image_uv, Color32::WHITE);
+            painter.rect_filled(rect, 0., background);
+            let backdrop = if previous == canvas {
+                image.backdrop
+            } else {
+                Rect::from_center_size(
+                    canvas.center() + (image.backdrop.center() - previous.center()) * scale,
+                    image.backdrop.size() * scale,
+                )
+            };
+            if checker {
+                crate::ui::transparency::paint(
+                    &painter.with_clip_rect(clip.intersect(rect)),
+                    backdrop,
+                    12.,
+                );
+            }
+            painter.image(
+                image
+                    .hdr
+                    .as_ref()
+                    .filter(|hdr| hdr.active())
+                    .map_or_else(|| image.handle.id(), |hdr| hdr.id()),
+                rect,
+                image_uv,
+                Color32::WHITE,
+            );
         }
     }
 }
@@ -114,10 +197,16 @@ pub struct Viewer {
     display_sleep: crate::platform::display_sleep::DisplaySleep,
     toast: Option<Toast>,
     media: Media,
+    details: details::Details,
+    render_state: Option<eframe::egui_wgpu::RenderState>,
     inspector: metadata::Inspector,
     store: Option<Store>,
     settings: Settings,
+    disk_cache_config: Option<(PathBuf, u32, bool)>,
     files: Vec<PathBuf>,
+    sorting: sorting::Sorting,
+    #[cfg(all(target_os = "macos", not(test)))]
+    mac_access: Option<crate::platform::mac_access::Access>,
     // Current page anchoring the focused spread. This is navigation state,
     // independent of widget/keyboard focus and checked selection.
     focus_index: usize,
@@ -127,6 +216,7 @@ pub struct Viewer {
     file_job: Option<checked_files::FileJob>,
     close_after_file_job: bool,
     closing_all: bool,
+    close_request_accepted: bool,
     close_signal: Option<crate::platform::close_signal::CloseSignal>,
     folder: Option<PathBuf>,
     listing: Option<u64>,
@@ -142,6 +232,8 @@ pub struct Viewer {
     page_sizes: HashMap<PathBuf, [u32; 2]>,
     // Group pages using the monitor, independently of window size and chrome.
     layout_monitor: Vec2,
+    // Two-page spreads are offered only when the display is wider than tall.
+    landscape: bool,
     span_cache: std::cell::RefCell<Option<SpanCache>>,
     presentation: Presentation,
     transition_waiting: bool,
@@ -153,8 +245,10 @@ pub struct Viewer {
     failures: HashMap<PathBuf, String>,
     last_error: String,
     frame: u64,
-    remember: Option<PathBuf>,
-    recent: Vec<PathBuf>,
+    /// Recent folders, bookmarks and their overlay, dialogs and thumbnails.
+    library: library::Library,
+    /// The zip or 7z archive open in this window, shown like a folder.
+    archives: archive::Archives,
     recent_moves: Vec<PathBuf>,
     move_dialog: Option<move_files::MoveDialog>,
     zoom: f32,
@@ -175,9 +269,8 @@ pub struct Viewer {
     shortcut_filter: String,
     shortcut_filter_focused: bool,
     shortcut_reset_prompt: bool,
+    reset_prompt: Option<settings::ResetScope>,
     reveal_job: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
-    recent_open: bool,
-    clear_prompt: bool,
     notices: Option<Vec<String>>,
     show_full_notices: bool,
     hide_controls: bool,
@@ -187,7 +280,7 @@ pub struct Viewer {
     held_button: Option<(bool, f64)>,
     canvas_drag: Option<CanvasDrag>,
     touch_gesture: crate::ui::mobile::TouchGesture,
-    #[cfg(any(target_os = "ios", target_os = "android"))]
+    #[cfg(any(target_os = "ios", target_os = "android", test))]
     mobile_selection: Option<crate::core::documents::ImportBatch>,
     window_size_state: window_frame::WindowSizeState,
     fullscreen: bool,
@@ -203,7 +296,9 @@ impl Viewer {
         store: Result<Store, String>,
     ) -> Self {
         let ctx = &cc.egui_ctx;
-        let mut style = (*ctx.style()).clone();
+        // All quit keys belong to the editable app bindings, including capture dialogs.
+        ctx.options_mut(|options| options.quit_shortcuts.clear());
+        let mut style = (*ctx.global_style()).clone();
         style.visuals = egui::Visuals::dark();
         style.visuals.panel_fill = BAR;
         style.visuals.window_fill = Color32::from_rgb(28, 30, 31);
@@ -212,9 +307,9 @@ impl Viewer {
         style.spacing.item_spacing = egui::vec2(8.0, 7.0);
         style.spacing.button_padding = egui::vec2(9.0, 5.0);
         if crate::app::is_mobile() {
-            style.spacing.interact_size = egui::vec2(44., 44.);
+            style.spacing.interact_size = Vec2::splat(TOUCH_TARGET);
         }
-        ctx.set_style(style);
+        ctx.set_global_style(style);
         let icon = eframe::icon_data::from_png_bytes(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/assets/icons/png/nabi-icon-256.png"
@@ -234,10 +329,16 @@ impl Viewer {
             app_icon,
             toast: None,
             media: Media::new(ctx.clone()),
+            details: details::Details::new(ctx.clone()),
+            render_state: cc.wgpu_render_state.clone(),
             inspector: metadata::Inspector::default(),
             store: None,
             settings: Settings::default(),
+            disk_cache_config: None,
             files: Vec::new(),
+            sorting: sorting::Sorting::default(),
+            #[cfg(all(target_os = "macos", not(test)))]
+            mac_access: None,
             focus_index: 0,
             checked: HashSet::new(),
             random_prompt: false,
@@ -245,6 +346,7 @@ impl Viewer {
             file_job: None,
             close_after_file_job: false,
             closing_all: false,
+            close_request_accepted: false,
             close_signal: store
                 .as_ref()
                 .ok()
@@ -267,6 +369,7 @@ impl Viewer {
             pictures: HashMap::new(),
             page_sizes: HashMap::new(),
             layout_monitor: Vec2::ZERO,
+            landscape: true,
             span_cache: Default::default(),
             presentation: Presentation::default(),
             transition_waiting: false,
@@ -277,8 +380,8 @@ impl Viewer {
             failures: HashMap::new(),
             last_error: String::new(),
             frame: 0,
-            remember: None,
-            recent: Vec::new(),
+            library: Default::default(),
+            archives: archive::Archives::new(ctx.clone()),
             recent_moves: Vec::new(),
             move_dialog: None,
             zoom: 1.0,
@@ -299,9 +402,8 @@ impl Viewer {
             shortcut_filter: String::new(),
             shortcut_filter_focused: false,
             shortcut_reset_prompt: false,
+            reset_prompt: None,
             reveal_job: None,
-            recent_open: false,
-            clear_prompt: false,
             notices: None,
             show_full_notices: false,
             hide_controls: !crate::app::is_mobile(),
@@ -311,7 +413,7 @@ impl Viewer {
             held_button: None,
             canvas_drag: None,
             touch_gesture: Default::default(),
-            #[cfg(any(target_os = "ios", target_os = "android"))]
+            #[cfg(any(target_os = "ios", target_os = "android", test))]
             mobile_selection: None,
             window_size_state: window_frame::WindowSizeState::default(),
             fullscreen: false,
@@ -319,9 +421,6 @@ impl Viewer {
             slideshow: false,
             slide_deadline: None,
         };
-        if let Some(path) = initial {
-            app.open(path);
-        }
         match store {
             Ok(store) => {
                 match store.load().and_then(|s| {
@@ -343,12 +442,50 @@ impl Viewer {
                 app.save();
             }
         }
+        app.sync_disk_cache();
+        #[cfg(all(target_os = "macos", not(test)))]
+        if let Some(store) = &app.store {
+            if let Err(error) = crate::platform::mac_access::configure(store.state_directory()) {
+                app.last_error = error;
+            }
+        }
+        if let Some(path) = initial {
+            let error = std::mem::take(&mut app.last_error);
+            app.open(path);
+            if app.last_error.is_empty() {
+                app.last_error = error;
+            }
+        }
         crate::i18n::set_language(app.settings.language.clone());
         if app.files.is_empty() && app.listing.is_none() {
-            app.recent_open = true;
-            app.reload_recent();
+            app.library.open = true;
+            app.reload_library();
         }
         app
+    }
+
+    fn sync_disk_cache(&mut self) {
+        let cache_config = self.store.as_ref().map(|store| {
+            (
+                store.cache_dir().to_owned(),
+                self.settings.disk_cache_mb,
+                self.settings.disk_cache_enabled,
+            )
+        });
+        if cache_config != self.disk_cache_config {
+            self.media.configure_cache(
+                cache_config
+                    .as_ref()
+                    .filter(|(_, _, enabled)| *enabled)
+                    .map(|(root, limit, _)| {
+                        crate::core::disk_cache::Cache::new(
+                            root.clone(),
+                            u64::from(*limit) * 1024 * 1024,
+                        )
+                    }),
+            );
+            self.disk_cache_config = cache_config;
+        }
     }
 
     fn save(&mut self) {
@@ -363,38 +500,125 @@ impl Viewer {
         self.menu_window(ctx);
         self.random_confirmation(ctx);
         self.settings_window(ctx);
-        self.recent_window(ctx);
+        self.poll_library_thumbnails(ctx);
+        self.library_window(ctx);
         self.move_window(ctx);
-        if self.clear_prompt {
-            egui::Window::new(tr("clear-recent-items-confirm"))
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.label(tr("remove-the-recent-list-on-this-device-confirm"));
-                    ui.horizontal(|ui| {
-                        if ui.button(tr("cancel")).clicked() {
-                            self.clear_prompt = false;
-                        }
-                        if ui.button(tr("clear-list")).clicked() {
-                            if let Some(s) = &self.store {
-                                match s.clear_recent() {
-                                    Ok(()) => {
-                                        self.recent.clear();
-                                        self.remember = None;
-                                    }
-                                    Err(e) => self.last_error = e,
-                                }
-                            }
-                            self.clear_prompt = false;
-                        }
-                    });
-                });
+        self.bookmark_window(ctx);
+        self.archive_window(ctx);
+        self.clear_recent_window(ctx);
+    }
+
+    /// Stops key and button auto-repeat, e.g. when a dialog takes the input.
+    fn release_held_input(&mut self) {
+        self.held_key = None;
+        self.held_button = None;
+    }
+
+    /// Leaves shortcut editing, search and filtering in the settings screen.
+    fn close_shortcut_editing(&mut self) {
+        self.shortcut_editor = None;
+        self.shortcut_search = None;
+        self.shortcut_filter.clear();
+        self.shortcut_filter_focused = false;
+        self.shortcut_reset_prompt = false;
+    }
+
+    /// A menu, list or dialog above the canvas that takes its input.
+    fn overlay_open(&self) -> bool {
+        self.menu_open || self.library.modal() || self.dialog_open() || self.random_prompt
+    }
+
+    /// The phone's back gesture closes the topmost layer. Returns false when
+    /// nothing is open, so the platform host can leave the app.
+    #[cfg(any(target_os = "ios", target_os = "android", test))]
+    fn handle_back(&mut self, ctx: &egui::Context) -> bool {
+        if ctx.any_popup_open() {
+            egui::Popup::close_all(ctx);
+        } else if self.shortcut_reset_prompt || self.reset_prompt.is_some() {
+            self.shortcut_reset_prompt = false;
+            self.reset_prompt = None;
+        } else if self.shortcut_editor.take().is_some() || self.zoom_input.take().is_some() {
+            // Taking the editor or the zoom field closed it.
+        } else if self.random_prompt {
+            self.random_prompt = false;
+        } else if self.library.clear_prompt {
+            self.library.clear_prompt = false;
+        } else if self.library.dialog.is_some() {
+            self.library.dialog = None;
+        } else if self.archives.prompt.is_some() {
+            self.leave_archive();
+        } else if self.move_dialog.is_some() {
+            // A running move keeps its dialog; the gesture is still used up.
+            if self.file_job.is_none() {
+                self.move_dialog = None;
+            }
+        } else if self.menu_open {
+            self.menu_open = false;
+        } else if self.settings_open {
+            self.settings_open = false;
+            self.close_shortcut_editing();
+        } else if self.library.open && (!self.files.is_empty() || self.listing.is_some()) {
+            // Without images the list is the start screen; nothing is behind it.
+            self.library.open = false;
+        } else if self.inspector.open {
+            self.inspector.close();
+        } else if self.fullscreen {
+            self.fullscreen = false;
+        } else {
+            return false;
         }
+        // A closed dialog must not keep the on-screen keyboard up.
+        ctx.memory_mut(|m| {
+            if let Some(id) = m.focused() {
+                m.surrender_focus(id);
+            }
+        });
+        self.release_held_input();
+        true
     }
 }
 
 impl eframe::App for Viewer {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // eframe 0.37 skips ui for minimized/occluded windows. Shutdown and
+        // file-operation completion must still run there, without painting.
+        self.close_request_accepted = false;
+        #[cfg(target_os = "macos")]
+        if crate::platform::mac_open::take_close_all() && !self.shortcut_input_active() {
+            self.run("close-all", ctx);
+        }
+        if self
+            .close_signal
+            .as_mut()
+            .is_some_and(|signal| signal.poll())
+        {
+            self.request_graceful_close(ctx);
+        }
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if self.shortcut_input_active() && !self.closing_all {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            } else if self.file_job.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.close_after_file_job = true;
+                self.show_toast(
+                    ctx,
+                    tr("the-window-will-close-when-the-file-operation-finishes"),
+                );
+            } else {
+                if let Err(error) = self.window_size_state.flush(self.store.as_ref()) {
+                    self.last_error = error;
+                }
+                self.close_request_accepted = true;
+            }
+        }
+        self.poll_file_job(ctx);
+    }
+
     fn on_exit(&mut self) {
+        // The folder reopens at the page this window showed last.
+        self.remember_page();
+        // Nothing reads the extracted pages any more.
+        self.archives.close();
         if let Err(error) = self.window_size_state.flush(self.store.as_ref()) {
             eprintln!("Could not save window size: {error}");
         }
@@ -407,24 +631,13 @@ impl eframe::App for Viewer {
     fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
         self.prepare_pointer_input(ctx, input);
         #[cfg(any(target_os = "ios", target_os = "android"))]
-        if let Some(screen) = input.screen_rect {
-            let ppp = input
-                .viewports
-                .get(&input.viewport_id)
-                .and_then(|v| v.native_pixels_per_point)
-                .unwrap_or(ctx.pixels_per_point());
-            input.screen_rect = Some(crate::ui::mobile::safe_rect(
-                screen,
-                crate::platform::mobile::safe_area(),
-                ppp,
-            ));
-        }
+        prepare_mobile_safe_area(ctx, input, crate::platform::mobile::safe_area());
         self.sync_native_shortcut_capture();
         #[cfg(all(target_os = "macos", not(test)))]
         if let Some(viewport) = input.viewports.get_mut(&input.viewport_id) {
             viewport.fullscreen = Some(self.fullscreen);
         }
-        self.popup_open_at_input = self.menu_open || ctx.memory(|m| m.any_popup_open());
+        self.popup_open_at_input = self.menu_open || ctx.any_popup_open();
         let capturing = self.shortcut_editor.as_ref().is_some_and(|e| e.listening)
             || self
                 .shortcut_search
@@ -433,9 +646,8 @@ impl eframe::App for Viewer {
         if self.zoom_input.is_some()
             || (!capturing
                 && (self.settings_open
-                    || self.recent_open
-                    || self.move_dialog.is_some()
-                    || self.clear_prompt
+                    || self.library.modal()
+                    || self.dialog_open()
                     || self.random_prompt
                     || self.popup_open_at_input))
         {
@@ -472,13 +684,34 @@ impl eframe::App for Viewer {
         }
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &root.ctx().clone();
+        if self.close_request_accepted {
+            return;
+        }
+        if let Some(state) = &self.render_state {
+            crate::ui::hdr::configure_display(state);
+            if state.target_format == eframe::wgpu::TextureFormat::Rgba16Float {
+                ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            }
+        }
+        self.sync_sort_settings();
         if !crate::app::is_mobile() {
             self.cursor_idle.observe(ctx);
         }
         // Widgets may replace this with resize/grab/text cursors below.
         ctx.set_cursor_icon(egui::CursorIcon::Default);
+        self.sync_disk_cache();
+        let animation_time = if self.settings.reduce_motion {
+            0.0
+        } else {
+            egui::Style::default().animation_time
+        };
+        if ctx.global_style().animation_time != animation_time {
+            ctx.global_style_mut(|style| style.animation_time = animation_time);
+        }
         crate::i18n::set_language(self.settings.language.clone());
+        crate::platform::fonts::sync_language(ctx);
         #[cfg(all(target_os = "macos", not(test)))]
         crate::platform::mac_open::localize_menu();
         #[cfg(all(target_os = "macos", not(test)))]
@@ -488,95 +721,93 @@ impl eframe::App for Viewer {
         }
         self.frame += 1;
         #[cfg(any(target_os = "ios", target_os = "android"))]
-        if crate::platform::mobile::take_back() {
-            if self.menu_open {
-                self.menu_open = false;
-            } else if self.settings_open {
-                self.settings_open = false;
-            } else if self.inspector.open {
-                self.inspector.close();
-            } else {
-                #[cfg(target_os = "android")]
-                crate::platform::mobile::exit();
-            }
+        if crate::platform::mobile::take_back() && !self.handle_back(ctx) {
+            #[cfg(target_os = "android")]
+            crate::platform::mobile::exit();
         }
         #[cfg(any(target_os = "ios", target_os = "android"))]
         if let Some(result) = crate::platform::mobile::take_result() {
             match result {
                 Ok(selection) => {
-                    if let Some(path) = selection.first() {
-                        self.open(path.to_owned());
-                        self.mobile_selection = Some(selection);
-                    }
+                    self.accept_mobile_selection(selection);
                 }
                 Err(error) => self.last_error = error,
             }
+        }
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        {
+            match crate::platform::mobile::take_settings_import() {
+                Some(Ok(path)) => self.import_settings_from(&path),
+                Some(Err(error)) => self.last_error = error,
+                None => {}
+            }
+            if crate::platform::mobile::take_export_failed() {
+                self.last_error = "Could not save the settings file.".into();
+            }
+            crate::platform::mobile::sync_display(&self.settings.orientation, self.fullscreen);
         }
         #[cfg(target_os = "macos")]
         if crate::platform::mac_open::take_about() {
             self.run("about", ctx);
         }
-        #[cfg(target_os = "macos")]
-        if crate::platform::mac_open::take_close_all() && !self.shortcut_input_active() {
-            self.run("close-all", ctx);
-        }
-        if self
-            .close_signal
-            .as_mut()
-            .is_some_and(|signal| signal.poll())
+        if !crate::app::is_mobile()
+            && let Err(error) = self.window_size_state.observe(ctx, self.store.as_ref())
         {
-            self.request_graceful_close(ctx);
-        }
-        if let Err(error) = if crate::app::is_mobile() {
-            Ok(())
-        } else {
-            self.window_size_state.observe(ctx, self.store.as_ref())
-        } {
             self.last_error = error;
-        }
-        if ctx.input(|i| i.viewport().close_requested()) {
-            if self.shortcut_input_active() && !self.closing_all {
-                // Alt-F4 / native window close is not an egui key action.
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            } else if self.file_job.is_some() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.close_after_file_job = true;
-                self.show_toast(
-                    ctx,
-                    tr("the-window-will-close-when-the-file-operation-finishes"),
-                );
-            } else {
-                if let Err(error) = self.window_size_state.flush(self.store.as_ref()) {
-                    self.last_error = error;
-                }
-                return;
-            }
         }
         #[cfg(target_os = "macos")]
         if let Some(request) = crate::platform::mac_open::take() {
             match request {
                 crate::app::OpenRequest::Here(path) => self.open(path),
-                crate::app::OpenRequest::New(path) => self.new_window(path.as_deref()),
+                crate::app::OpenRequest::New(path) => {
+                    #[cfg(not(test))]
+                    if let Some(path) = path
+                        .as_ref()
+                        .filter(|path| crate::platform::mac_access::temporary(path))
+                    {
+                        self.open(path.clone());
+                    } else {
+                        self.new_window(path.as_deref());
+                    }
+                    #[cfg(test)]
+                    self.new_window(path.as_deref());
+                }
             }
         }
         let dropped = ctx.input(|i| {
             i.raw
                 .dropped_files
                 .iter()
-                .filter_map(|f| f.path.clone())
+                .map(|f| f.path().to_path_buf())
                 .collect::<Vec<_>>()
         });
         for path in dropped {
+            #[cfg(all(target_os = "macos", not(test)))]
+            let permission_error = crate::platform::mac_access::remember(&path).err();
+            #[cfg(all(target_os = "macos", not(test)))]
+            if permission_error.is_some() {
+                self.open(path);
+            } else {
+                self.open_from_user(path);
+            }
+            #[cfg(not(all(target_os = "macos", not(test))))]
             self.open_from_user(path);
+            #[cfg(all(target_os = "macos", not(test)))]
+            if let Some(error) = permission_error {
+                self.last_error = error;
+            }
         }
         // Persist only after a frame containing an image has already been submitted.
         if !self.pictures.is_empty()
-            && let Some(dir) = self.remember.take()
+            && let Some(dir) = self.library.remember.take()
             && self.settings.remember_recent
             && let Some(s) = &self.store
-            && let Err(e) = s.record_folder(&dir, self.settings.recent_limit)
         {
-            self.last_error = e;
+            if let Err(e) = s.record_folder(&dir, self.settings.recent_limit) {
+                self.last_error = e;
+            } else {
+                self.remember_page();
+            }
         }
         if let Some(sample) = self.memory_monitor.take() {
             self.apply_memory_sample(sample);
@@ -590,88 +821,37 @@ impl eframe::App for Viewer {
         {
             self.layout_monitor = size;
         }
+        // Mobile follows the current app window, including tablet rotation and
+        // split-screen resizing. Desktops follow the monitor so that resizing
+        // the window does not toggle the spread.
+        let display = if crate::app::is_mobile() || self.layout_monitor == Vec2::ZERO {
+            ctx.viewport_rect().size()
+        } else {
+            self.layout_monitor
+        };
+        self.landscape = display.x > display.y;
+        self.poll_archive(ctx);
         self.collect(ctx);
-        if let Some(receiver) = &self.reveal_job {
-            match receiver.try_recv() {
-                Ok(result) => {
-                    self.reveal_job = None;
-                    if let Err(error) = result {
-                        self.last_error = error;
-                    }
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.reveal_job = None;
-                    self.last_error = tr("file-manager-request-failed").into();
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            }
-        }
-        self.poll_file_job(ctx);
+        self.poll_reveal();
         self.keyboard(ctx);
+        self.library_mouse(ctx);
         self.advance_slideshow(ctx);
         self.update_controls(ctx);
         self.inspector.poll();
         self.animate(ctx);
+        // The settings screen covers the viewer and its bars.
+        let chrome = self.controls_visible && !self.settings_open;
         if self.settings_open {
-            if self
-                .toast
-                .as_ref()
-                .is_some_and(|toast| !toast.keep_on_slideshow)
-            {
-                self.toast = None;
-            }
+            // Only toasts about a setting belong on the settings screen.
+            self.toast.take_if(|toast| !toast.keep_on_slideshow);
             self.held_button = None;
-            self.canvas(ctx);
-            self.windows(ctx);
-            self.toast_overlay(ctx);
-            self.sync_native_shortcut_capture();
-            self.queue_images();
-            self.media.clear_thumbnail();
-            self.thumb_ticket = None;
-            self.queue_prefetch();
-            if !crate::app::is_mobile() {
-                window_frame::resize(ctx);
-            }
-            if !crate::app::is_mobile() {
-                self.cursor_idle.apply(ctx, self.settings.cursor_hide_ms);
-            }
-            #[cfg(any(target_os = "ios", target_os = "android"))]
-            crate::platform::mobile::clipboard(ctx);
-            self.display_sleep.update(
-                self.settings.prevent_display_sleep
-                    && (!crate::app::is_mobile() || ctx.input(|i| i.focused)),
-                ctx,
-            );
-            return;
         }
-        self.canvas(ctx);
-        if self.controls_visible {
-            if crate::app::is_mobile() {
-                self.mobile_chrome(ctx);
-            } else {
-                self.top(ctx);
-                self.bottom(ctx);
-                self.thumbnail_bar(ctx);
-            }
-            if !self.last_error.is_empty() {
-                egui::Area::new(egui::Id::new("notice"))
-                    .order(egui::Order::Foreground)
-                    .fixed_pos(ctx.screen_rect().min + egui::vec2(14., 52.))
-                    .show(ctx, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            if ui.small_button("×").clicked() {
-                                self.last_error.clear();
-                            }
-                            ui.label(
-                                RichText::new(crate::i18n::value_label(
-                                    "error-details",
-                                    &self.last_error,
-                                ))
-                                .color(Color32::from_rgb(244, 198, 145)),
-                            );
-                        });
-                    });
-            }
+        self.canvas(root);
+        if chrome {
+            self.top(ctx);
+            self.bottom(ctx);
+            self.thumbnail_bar(ctx);
+            self.notice_overlay(ctx);
         }
         self.windows(ctx);
         self.sync_native_shortcut_capture();
@@ -683,12 +863,12 @@ impl eframe::App for Viewer {
             self.held_button = None;
         }
         self.queue_images();
-        if !self.controls_visible {
+        if !chrome {
             self.media.clear_thumbnail();
             self.thumb_ticket = None;
         }
         self.queue_prefetch();
-        if self.remember.is_some() && !self.pictures.is_empty() {
+        if self.library.remember.is_some() && !self.pictures.is_empty() {
             ctx.request_repaint();
         }
         if !crate::app::is_mobile() {
@@ -696,11 +876,40 @@ impl eframe::App for Viewer {
         }
         #[cfg(any(target_os = "ios", target_os = "android"))]
         crate::platform::mobile::clipboard(ctx);
-        self.display_sleep.update(
-            self.settings.prevent_display_sleep
-                && (!crate::app::is_mobile() || ctx.input(|i| i.focused)),
-            ctx,
-        );
+        self.display_sleep
+            .update(self.wants_display_awake(ctx), ctx);
+    }
+}
+
+impl Viewer {
+    /// Desktop keeps the display awake only while presenting; mobile while focused.
+    fn wants_display_awake(&self, ctx: &egui::Context) -> bool {
+        self.settings.prevent_display_sleep
+            && if crate::app::is_mobile() {
+                ctx.input(|i| i.focused)
+            } else {
+                self.fullscreen || self.slideshow
+            }
+    }
+}
+
+#[cfg(any(target_os = "ios", target_os = "android", test))]
+fn prepare_mobile_safe_area(
+    ctx: &egui::Context,
+    input: &mut egui::RawInput,
+    physical_insets: [f32; 4],
+) {
+    // Keep the existing native-window pointer coordinates and inset viewport.
+    // egui-winit 0.37 also supplies iOS insets: clear those every time (None
+    // retains the preceding frame), or Area/Window constraints subtract twice.
+    input.safe_area_insets = Some(Default::default());
+    if let Some(screen) = input.screen_rect {
+        let ppp = input
+            .viewports
+            .get(&input.viewport_id)
+            .and_then(|v| v.native_pixels_per_point)
+            .unwrap_or(ctx.pixels_per_point());
+        input.screen_rect = Some(crate::ui::mobile::safe_rect(screen, physical_insets, ppp));
     }
 }
 
@@ -722,7 +931,11 @@ fn parse_zoom_percent(text: &str) -> Option<f32> {
         return None;
     }
     let percent: f32 = text.parse().ok()?;
-    (10. ..=3000.).contains(&percent).then_some(percent)
+    ZOOM_PERCENT.contains(&percent).then_some(percent)
+}
+
+fn clamp_zoom_percent(percent: f32) -> f32 {
+    percent.clamp(*ZOOM_PERCENT.start(), *ZOOM_PERCENT.end())
 }
 
 fn chrome_drag(ui: &mut egui::Ui, rect: Rect) {
@@ -731,7 +944,7 @@ fn chrome_drag(ui: &mut egui::Ui, rect: Rect) {
     // hold (especially the click that activates the window) must not start it.
     let response = ui.interact(
         rect,
-        ui.id().with("window-drag"),
+        ui.scope_id().with("window-drag"),
         egui::Sense::click_and_drag(),
     );
     let blocked_id = response.id.with("pressed-on-control");
@@ -806,6 +1019,11 @@ struct SpanCache {
     span: (usize, usize),
 }
 
+/// Commands that switch between single-page and two-page layouts.
+fn is_layout_command(id: &str) -> bool {
+    matches!(id, "single" | "spread" | "spread-left" | "spread-right")
+}
+
 // A page limited by the width of half the monitor gets the whole canvas.
 // Only the aspect ratio matters, so OS/UI scaling does not affect grouping.
 fn width_limited(size: [u32; 2], monitor: Vec2) -> bool {
@@ -857,7 +1075,7 @@ fn next_page(focus_index: usize, len: usize, spread: bool, cover: bool, forward:
 // Preserve a selected symlink entry and its neighbors, rather than opening
 // the target in a different folder. Missing paths retain their error page.
 fn normalize_open_path(path: PathBuf) -> PathBuf {
-    let path = std::path::absolute(&path).unwrap_or(path);
+    let path = crate::core::paths::simplified(std::path::absolute(&path).unwrap_or(path));
     if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
         return path;
     }
@@ -939,3 +1157,14 @@ fn effective_keys(s: &Settings, id: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests;
+
+fn scroll_source(drag: bool) -> egui::scroll_area::ScrollSource {
+    egui::scroll_area::ScrollSource {
+        drag: if drag {
+            egui::scroll_area::DragScroll::Always
+        } else {
+            egui::scroll_area::DragScroll::Never
+        },
+        ..Default::default()
+    }
+}

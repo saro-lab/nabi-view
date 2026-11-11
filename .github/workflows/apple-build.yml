@@ -1,0 +1,60 @@
+name: Apple store preparation
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ios:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install build tools
+        run: |
+          rustup show
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          brew install cmake
+      - name: Archive without signing credentials
+        run: sh build/ios-store.sh archive --unsigned
+      - name: Build simulator app
+        run: sh build/ios.sh --build-only
+      - name: Verify iPhone and iPad archive support
+        run: |
+          python3 - <<'PY'
+          import pathlib, plistlib
+          app = pathlib.Path('target/store/ios/NabiView.xcarchive/Products/Applications/NABI VIEW.app')
+          info = plistlib.loads((app / 'Info.plist').read_bytes())
+          assert set(info['UIDeviceFamily']) == {1, 2}, 'Archive must support iPhone and iPad'
+          assert len(set(info['UISupportedInterfaceOrientations~ipad'])) == 4, 'iPad needs all four orientations'
+          assert not info.get('UIRequiresFullScreen', False), 'iPad window resizing must remain enabled'
+          PY
+      - name: Zip unsigned archive
+        run: ditto -c -k --keepParent target/store/ios/NabiView.xcarchive target/store/ios/NabiView-unsigned.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nabi-view-ios-unsigned-archive
+          path: target/store/ios/NabiView-unsigned.zip
+          if-no-files-found: error
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install build tools
+        run: |
+          rustup show
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          brew install cmake nasm
+      - name: Package Universal sandbox candidate
+        run: sh build/macos-store.sh --target universal
+      - name: Zip sandbox candidate
+        run: ditto -c -k --keepParent 'target/store/macos/universal/NABI VIEW.app' target/store/macos/universal/NabiView-sandbox.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nabi-view-macos-sandbox-candidate
+          path: target/store/macos/universal/NabiView-sandbox.zip
+          if-no-files-found: error

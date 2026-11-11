@@ -15,6 +15,33 @@ enum FileResult {
 }
 
 impl Viewer {
+    #[cfg(all(target_os = "macos", not(test)))]
+    fn authorize_file_folders(
+        &mut self,
+        paths: &[PathBuf],
+        destination: Option<&Path>,
+    ) -> Option<Vec<crate::platform::mac_access::Access>> {
+        if !crate::platform::mac_access::sandboxed() {
+            return Some(Vec::new());
+        }
+        let folders: std::collections::BTreeSet<_> = paths
+            .iter()
+            .filter_map(|path| path.parent().map(Path::to_owned))
+            .chain(destination.map(Path::to_owned))
+            .collect();
+        let mut scopes = Vec::new();
+        for folder in folders {
+            match crate::platform::mac_access::write_scope(&folder) {
+                Ok(Some(scope)) => scopes.push(scope),
+                Ok(None) => return None,
+                Err(error) => {
+                    self.last_error = error;
+                    return None;
+                }
+            }
+        }
+        Some(scopes)
+    }
     pub(super) fn replay_pending_navigation(&mut self, ctx: &egui::Context) {
         for (forward, check) in std::mem::take(&mut self.pending_steps) {
             if check {
@@ -55,7 +82,8 @@ impl Viewer {
             shuffle_paths(&mut self.files);
             self.focus(0);
         } else {
-            self.files.sort_by(|a, b| media::compare_file_names(a, b));
+            let files = std::mem::take(&mut self.files);
+            self.files = self.sorted_files(files);
             self.focus(
                 self.files
                     .iter()
@@ -69,7 +97,7 @@ impl Viewer {
         if !self.random_prompt {
             return;
         }
-        let response = egui::Modal::new(egui::Id::new("random-clears-checks")).show(ctx, |ui| {
+        let response = egui::Modal::new(egui::Id::unique("random-clears-checks")).show(ctx, |ui| {
             ui.heading(tr("clear-checks-and-enable-random-order-confirm"));
             ui.label(tr("enabling-random-order-will-clear-all-checks"));
             ui.horizontal(|ui| {
@@ -104,14 +132,14 @@ impl Viewer {
         ));
         ui.interact(
             badge,
-            egui::Id::new(("thumbnail-check", path)),
+            egui::Id::unique(("thumbnail-check", path)),
             egui::Sense::hover(),
         )
-        .on_hover_text(tr("checked"));
+        .hover_text(tr("checked"));
     }
 
     pub(super) fn file_targets(&self) -> Vec<PathBuf> {
-        if self.checked.is_empty() {
+        let paths = if self.checked.is_empty() {
             if self.files.is_empty() {
                 Vec::new()
             } else {
@@ -125,7 +153,37 @@ impl Viewer {
                 .filter(|p| self.checked.contains(*p))
                 .cloned()
                 .collect()
-        }
+        };
+        #[cfg(any(target_os = "ios", target_os = "android", test))]
+        let paths = paths
+            .into_iter()
+            .filter(|path| crate::core::documents::source_record(path).is_none())
+            .collect();
+        paths
+    }
+
+    /// Runs file work off the UI thread; `poll_file_job` collects its result.
+    fn spawn_file_job(
+        &mut self,
+        ctx: &egui::Context,
+        name: &str,
+        undo_backup: Option<Vec<TrashEntry>>,
+        work: impl FnOnce() -> FileResult + Send + 'static,
+    ) -> Result<(), String> {
+        let (sender, receiver) = mpsc::channel();
+        let repaint = ctx.clone();
+        std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                let _ = sender.send(work());
+                repaint.request_repaint();
+            })
+            .map_err(|error| error.to_string())?;
+        self.file_job = Some(FileJob {
+            receiver,
+            undo_backup,
+        });
+        Ok(())
     }
 
     pub(super) fn trash_files(&mut self, ctx: &egui::Context) {
@@ -137,18 +195,21 @@ impl Viewer {
         if paths.is_empty() {
             return;
         }
-        let (sender, receiver) = mpsc::channel();
-        let repaint = ctx.clone();
-        self.file_job = Some(FileJob {
-            receiver,
-            undo_backup: None,
-        });
-        std::thread::spawn(move || {
-            let result = crate::platform::trash::move_to_trash(paths);
-            let _ = sender.send(FileResult::Trashed(result));
-            repaint.request_repaint();
-        });
-        self.show_toast(ctx, tr("moving-images-to-trash-dialog"));
+        #[cfg(all(target_os = "macos", not(test)))]
+        let Some(scopes) = self.authorize_file_folders(&paths, None) else {
+            return;
+        };
+        match self.spawn_file_job(ctx, "trash-images", None, move || {
+            #[cfg(all(target_os = "macos", not(test)))]
+            let _scopes = scopes;
+            FileResult::Trashed(crate::platform::trash::move_to_trash(paths))
+        }) {
+            Ok(()) if !REMOVES_FROM_LIST => {
+                self.show_toast(ctx, tr("moving-images-to-trash-dialog"));
+            }
+            Ok(()) => {}
+            Err(error) => self.last_error = error,
+        }
     }
 
     pub(super) fn start_move(
@@ -160,27 +221,21 @@ impl Viewer {
         if self.file_job.is_some() || paths.is_empty() {
             return;
         }
-        let (sender, receiver) = mpsc::channel();
-        let repaint = ctx.clone();
-        match std::thread::Builder::new()
-            .name("move-images".into())
-            .spawn(move || {
-                let result = crate::core::file_move::move_files(paths, &destination);
-                let _ = sender.send(FileResult::Moved(result));
-                repaint.request_repaint();
-            }) {
-            Ok(_) => {
-                self.file_job = Some(FileJob {
-                    receiver,
-                    undo_backup: None,
-                });
-                self.show_toast(ctx, tr("moving-images"));
-            }
+        #[cfg(all(target_os = "macos", not(test)))]
+        let Some(scopes) = self.authorize_file_folders(&paths, Some(&destination)) else {
+            return;
+        };
+        match self.spawn_file_job(ctx, "move-images", None, move || {
+            #[cfg(all(target_os = "macos", not(test)))]
+            let _scopes = scopes;
+            FileResult::Moved(crate::core::file_move::move_files(paths, &destination))
+        }) {
+            Ok(()) => self.show_toast(ctx, tr("moving-images")),
             Err(error) => {
-                self.last_error = error.to_string();
                 if let Some(dialog) = &mut self.move_dialog {
-                    dialog.error.clone_from(&self.last_error);
+                    dialog.error.clone_from(&error);
                 }
+                self.last_error = error;
             }
         }
     }
@@ -190,22 +245,35 @@ impl Viewer {
             self.show_toast(ctx, tr("a-file-operation-is-still-in-progress"));
             return;
         }
-        let Some(entries) = self.trash_history.pop() else {
+        // The batch leaves the history only once its worker has started.
+        let Some(entries) = self.trash_history.last().cloned() else {
             self.show_toast(ctx, tr("there-are-no-images-to-restore"));
             return;
         };
-        let (sender, receiver) = mpsc::channel();
-        let repaint = ctx.clone();
-        self.file_job = Some(FileJob {
-            receiver,
-            undo_backup: Some(entries.clone()),
-        });
-        std::thread::spawn(move || {
-            let result = crate::platform::trash::restore_batch(entries);
-            let _ = sender.send(FileResult::Restored(result));
-            repaint.request_repaint();
-        });
-        self.show_toast(ctx, tr("restoring-images-from-trash-dialog"));
+        let backup = self.trash_history.last().cloned();
+        #[cfg(all(target_os = "macos", not(test)))]
+        let Some(scopes) = self.authorize_file_folders(
+            &entries
+                .iter()
+                .map(|entry| entry.original_path.clone())
+                .collect::<Vec<_>>(),
+            None,
+        ) else {
+            return;
+        };
+        match self.spawn_file_job(ctx, "restore-images", backup, move || {
+            #[cfg(all(target_os = "macos", not(test)))]
+            let _scopes = scopes;
+            FileResult::Restored(crate::platform::trash::restore_batch(entries))
+        }) {
+            Ok(()) => {
+                self.trash_history.pop();
+                if !REMOVES_FROM_LIST {
+                    self.show_toast(ctx, tr("restoring-images-from-trash-dialog"));
+                }
+            }
+            Err(error) => self.last_error = error,
+        }
     }
 
     pub(super) fn poll_file_job(&mut self, ctx: &egui::Context) {
@@ -248,7 +316,14 @@ impl Viewer {
                 if !result.trashed.is_empty() {
                     self.trash_history.push(result.trashed);
                 }
-                (result.failed, "images-moved-to-trash")
+                (
+                    result.failed,
+                    if REMOVES_FROM_LIST {
+                        "images-removed-from-list"
+                    } else {
+                        "images-moved-to-trash"
+                    },
+                )
             }
             FileResult::Moved(result) => {
                 let removed: HashSet<_> = result.moved.iter().cloned().collect();
@@ -264,7 +339,7 @@ impl Viewer {
                 }
                 if result.failed.is_empty() {
                     self.move_dialog = None;
-                    ctx.memory_mut(|memory| memory.surrender_focus(egui::Id::new("move-path")));
+                    ctx.memory_mut(|memory| memory.surrender_focus(egui::Id::unique("move-path")));
                 } else if let Some(dialog) = &mut self.move_dialog {
                     dialog.paths = result.failed.iter().map(|(path, _)| path.clone()).collect();
                     dialog.error = result
@@ -288,7 +363,14 @@ impl Viewer {
                 if !result.remaining.is_empty() {
                     self.trash_history.push(result.remaining);
                 }
-                (result.failed, "images-restored-from-trash")
+                (
+                    result.failed,
+                    if REMOVES_FROM_LIST {
+                        "images-restored-to-list"
+                    } else {
+                        "images-restored-from-trash"
+                    },
+                )
             }
         };
         // Retire stale watcher snapshots taken before the operation completed.
@@ -322,6 +404,83 @@ impl Viewer {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn hidden_window_defers_native_close_until_file_work_succeeds() {
+        use eframe::App;
+
+        for fail in [false, true] {
+            for complete_before_close in [false, true] {
+                let (mut app, ctx) = viewer();
+                let (sender, receiver) = std::sync::mpsc::channel();
+                app.file_job = Some(FileJob {
+                    receiver,
+                    undo_backup: None,
+                });
+                let mut result = TrashBatchResult::default();
+                if fail {
+                    result
+                        .failed
+                        .push(("image.png".into(), "test error".into()));
+                }
+                let mut result = Some(result);
+                if complete_before_close {
+                    sender
+                        .send(FileResult::Trashed(result.take().unwrap()))
+                        .unwrap();
+                }
+                let mut input = egui::RawInput {
+                    focused: false,
+                    ..Default::default()
+                };
+                let viewport = input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap();
+                viewport.minimized = Some(true);
+                viewport.events.push(egui::ViewportEvent::Close);
+                let mut output = ctx.run_logic(&input, |ctx| {
+                    app.logic(ctx, &mut eframe::Frame::_new_kittest());
+                });
+                assert!(
+                    output
+                        .viewport_commands
+                        .values()
+                        .any(|commands| { commands.contains(&egui::ViewportCommand::CancelClose) })
+                );
+                if !complete_before_close {
+                    assert!(app.close_after_file_job);
+                    assert!(
+                        !output
+                            .viewport_commands
+                            .values()
+                            .any(|commands| { commands.contains(&egui::ViewportCommand::Close) })
+                    );
+                    sender
+                        .send(FileResult::Trashed(result.take().unwrap()))
+                        .unwrap();
+                    input
+                        .viewports
+                        .get_mut(&egui::ViewportId::ROOT)
+                        .unwrap()
+                        .events
+                        .clear();
+                    output = ctx.run_logic(&input, |ctx| {
+                        app.logic(ctx, &mut eframe::Frame::_new_kittest());
+                    });
+                }
+                let closed = output
+                    .viewport_commands
+                    .values()
+                    .any(|commands| commands.contains(&egui::ViewportCommand::Close));
+                assert_eq!(closed, !fail);
+                assert!(!app.close_after_file_job);
+                assert!(app.file_job.is_none());
+                assert!(!app.close_request_accepted);
+                if fail {
+                    assert!(app.last_error.contains("test error"));
+                    assert!(!app.closing_all);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn close_all_waits_for_file_work_and_does_not_hide_failures() {
         for fail in [false, true] {
             let (mut app, ctx) = viewer();
@@ -330,7 +489,7 @@ mod tests {
                 receiver,
                 undo_backup: None,
             });
-            let output = ctx.run(egui::RawInput::default(), |ctx| {
+            let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
                 app.request_graceful_close(ctx)
             });
             assert!(app.close_after_file_job);
@@ -347,7 +506,7 @@ mod tests {
                     .push(("image.png".into(), "test error".into()));
             }
             sender.send(FileResult::Trashed(result)).unwrap();
-            let output = ctx.run(egui::RawInput::default(), |ctx| app.poll_file_job(ctx));
+            let output = ctx.run_pass(egui::RawInput::default(), |ctx| app.poll_file_job(ctx));
             let closed = output
                 .viewport_output
                 .values()

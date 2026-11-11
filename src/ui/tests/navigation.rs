@@ -523,7 +523,7 @@ fn thumbnail_focus_respects_a_single_cover_and_reversed_spreads() {
 
 #[test]
 fn wheel_navigation_counts_events_instead_of_magnitude_or_smooth_scroll_frames() {
-    let mut window = TestWindow::sample();
+    let mut window = TestWindow::sample_with_modifier_gestures();
     window.reveal_controls();
     window.wait_for("1 / 5");
     window.draw(Some(Key::H)); // Keep the page counter visible without opening metadata.
@@ -531,6 +531,8 @@ fn wheel_navigation_counts_events_instead_of_magnitude_or_smooth_scroll_frames()
     window.time += 0.1;
     window.draw(None);
     let wheel = |x, y| Event::MouseWheel {
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Wheel,
         unit: egui::MouseWheelUnit::Point,
         delta: egui::vec2(x, y),
         modifiers: egui::Modifiers::NONE,
