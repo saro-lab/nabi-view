@@ -1,8 +1,9 @@
-#![allow(clippy::derived_hash_with_manual_eq)] // We need to impl Hash for f32, but we don't implement Eq, which is fine
+use alloc::sync::Arc;
+use core::fmt::Debug;
 
-use std::{fmt::Debug, sync::Arc};
+use emath::GuiRounding as _;
 
-use super::{emath, Color32, ColorMode, Pos2, Rect};
+use super::{Color32, ColorMode, Pos2, Rect, emath};
 
 /// Describes the width and color of a line.
 ///
@@ -22,9 +23,9 @@ impl Stroke {
     };
 
     #[inline]
-    pub fn new(width: impl Into<f32>, color: impl Into<Color32>) -> Self {
+    pub fn new(width: f32, color: impl Into<Color32>) -> Self {
         Self {
-            width: width.into(),
+            width,
             color: color.into(),
         }
     }
@@ -33,6 +34,46 @@ impl Stroke {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.width <= 0.0 || self.color == Color32::TRANSPARENT
+    }
+
+    /// For vertical or horizontal lines:
+    /// round the stroke center to produce a sharp, pixel-aligned line.
+    pub fn round_center_to_pixel(&self, pixels_per_point: f32, coord: &mut f32) {
+        // If the stroke is an odd number of pixels wide,
+        // we want to round the center of it to the center of a pixel.
+        //
+        // If however it is an even number of pixels wide,
+        // we want to round the center to be between two pixels.
+        //
+        // We also want to treat strokes that are _almost_ odd as it it was odd,
+        // to make it symmetric. Same for strokes that are _almost_ even.
+        //
+        // For strokes less than a pixel wide we also round to the center,
+        // because it will rendered as a single row of pixels by the tessellator.
+
+        let pixel_size = 1.0 / pixels_per_point;
+
+        if self.width <= pixel_size || is_nearest_integer_odd(pixels_per_point * self.width) {
+            *coord = coord.round_to_pixel_center(pixels_per_point);
+        } else {
+            *coord = coord.round_to_pixels(pixels_per_point);
+        }
+    }
+
+    pub(crate) fn round_rect_to_pixel(&self, pixels_per_point: f32, rect: &mut Rect) {
+        // We put odd-width strokes in the center of pixels.
+        // To understand why, see `fn round_center_to_pixel`.
+
+        let pixel_size = 1.0 / pixels_per_point;
+
+        let width = self.width;
+        if width <= 0.0 {
+            *rect = rect.round_to_pixels(pixels_per_point);
+        } else if width <= pixel_size || is_nearest_integer_odd(pixels_per_point * width) {
+            *rect = rect.round_to_pixel_center(pixels_per_point);
+        } else {
+            *rect = rect.round_to_pixels(pixels_per_point);
+        }
     }
 }
 
@@ -46,9 +87,9 @@ where
     }
 }
 
-impl std::hash::Hash for Stroke {
+impl core::hash::Hash for Stroke {
     #[inline(always)]
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         let Self { width, color } = *self;
         emath::OrderedFloat(width).hash(state);
         color.hash(state);
@@ -96,9 +137,9 @@ impl PathStroke {
     };
 
     #[inline]
-    pub fn new(width: impl Into<f32>, color: impl Into<Color32>) -> Self {
+    pub fn new(width: f32, color: impl Into<Color32>) -> Self {
         Self {
-            width: width.into(),
+            width,
             color: ColorMode::Solid(color.into()),
             kind: StrokeKind::Middle,
         }
@@ -109,11 +150,11 @@ impl PathStroke {
     /// The bounding box passed to the callback will have a margin of [`TessellationOptions::feathering_size_in_pixels`](`crate::tessellator::TessellationOptions::feathering_size_in_pixels`)
     #[inline]
     pub fn new_uv(
-        width: impl Into<f32>,
+        width: f32,
         callback: impl Fn(Rect, Pos2) -> Color32 + Send + Sync + 'static,
     ) -> Self {
         Self {
-            width: width.into(),
+            width,
             color: ColorMode::UV(Arc::new(callback)),
             kind: StrokeKind::Middle,
         }
@@ -181,4 +222,22 @@ impl From<Stroke> for PathStroke {
             }
         }
     }
+}
+
+/// Returns true if the nearest integer is odd.
+fn is_nearest_integer_odd(x: f32) -> bool {
+    (x * 0.5 + 0.25).fract() > 0.5
+}
+
+#[test]
+fn test_is_nearest_integer_odd() {
+    assert!(is_nearest_integer_odd(0.6));
+    assert!(is_nearest_integer_odd(1.0));
+    assert!(is_nearest_integer_odd(1.4));
+    assert!(!is_nearest_integer_odd(1.6));
+    assert!(!is_nearest_integer_odd(2.0));
+    assert!(!is_nearest_integer_odd(2.4));
+    assert!(is_nearest_integer_odd(2.6));
+    assert!(is_nearest_integer_odd(3.0));
+    assert!(is_nearest_integer_odd(3.4));
 }

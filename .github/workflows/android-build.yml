@@ -1,0 +1,70 @@
+name: Android release preparation
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_code:
+        description: Monotonically increasing Android versionCode
+        type: string
+        default: '1'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      NABI_ANDROID_VERSION_CODE: ${{ inputs.version_code }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+      - uses: android-actions/setup-android@v3
+      - name: Install build tools and Rust targets
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build nasm perl pkg-config
+          sdkmanager 'platform-tools' 'platforms;android-36' 'build-tools;35.0.0' 'ndk;28.2.13676358'
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+          rustup show
+          rustup target add aarch64-linux-android x86_64-linux-android
+      - name: Check native package validator
+        run: python build/test-android-elf.py
+      - name: Build unsigned release bundle for both ABIs
+        run: sh build/android.sh --bundle --abi all
+      - name: Build debug and unsigned release APKs
+        run: |
+          gradle -p platforms/android -PnabiAbi=all -PnabiNativePrepared=true :app:assembleDebug :app:assembleRelease
+          python build/check-android-elf.py target/android/gradle/app/outputs/apk/debug/app-debug.apk --abis arm64-v8a,x86_64
+          python build/check-android-elf.py target/android/gradle/app/outputs/apk/release/app-release-unsigned.apk --abis arm64-v8a,x86_64
+          "$ANDROID_HOME/build-tools/35.0.0/zipalign" -c -P 16 -v 4 target/android/gradle/app/outputs/apk/release/app-release-unsigned.apk
+          sha256sum target/android/gradle/app/outputs/apk/debug/*.apk target/android/gradle/app/outputs/apk/release/*.apk target/android/gradle/app/outputs/bundle/release/*.aab > target/android/SHA256SUMS
+      - name: Verify phone and tablet package support
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging target/android/gradle/app/outputs/apk/release/app-release-unsigned.apk > target/android/package-badging.txt
+          python - <<'PY'
+          import pathlib, shlex
+          badging = pathlib.Path('target/android/package-badging.txt').read_text()
+          screens = next(line for line in badging.splitlines() if line.startswith('supports-screens:'))
+          assert {'small', 'normal', 'large', 'xlarge'} <= set(shlex.split(screens)[1:]), 'APK must support phones and tablets'
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nabi-view-android-unsigned-preparation
+          path: |
+            target/android/gradle/app/outputs/apk/debug/*.apk
+            target/android/gradle/app/outputs/apk/release/*.apk
+            target/android/gradle/app/outputs/bundle/release/*.aab
+            target/android/SHA256SUMS
+          if-no-files-found: error

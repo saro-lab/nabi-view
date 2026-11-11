@@ -76,11 +76,49 @@ impl Viewer {
         }
     }
 
+    /// The recent/bookmark screen covers the canvas. Clicks assigned to the
+    /// commands its keyboard shortcuts also allow there (so the button that
+    /// opened it closes it again) keep working over it.
+    pub(super) fn library_mouse(&mut self, ctx: &egui::Context) {
+        if crate::app::is_mobile()
+            || !self.library.open
+            || self.library.clear_prompt
+            || self.library.dialog.is_some()
+            || self.settings_open
+            || self.menu_open
+            || self.random_prompt
+            || self.dialog_open()
+            || self.popup_open_at_input
+            || ctx.any_popup_open()
+            || !ctx.input(|i| i.focused)
+        {
+            return;
+        }
+        let mouse = &self.settings.mouse;
+        let action = [
+            (egui::PointerButton::Secondary, &mouse.right_click),
+            (egui::PointerButton::Middle, &mouse.middle_click),
+            (egui::PointerButton::Extra1, &mouse.back_button),
+            (egui::PointerButton::Extra2, &mouse.forward_button),
+        ]
+        .into_iter()
+        .find(|(button, action)| {
+            matches!(action.as_str(), "open" | "folder" | "recent")
+                && command_supported(action)
+                && ctx.input(|i| i.pointer.button_clicked(*button))
+        })
+        .map(|(_, action)| action.clone());
+        if let Some(action) = action {
+            self.run(&action, ctx);
+        }
+    }
+
     pub(super) fn shortcut_input_active(&self) -> bool {
         self.shortcut_editor.is_some()
             || self.shortcut_search.is_some()
             || self.shortcut_filter_focused
             || self.shortcut_reset_prompt
+            || self.reset_prompt.is_some()
     }
 
     pub(super) fn sync_native_shortcut_capture(&self) {
@@ -146,10 +184,14 @@ impl Viewer {
             else {
                 continue;
             };
+            if crate::core::commands::modifier_key_name(key.name()) {
+                continue;
+            }
             let chord = key_chord(key, modifiers);
-            if self.shortcut_reset_prompt {
+            if self.shortcut_reset_prompt || self.reset_prompt.is_some() {
                 if key == Key::Escape {
                     self.shortcut_reset_prompt = false;
+                    self.reset_prompt = None;
                     ctx.input_mut(|i| i.consume_key(modifiers, key));
                 }
                 continue;
@@ -182,21 +224,25 @@ impl Viewer {
                 }
                 continue;
             }
-            if self.move_dialog.is_some() {
-                self.held_key = None;
-                self.held_button = None;
+            if self.dialog_open() || self.library.dialog.is_some() || self.zoom_input.is_some() {
+                self.release_held_input();
                 continue;
             }
-            if self.zoom_input.is_some() {
-                self.held_key = None;
-                self.held_button = None;
+            if self.inspector.filter_focused(ctx) {
+                // Keys go to the filter text, except Escape, which clears it
+                // and then releases focus so later keys are shortcuts again.
+                if key == Key::Escape {
+                    self.inspector.escape_focused_filter(ctx);
+                    ctx.input_mut(|i| i.consume_key(modifiers, key));
+                }
+                self.release_held_input();
                 continue;
             }
             if key == Key::Escape {
                 // A popup may already have consumed Escape during egui's focus pass.
                 // Preserve its input-time state so this same press cannot close the viewer.
-                let handled = if self.popup_open_at_input || ctx.memory(|m| m.any_popup_open()) {
-                    ctx.memory_mut(|m| m.close_popup());
+                let handled = if self.popup_open_at_input || ctx.any_popup_open() {
+                    egui::Popup::close_all(ctx);
                     self.menu_open = false;
                     true
                 } else if self.menu_open {
@@ -205,11 +251,11 @@ impl Viewer {
                 } else if self.random_prompt {
                     self.random_prompt = false;
                     true
-                } else if self.clear_prompt {
-                    self.clear_prompt = false;
+                } else if self.library.clear_prompt {
+                    self.library.clear_prompt = false;
                     true
-                } else if self.recent_open {
-                    self.recent_open = false;
+                } else if self.library.open {
+                    self.library.open = false;
                     true
                 } else if self.settings_open {
                     if self.shortcut_editor.take().is_none()
@@ -232,10 +278,10 @@ impl Viewer {
                     continue;
                 }
             }
-            if self.recent_open
+            if self.library.open
                 && !self.settings_open
                 && !self.menu_open
-                && !self.clear_prompt
+                && !self.library.clear_prompt
                 && !self.random_prompt
                 && let Some(id) = ["open", "folder", "recent"]
                     .into_iter()
@@ -247,11 +293,10 @@ impl Viewer {
             }
             if self.settings_open
                 && !self.shortcut_input_active()
-                && !self.clear_prompt
+                && !self.library.modal()
                 && !self.random_prompt
-                && !self.recent_open
                 && !self.popup_open_at_input
-                && !ctx.memory(|m| m.any_popup_open())
+                && !ctx.any_popup_open()
                 && self.bindings("about").contains(&chord)
             {
                 ctx.input_mut(|i| i.consume_key(modifiers, key));
@@ -259,12 +304,9 @@ impl Viewer {
                 continue;
             }
             if self.settings_open
-                || self.menu_open
-                || self.clear_prompt
-                || self.random_prompt
-                || self.recent_open
+                || self.overlay_open()
                 || self.popup_open_at_input
-                || ctx.memory(|m| m.any_popup_open())
+                || ctx.any_popup_open()
             {
                 continue;
             }
@@ -291,15 +333,12 @@ impl Viewer {
                 }
             }
         }
-        let blocked = self.move_dialog.is_some()
-            || self.settings_open
-            || self.menu_open
+        let blocked = self.settings_open
+            || self.overlay_open()
             || self.zoom_input.is_some()
-            || self.clear_prompt
-            || self.random_prompt
-            || self.recent_open
+            || self.inspector.filter_focused(ctx)
             || self.popup_open_at_input
-            || ctx.memory(|m| m.any_popup_open())
+            || ctx.any_popup_open()
             || self.shortcut_editor.is_some()
             || !ctx.input(|i| i.focused);
         if let Some((key, action, next)) = self.held_key {

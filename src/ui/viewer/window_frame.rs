@@ -9,7 +9,7 @@ const CORNER: f32 = 12.;
 const SAVE_DELAY: f64 = 0.5;
 
 fn drag_id(ctx: &egui::Context) -> egui::Id {
-    egui::Id::new(("native-window-drag-started", ctx.viewport_id()))
+    egui::Id::unique(("native-window-drag-started", ctx.viewport_id()))
 }
 
 pub(super) fn reset_drag(ctx: &egui::Context) {
@@ -99,23 +99,24 @@ pub fn resize(ctx: &egui::Context) {
     }) {
         return;
     }
-    for (index, (rect, direction, cursor)) in handles(ctx.screen_rect()).into_iter().enumerate() {
-        let area = egui::Area::new(egui::Id::new(("native-resize", index)))
+    for (index, (rect, direction, cursor)) in handles(ctx.viewport_rect()).into_iter().enumerate() {
+        let area = egui::Area::new(egui::Id::unique(("native-resize", index)))
             .order(egui::Order::Foreground)
             .fixed_pos(rect.min)
             .default_size(rect.size())
             .constrain(false)
             .fade_in(false)
-            .sense(egui::Sense::drag())
+            // One drag target per edge: an equally sized draggable Area would
+            // compete with its child in egui's nearest-widget hit testing.
+            .sense(egui::Sense::hover())
             .movable(false)
             .show(ctx, |ui| {
-                // Use the Area's own response: child widgets are disabled in its
-                // initial sizing pass, whereas its root hit target is live immediately.
                 ui.set_min_size(rect.size());
                 ui.set_max_size(rect.size());
+                ui.interact(rect, ui.scope_id().with("resize"), egui::Sense::drag())
             });
         ctx.move_to_top(area.response.layer_id);
-        let response = area.response.on_hover_and_drag_cursor(cursor);
+        let response = area.inner.on_hover_and_drag_cursor(cursor);
         if response.drag_started_by(egui::PointerButton::Primary) {
             ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
         }
@@ -200,11 +201,12 @@ mod tests {
         for (rect, direction, cursor) in handles(screen) {
             let ctx = egui::Context::default();
             let point = rect.center();
-            // First frame registers areas; subsequent native input uses those rectangles.
-            let _ = ctx.run(input(Vec::new()), resize);
-            let hovered = ctx.run(input(vec![egui::Event::PointerMoved(point)]), resize);
+            // Area sizing is non-interactive; register its settled hit target next.
+            let _ = ctx.run_pass(input(Vec::new()), resize);
+            let _ = ctx.run_pass(input(Vec::new()), resize);
+            let hovered = ctx.run_pass(input(vec![egui::Event::PointerMoved(point)]), resize);
             assert_eq!(hovered.platform_output.cursor_icon, cursor, "{direction:?}");
-            let pressed = ctx.run(
+            let pressed = ctx.run_pass(
                 input(vec![egui::Event::PointerButton {
                     pos: point,
                     button: egui::PointerButton::Primary,
@@ -232,7 +234,7 @@ mod tests {
             let viewport = raw.viewports.get_mut(&egui::ViewportId::ROOT).unwrap();
             viewport.fullscreen = Some(fullscreen);
             viewport.maximized = Some(!fullscreen);
-            let output = ctx.run(raw, resize);
+            let output = ctx.run_pass(raw, resize);
             assert_eq!(output.platform_output.cursor_icon, CursorIcon::Default);
             assert!(
                 !output
@@ -281,7 +283,7 @@ mod tests {
             viewport.maximized = Some(mode == 1);
             viewport.minimized = Some(mode == 2);
             viewport.fullscreen = Some(mode == 3);
-            let _ = ctx.run(raw, |ctx| state.observe(ctx, Some(&store)).unwrap());
+            let _ = ctx.run_pass(raw, |ctx| state.observe(ctx, Some(&store)).unwrap());
             if time < 0.7 {
                 assert_eq!(store.load_window_size().unwrap(), None);
             }

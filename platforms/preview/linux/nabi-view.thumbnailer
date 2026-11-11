@@ -1,0 +1,4 @@
+[Thumbnailer Entry]
+TryExec=nabi-thumbnailer
+Exec=nabi-thumbnailer --size %s --input %u --output %o
+MimeType=image/avif;image/jxl;image/qoi;image/x-exr;image/vnd.radiance;image/vnd-ms.dds;image/x-tga;image/x-portable-bitmap;image/x-portable-graymap;image/x-portable-pixmap;image/x-portable-anymap;image/farbfeld;

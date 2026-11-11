@@ -7,6 +7,7 @@ extern void nabi_request_close_all(void);
 extern void nabi_request_about(void);
 extern void nabi_finished_launching(void);
 extern void nabi_stop_open_events(void);
+extern void nabi_access_capture_url(NSURL *url);
 
 @interface NabiOpenDocuments : NSObject
 - (void)configureMenu;
@@ -105,6 +106,7 @@ void nabi_localize_menu(const char *about, const char *hide, const char *others,
         NSAppleEventDescriptor *entry = [files descriptorAtIndex:index];
         NSURL *url = [entry coerceToDescriptorType:typeFileURL].fileURLValue;
         if (url.isFileURL && url.fileSystemRepresentation != NULL) {
+            nabi_access_capture_url(url);
             nabi_enqueue_open_document(url.fileSystemRepresentation);
         }
     }

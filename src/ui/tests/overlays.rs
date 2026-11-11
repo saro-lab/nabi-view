@@ -20,8 +20,14 @@ fn recent_overlay_drops_emptied_folder_and_opens_first_image() {
     pixel.save(album.join("10.png")).unwrap();
     pixel.save(album.join("2.png")).unwrap();
     std::fs::create_dir(album.join("1.png")).unwrap();
-    let album = album.canonicalize().unwrap();
-    let emptied = emptied.canonicalize().unwrap();
+    let album = album
+        .canonicalize()
+        .map(crate::core::paths::simplified)
+        .unwrap();
+    let emptied = emptied
+        .canonicalize()
+        .map(crate::core::paths::simplified)
+        .unwrap();
     window.app = Viewer::new(
         &CreationContext::_new_kittest(window.ctx.clone()),
         None,
@@ -32,7 +38,7 @@ fn recent_overlay_drops_emptied_folder_and_opens_first_image() {
     }
     let row = window
         .ctx
-        .read_response(egui::Id::new(("recent-folder", &emptied)))
+        .read_response(egui::Id::unique(("recent-folder", &emptied)))
         .unwrap();
     std::fs::remove_file(emptied.join("1.png")).unwrap();
     window.click(row.rect.center());
@@ -43,12 +49,12 @@ fn recent_overlay_drops_emptied_folder_and_opens_first_image() {
     assert!(
         window
             .ctx
-            .read_response(egui::Id::new(("recent-folder", &emptied)))
+            .read_response(egui::Id::unique(("recent-folder", &emptied)))
             .is_none()
     );
     let row = window
         .ctx
-        .read_response(egui::Id::new(("recent-folder", &album)))
+        .read_response(egui::Id::unique(("recent-folder", &album)))
         .unwrap();
     window.click(row.rect.center());
     window.reveal_controls();
@@ -80,7 +86,9 @@ fn recent_overlay_prunes_unavailable_items_on_display_and_click() {
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("1.png"), b"image").unwrap();
         store.record_folder(&path, 10).unwrap();
-        path.canonicalize().unwrap()
+        path.canonicalize()
+            .map(crate::core::paths::simplified)
+            .unwrap()
     });
     std::fs::remove_dir_all(&folders[0]).unwrap();
     window.app = Viewer::new(
@@ -94,7 +102,7 @@ fn recent_overlay_prunes_unavailable_items_on_display_and_click() {
     assert!(
         window
             .ctx
-            .read_response(egui::Id::new(("recent-folder", &folders[0])))
+            .read_response(egui::Id::unique(("recent-folder", &folders[0])))
             .is_none()
     );
 
@@ -115,12 +123,12 @@ fn recent_overlay_prunes_unavailable_items_on_display_and_click() {
     assert!(
         window
             .ctx
-            .read_response(egui::Id::new(("recent-folder", &folders[1])))
+            .read_response(egui::Id::unique(("recent-folder", &folders[1])))
             .is_none()
     );
     let row = window
         .ctx
-        .read_response(egui::Id::new(("recent-folder", &folders[2])))
+        .read_response(egui::Id::unique(("recent-folder", &folders[2])))
         .unwrap();
     std::fs::remove_dir_all(&folders[2]).unwrap();
     window.click(row.rect.center());
@@ -130,7 +138,7 @@ fn recent_overlay_prunes_unavailable_items_on_display_and_click() {
     assert!(
         window
             .ctx
-            .read_response(egui::Id::new(("recent-folder", &folders[2])))
+            .read_response(egui::Id::unique(("recent-folder", &folders[2])))
             .is_none()
     );
     assert!(window.draw(None).0.contains(crate::i18n::test_tr(
@@ -157,32 +165,38 @@ fn empty_window_opens_centered_recent_overlay_and_escape_only_dismisses_it() {
     }
     window.time += 0.3;
     let (text, image) = window.draw(None);
+    // Both lists fit side by side under their headings, without tabs.
     for label in [
-        "Open image",
-        "Open folder",
-        "Recently opened items will appear here.",
+        crate::i18n::test_tr("Recent"),
+        crate::i18n::tr("bookmarks"),
+        crate::i18n::test_tr("Recently opened items will appear here."),
+        crate::i18n::tr("bookmarked-folders-will-appear-here"),
     ] {
-        assert!(
-            text.contains(crate::i18n::test_tr(label)),
-            "Missing {label}: {text}"
-        );
+        assert!(text.contains(label), "Missing {label}: {text}");
     }
-    assert!(!text.contains(crate::i18n::test_tr("Recent")));
     assert!(
         window
             .ctx
-            .read_response(egui::Id::new(("titlebar", "recent-close")))
+            .read_response(egui::Id::unique(("titlebar", "library-close")))
             .is_none()
     );
     assert!(!image);
     let overlay = window
         .ctx
-        .memory(|m| m.area_rect(egui::Id::new("recent-folders")))
+        .memory(|m| m.area_rect(egui::Id::unique("library")))
         .unwrap();
+    // Opening is offered as icons above the lists.
+    for icon in ["library-open", "library-folder"] {
+        let button = window
+            .ctx
+            .read_response(egui::Id::unique(("titlebar", icon)))
+            .unwrap();
+        assert!(overlay.contains_rect(button.rect));
+    }
     assert!((overlay.center() - window.screen_size.to_pos2() / 2.).length() < 2.);
     assert!(window.paint.iter().any(|s| {
         matches!(&s.shape, Shape::Rect(r)
-            if r.fill == Color32::from_rgba_unmultiplied(21, 23, 25, 230) && r.rect == overlay)
+            if r.fill == Color32::from_rgba_unmultiplied(21, 23, 25, 250) && r.rect == overlay)
     }));
     window.draw(Some(Key::Escape));
     assert!(
@@ -212,7 +226,11 @@ fn recent_overlay_resizes_scrolls_and_removes_only_selected_history() {
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("1.png"), b"image").unwrap();
         store.record_folder(&dir, 50).unwrap();
-        folders.push(dir.canonicalize().unwrap());
+        folders.push(
+            dir.canonicalize()
+                .map(crate::core::paths::simplified)
+                .unwrap(),
+        );
     }
     window.app = Viewer::new(
         &CreationContext::_new_kittest(window.ctx.clone()),
@@ -230,10 +248,10 @@ fn recent_overlay_resizes_scrolls_and_removes_only_selected_history() {
         for _ in 0..5 {
             window.draw(None);
         }
-        let screen = window.ctx.screen_rect();
+        let screen = window.ctx.viewport_rect();
         let overlay = window
             .ctx
-            .memory(|m| m.area_rect(egui::Id::new("recent-folders")))
+            .memory(|m| m.area_rect(egui::Id::unique("library")))
             .unwrap();
         assert!(
             screen.expand(1.).contains_rect(overlay),
@@ -246,34 +264,36 @@ fn recent_overlay_resizes_scrolls_and_removes_only_selected_history() {
         assert_eq!(
             window
                 .ctx
-                .read_response(egui::Id::new(("titlebar", "recent-close")))
+                .read_response(egui::Id::unique(("titlebar", "library-close")))
                 .is_some(),
             size.x <= 600.
         );
+        // Wide enough for both lists side by side; phones switch with tabs
+        // and start on the recent list.
         assert_eq!(
             window
                 .paint
                 .iter()
                 .any(|shape| matches!(&shape.shape, Shape::Text(text)
-            if text.galley.job.text == crate::i18n::test_tr("Recent"))),
-            size.x <= 600.
+            if text.galley.job.text == crate::i18n::tr("bookmarked-folders-will-appear-here"))),
+            size.x > 520.
         );
-        for action in ["open", "folder"] {
+        for action in ["library-open", "library-folder"] {
             let button = window
                 .ctx
-                .read_response(egui::Id::new(("recent-action", action)))
+                .read_response(egui::Id::unique(("titlebar", action)))
                 .unwrap();
             assert!(overlay.contains_rect(button.rect));
         }
         let delete = window
             .ctx
-            .read_response(egui::Id::new(("recent-remove", &folders[34])))
+            .read_response(egui::Id::unique(("recent-remove", &folders[34])))
             .unwrap();
         assert!(overlay.contains_rect(delete.rect));
         assert_eq!(delete.rect.size(), egui::Vec2::splat(44.));
         let open = window
             .ctx
-            .read_response(egui::Id::new(("recent-folder", &folders[34])))
+            .read_response(egui::Id::unique(("recent-folder", &folders[34])))
             .unwrap();
         assert!(open.rect.right() < delete.rect.left());
         for shape in &window.paint {
@@ -286,7 +306,7 @@ fn recent_overlay_resizes_scrolls_and_removes_only_selected_history() {
     }
     let delete = window
         .ctx
-        .read_response(egui::Id::new(("recent-remove", &folders[34])))
+        .read_response(egui::Id::unique(("recent-remove", &folders[34])))
         .unwrap();
     window.click(delete.rect.center());
     assert!(
@@ -306,14 +326,20 @@ fn recent_overlay_resizes_scrolls_and_removes_only_selected_history() {
     }
     let delete = window
         .ctx
-        .read_response(egui::Id::new(("recent-remove", &folders[33])))
+        .read_response(egui::Id::unique(("recent-remove", &folders[33])))
         .unwrap();
     window.click(delete.rect.center());
     assert_eq!(store.recent().unwrap().len(), 33);
     assert!(!store.recent().unwrap().contains(&folders[33]));
-    window.pointer(400., 230.);
+    let list = window
+        .ctx
+        .read_response(egui::Id::unique(("recent-folder", &folders[32])))
+        .unwrap();
+    window.pointer(list.rect.center().x, 230.);
     window.draw_events(
         vec![Event::MouseWheel {
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
             unit: egui::MouseWheelUnit::Point,
             delta: egui::vec2(0., -5000.),
             modifiers: egui::Modifiers::NONE,
@@ -325,22 +351,23 @@ fn recent_overlay_resizes_scrolls_and_removes_only_selected_history() {
     }
     let last = window
         .ctx
-        .read_response(egui::Id::new(("recent-remove", &folders[0])))
+        .read_response(egui::Id::unique(("recent-remove", &folders[0])))
         .unwrap();
     let overlay = window
         .ctx
-        .memory(|m| m.area_rect(egui::Id::new("recent-folders")))
+        .memory(|m| m.area_rect(egui::Id::unique("library")))
         .unwrap();
     assert!(
         overlay.contains_rect(last.rect),
         "Cannot scroll to the final history entry"
     );
     window.click(egui::pos2(10., 180.));
+    window.draw(None);
     assert!(
-        !window
-            .draw(None)
-            .0
-            .contains(crate::i18n::test_tr("Open folder"))
+        window
+            .ctx
+            .read_response(egui::Id::unique(("titlebar", "library-folder")))
+            .is_none()
     );
 }
 
@@ -353,7 +380,7 @@ fn recent_overlay_blocks_background_and_opens_a_folder_in_an_empty_window() {
     window.click(window.titlebar_icon("menu").rect.center());
     let recent = window
         .ctx
-        .read_response(egui::Id::new(("menu-command", "recent")))
+        .read_response(egui::Id::unique(("menu-command", "recent")))
         .unwrap();
     window.click(recent.rect.center());
     for key in [Key::ArrowRight, Key::Delete, Key::F] {
@@ -362,11 +389,12 @@ fn recent_overlay_blocks_background_and_opens_a_folder_in_an_empty_window() {
     assert_eq!(focused_thumbnail_pages(&window), [1]);
     assert!(!window.started_window_drag());
     window.click(egui::pos2(24., 180.));
+    window.draw(None);
     assert!(
-        !window
-            .draw(None)
-            .0
-            .contains(crate::i18n::test_tr("Open folder"))
+        window
+            .ctx
+            .read_response(egui::Id::unique(("titlebar", "library-folder")))
+            .is_none()
     );
 
     let store = Store::in_directories(
@@ -379,6 +407,7 @@ fn recent_overlay_blocks_background_and_opens_a_folder_in_an_empty_window() {
         .unwrap()
         .path()
         .canonicalize()
+        .map(crate::core::paths::simplified)
         .unwrap();
     store.record_folder(&dir, 50).unwrap();
     window.app = Viewer::new(
@@ -391,16 +420,17 @@ fn recent_overlay_blocks_background_and_opens_a_folder_in_an_empty_window() {
     }
     let folder = window
         .ctx
-        .read_response(egui::Id::new(("recent-folder", &dir)))
+        .read_response(egui::Id::unique(("recent-folder", &dir)))
         .unwrap();
     window.click(folder.rect.center());
     window.reveal_controls();
     window.wait_for("01 Alpine Light.png");
+    window.draw(None);
     assert!(
-        !window
-            .draw(None)
-            .0
-            .contains(crate::i18n::test_tr("Open folder"))
+        window
+            .ctx
+            .read_response(egui::Id::unique(("titlebar", "library-folder")))
+            .is_none()
     );
 }
 
@@ -426,10 +456,10 @@ fn centered_icon_menu_scrolls_and_executes_without_background_input() {
         for _ in 0..5 {
             window.draw(None);
         }
-        let screen = window.ctx.screen_rect();
+        let screen = window.ctx.viewport_rect();
         let overlay = window
             .ctx
-            .memory(|m| m.area_rect(egui::Id::new("command-menu")))
+            .memory(|m| m.area_rect(egui::Id::unique("command-menu")))
             .unwrap();
         assert!(
             screen.expand(1.).contains_rect(overlay),
@@ -442,7 +472,7 @@ fn centered_icon_menu_scrolls_and_executes_without_background_input() {
         assert_eq!(
             window
                 .ctx
-                .read_response(egui::Id::new(("titlebar", "menu-close")))
+                .read_response(egui::Id::unique(("titlebar", "menu-close")))
                 .is_some(),
             size.x <= 600.
         );
@@ -458,7 +488,7 @@ fn centered_icon_menu_scrolls_and_executes_without_background_input() {
             assert!(
                 window
                     .ctx
-                    .read_response(egui::Id::new(("menu-command", id)))
+                    .read_response(egui::Id::unique(("menu-command", id)))
                     .is_none()
             );
         }
@@ -467,14 +497,14 @@ fn centered_icon_menu_scrolls_and_executes_without_background_input() {
     window.draw(None);
     let menu = window
         .ctx
-        .memory(|m| m.area_rect(egui::Id::new("command-menu")))
+        .memory(|m| m.area_rect(egui::Id::unique("command-menu")))
         .unwrap();
     assert!(
         window
             .paint
             .iter()
             .any(|s| matches!(&s.shape, Shape::Rect(r)
-        if r.fill == Color32::from_rgba_unmultiplied(21, 23, 25, 230) && r.rect == menu))
+        if r.fill == Color32::from_rgba_unmultiplied(21, 23, 25, 250) && r.rect == menu))
     );
     assert!(window.draw(None).0.contains("Recent"));
     assert!(
@@ -484,7 +514,7 @@ fn centered_icon_menu_scrolls_and_executes_without_background_input() {
     assert!(egui::Rect::from_min_size(egui::Pos2::ZERO, window.screen_size).contains_rect(menu));
     let open = window
         .ctx
-        .read_response(egui::Id::new(("menu-command", "open")))
+        .read_response(egui::Id::unique(("menu-command", "open")))
         .unwrap()
         .rect;
     assert!(
@@ -510,6 +540,8 @@ fn centered_icon_menu_scrolls_and_executes_without_background_input() {
     window.draw_events(
         vec![
             Event::MouseWheel {
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Wheel,
                 unit: egui::MouseWheelUnit::Point,
                 delta: egui::vec2(0., -1800.),
                 modifiers: egui::Modifiers::NONE,
@@ -523,7 +555,7 @@ fn centered_icon_menu_scrolls_and_executes_without_background_input() {
     }
     let shifted = window
         .ctx
-        .read_response(egui::Id::new(("menu-command", "open")))
+        .read_response(egui::Id::unique(("menu-command", "open")))
         .unwrap()
         .rect;
     assert!(
@@ -537,7 +569,7 @@ fn centered_icon_menu_scrolls_and_executes_without_background_input() {
     );
     let fullscreen = window
         .ctx
-        .read_response(egui::Id::new(("menu-command", "fullscreen")))
+        .read_response(egui::Id::unique(("menu-command", "fullscreen")))
         .unwrap()
         .rect;
     assert!(
@@ -588,23 +620,16 @@ fn menu_and_recent_blank_space_moves_window_without_dismissing_or_activating_con
                 if recent {
                     let button = window
                         .ctx
-                        .read_response(egui::Id::new(("menu-command", "recent")))
+                        .read_response(egui::Id::unique(("menu-command", "recent")))
                         .unwrap();
                     window.click(button.rect.center());
                 }
-                let area_id = egui::Id::new(if recent {
-                    "recent-folders"
+                let area_id = egui::Id::unique(if recent { "library" } else { "command-menu" });
+                let control_id = if recent {
+                    egui::Id::unique(("titlebar", "library-open"))
                 } else {
-                    "command-menu"
-                });
-                let control_id = egui::Id::new((
-                    if recent {
-                        "recent-action"
-                    } else {
-                        "menu-command"
-                    },
-                    "open",
-                ));
+                    egui::Id::unique(("menu-command", "open"))
+                };
                 let movable = !mobile && !fullscreen;
                 for width in [1080., 520.] {
                     window.screen_size.x = width;
@@ -643,7 +668,7 @@ fn menu_and_recent_blank_space_moves_window_without_dismissing_or_activating_con
                     let control = window.ctx.read_response(control_id).unwrap();
                     assert!(
                         !window.drag_pointer(control.rect.center(), egui::vec2(30., 8.)),
-                        "Dragging a control must not move the window"
+                        "Dragging a control must not move the window: recent={recent}, mobile={mobile}, fullscreen={fullscreen}, width={width}"
                     );
                     assert!(
                         window.ctx.read_response(control_id).is_some(),
@@ -667,7 +692,7 @@ fn centered_icon_menu_applies_view_mode_and_dismisses_with_close_or_backdrop() {
     window.click(window.titlebar_icon("menu").rect.center());
     let width = window
         .ctx
-        .read_response(egui::Id::new(("menu-command", "width")))
+        .read_response(egui::Id::unique(("menu-command", "width")))
         .unwrap()
         .rect;
     window.click(width.center());
@@ -731,7 +756,7 @@ fn right_clicking_empty_canvas_opens_menu_and_backdrop_only_dismisses_it() {
     assert!(
         window
             .ctx
-            .read_response(egui::Id::new(("menu-command", "open")))
+            .read_response(egui::Id::unique(("menu-command", "open")))
             .is_none()
     );
     window.click(egui::pos2(24., 180.));
@@ -739,14 +764,14 @@ fn right_clicking_empty_canvas_opens_menu_and_backdrop_only_dismisses_it() {
     assert!(
         window
             .ctx
-            .read_response(egui::Id::new(("menu-command", "open")))
+            .read_response(egui::Id::unique(("menu-command", "open")))
             .is_some()
     );
     assert!(!window.started_window_drag());
     assert!(
         window
             .ctx
-            .read_response(egui::Id::new(("titlebar", "menu-close")))
+            .read_response(egui::Id::unique(("titlebar", "menu-close")))
             .is_none()
     );
     window.click(egui::pos2(24., 180.));
@@ -756,7 +781,7 @@ fn right_clicking_empty_canvas_opens_menu_and_backdrop_only_dismisses_it() {
     assert!(
         window
             .ctx
-            .read_response(egui::Id::new(("menu-command", "open")))
+            .read_response(egui::Id::unique(("menu-command", "open")))
             .is_none()
     );
     assert!(

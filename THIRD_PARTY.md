@@ -7,7 +7,7 @@ copyright notices; the project's MIT license does not replace those terms.
 The application includes `THIRD_PARTY_NOTICES.txt`, generated from the locked
 Cargo dependency graph, published source packages, bundled font metadata and
 the upstream notices retained in `licenses/upstream/`. It includes platform
-specific and build dependencies, so not every listed package is linked into
+specific, build and test dependencies, so not every listed package is linked into
 every build. Settings > About > Open source licenses shows a flat summary of
 direct dependencies and explicitly vendored code. Enable "Show full license
 texts" there to read the complete notices offline, together with the project's
@@ -41,29 +41,32 @@ NABI VIEW's separate original source files.
   Hack font's accompanying terms and attribution. The font licenses do not
   replace the application's MIT license. System fonts are read from the
   installed operating system and are not redistributed by NABI VIEW.
-- `vendor/block` retains its original MIT declaration and patch notice.
+- `vendor/epaint` and `vendor/egui-wgpu` contain the patched 0.37.0 upstream
+  crates and retain their original MIT/Apache-2.0 licenses. They remain third-party
+  code even though workspace membership enables their regression tests.
   The MIT-licensed `ds_store` and `mac_alias` helpers and the Chromium
   BSD-style DMG layout recipe retain their notices under `vendor/dmg-layout/`.
   These Python helpers are build tools, not application resources.
 
 ## Notice provenance and review scope
 
-Reviewed 2026-11-08 against the current Cargo.lock: 470 third-party Rust
-packages, including transitive and platform-specific dependencies, plus the
-bundled native codecs, fonts and vendored packaging helpers. No requirement
-to relicense NABI VIEW's original code away from MIT was identified in this
-configuration.
+Inventory refreshed 2026-11-12 against Cargo.lock: 482 third-party Rust
+packages, including transitive, platform-specific, build and test dependencies,
+plus bundled native codecs, fonts and vendored packaging helpers. This is the
+resolved dependency inventory, not a claim that every component is linked into
+every platform's application binary.
 
-59 packages omit a license file from their published crate but have upstream
-notices recorded with source URLs and SHA-256 hashes in
+58 packages in the current inventory have supplemental upstream notices
+recorded with source URLs and SHA-256 hashes in
 `licenses/upstream/index.json`. Some upstream notices declare licenses by
 name; the generated catalog also supplies their standard terms.
 
-`block` 0.1.6 and `dispatch` 0.2.0 declare MIT, and `hexf-parse` 0.2.1 declares
-CC0-1.0, but no separate upstream license file was found for those releases.
-Their published authors, license declarations and reference terms are
-included in the generated catalog. Original upstream attribution remains
-flagged for review; reference terms are not represented as recovered originals.
+`dispatch` 0.2.0 declares MIT, but no separate upstream license file was found
+at its published source revision. Its published author, license declaration and
+reference terms are included in the generated catalog. Original upstream
+attribution remains flagged for review; reference terms are not represented as
+recovered originals. The former `block` 0.1.6 and `hexf-parse` 0.2.1 review entries
+are absent from the current resolved graph.
 
 References:
 
@@ -73,9 +76,11 @@ References:
 - https://ubuntu.com/legal/font-licence
 - https://www.apache.org/licenses/LICENSE-2.0 (section 4)
 
-- `vendor/epaint` contains epaint 0.31.1 with local Unicode shaping and
-  bidirectional text layout changes. Its original MIT/Apache-2.0 licenses are
-  retained; modification details are in `vendor/epaint/PATCH.md`. HarfRust and
-  Unicode bidirectional/script support retain the licenses listed in the
-  generated dependency notices. System fallback fonts are loaded locally and
-  are not copied into the application bundle.
+- `vendor/epaint` uses upstream 0.37.0 HarfRust, skrifa and vello text handling
+  with local bidirectional layout, RTL caret and cluster corrections. Details
+  are in `vendor/epaint/PATCH.md`. Their dependencies retain the licenses listed
+  in the generated notices. System fallback fonts are loaded locally and are
+  not copied into the application bundle.
+- `vendor/egui-wgpu` 0.37.0 adds the application's explicit wgpu 30 surface
+  color-space selection, native linear HDR texture handling, output white scale
+  and FP16 capture support. Details are in `vendor/egui-wgpu/NABI-PATCH.md`.

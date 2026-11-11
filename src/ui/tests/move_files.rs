@@ -24,7 +24,11 @@ fn move_dialog_moves_checked_images_with_arrow_selection_and_enter() {
     let mut window = sample();
     let destination = tempfile::tempdir().unwrap();
     let older = tempfile::tempdir().unwrap();
-    let destination_path = destination.path().canonicalize().unwrap();
+    let destination_path = destination
+        .path()
+        .canonicalize()
+        .map(crate::core::paths::simplified)
+        .unwrap();
     store(&window).record_move(older.path(), 10).unwrap();
     store(&window).record_move(&destination_path, 10).unwrap();
     let source = window._images.as_ref().unwrap().path().to_owned();
@@ -33,7 +37,7 @@ fn move_dialog_moves_checked_images_with_arrow_selection_and_enter() {
     window.draw(Some(Key::ArrowRight));
     window.wait_for("3 / 5");
     window.draw(Some(Key::M));
-    window.wait_for("Move 2 image(s)");
+    window.wait_for(&crate::i18n::format("move-image-count", &[("count", "2")]));
     window.draw(Some(Key::ArrowDown));
     window.draw(Some(Key::ArrowDown));
     window.draw(Some(Key::ArrowUp));
@@ -110,7 +114,7 @@ fn move_history_rows_delete_independently_and_clear_from_cache_settings() {
     window.wait_for("Recent move destinations");
     let response = window
         .ctx
-        .read_response(egui::Id::new(("move-history-remove", paths[1].path())))
+        .read_response(egui::Id::unique(("move-history-remove", paths[1].path())))
         .unwrap();
     window.click(response.rect.center());
     assert_eq!(
@@ -125,7 +129,7 @@ fn move_history_rows_delete_independently_and_clear_from_cache_settings() {
     window.wait_for("Maximum recent move destinations");
     let response = window
         .ctx
-        .read_response(egui::Id::new(("titlebar", "move-history-clear")))
+        .read_response(egui::Id::unique(("titlebar", "move-history-clear")))
         .unwrap();
     window.click(response.rect.center());
     assert!(store(&window).recent_moves(10).unwrap().is_empty());
@@ -153,7 +157,7 @@ fn move_and_delete_icons_precede_zoom_without_overlapping_controls() {
         window.wait_for("Recent move destinations");
         let input = window
             .ctx
-            .read_response(egui::Id::new("move-path"))
+            .read_response(egui::Id::unique("move-path"))
             .unwrap();
         assert!(input.rect.right() <= width);
         window.draw(Some(Key::Escape));
@@ -184,22 +188,25 @@ fn move_dialog_controls_align_and_fit_at_each_window_width() {
             }
             let input = window
                 .ctx
-                .read_response(egui::Id::new("move-path"))
+                .read_response(egui::Id::unique("move-path"))
                 .unwrap()
                 .rect;
             let browse = window
                 .ctx
-                .read_response(egui::Id::new(("titlebar", "move-browse")))
+                .read_response(egui::Id::unique(("titlebar", "move-browse")))
                 .unwrap()
                 .rect;
             let clear = window
                 .ctx
-                .read_response(egui::Id::new(("titlebar", "move-history-clear")))
+                .read_response(egui::Id::unique(("titlebar", "move-history-clear")))
                 .unwrap()
                 .rect;
             let remove = window
                 .ctx
-                .read_response(egui::Id::new(("move-history-remove", destination.path())))
+                .read_response(egui::Id::unique((
+                    "move-history-remove",
+                    destination.path(),
+                )))
                 .unwrap()
                 .rect;
             // The text button's actual painted background, including its padding.
@@ -225,7 +232,7 @@ fn move_dialog_controls_align_and_fit_at_each_window_width() {
                     language.code()
                 );
                 assert!(
-                    window.ctx.screen_rect().contains_rect(rect),
+                    window.ctx.viewport_rect().contains_rect(rect),
                     "{} / {width}: {rect:?}",
                     language.code()
                 );

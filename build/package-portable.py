@@ -11,6 +11,8 @@ import tarfile
 import tempfile
 import zipfile
 
+from package_resources import copy_resources
+
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = (
@@ -47,7 +49,7 @@ def make_archive(app, archive, windows):
         def permissions(info):
             info.uid = info.gid = 0
             info.uname = info.gname = ""
-            info.mode = 0o755 if info.isdir() or info.name == f"{APP_NAME}/nabi-view" else 0o644
+            info.mode = 0o755 if info.isdir() or info.name in (f"{APP_NAME}/nabi-view", f"{APP_NAME}/previews/nabi-thumbnailer", f"{APP_NAME}/previews/install.sh") else 0o644
             return info
 
         with tarfile.open(archive, "w:gz") as output:
@@ -72,10 +74,6 @@ def package(target, binary=None):
     notices = ROOT / "target/notices/THIRD_PARTY_NOTICES.txt"
     if not notices.is_file():
         raise ValueError("Missing third-party notices. Run python3 build/notices.py first.")
-    samples = ROOT / "assets/field-notes"
-    if not samples.is_dir():
-        raise ValueError(f"Missing sample resources: {samples}")
-
     package_dir = build_dir / "package"
     if package_dir.is_symlink():
         raise ValueError(f"Unexpected output directory: {package_dir}")
@@ -104,8 +102,20 @@ def package(target, binary=None):
         executable = app / ("nabi-view.exe" if windows else "nabi-view")
         shutil.copy2(binary, executable)
         executable.chmod(0o755)
-        shutil.copytree(samples, app / "field-notes")
-        shutil.copytree(ROOT / "assets/icons", app / "icons")
+        previews = app / "previews"
+        if windows and target.endswith("msvc"):
+            previews.mkdir()
+            for name in ("nabi_preview.dll", "nabi-shell-preview.dll"):
+                shutil.copy2(build_dir / target / "release" / name, previews / name)
+            shutil.copy2(ROOT / "platforms/preview/windows/register.ps1", previews / "register.ps1")
+        elif not windows:
+            previews.mkdir()
+            shutil.copy2(build_dir / target / "release/nabi-thumbnailer", previews / "nabi-thumbnailer")
+            (previews / "nabi-thumbnailer").chmod(0o755)
+            for name in ("install.sh", "nabi-view.thumbnailer"):
+                shutil.copy2(ROOT / "platforms/preview/linux" / name, previews / name)
+            (previews / "install.sh").chmod(0o755)
+        copy_resources(ROOT, app)
         shutil.copy2(notices, app / notices.name)
         for name in ("LICENSE", "THIRD_PARTY.md"):
             shutil.copy2(ROOT / name, app / name)

@@ -37,6 +37,8 @@ try {
         if ($LASTEXITCODE) { throw 'Windows tests failed.' }
         & cargo build --locked --release --bin nabi-view --target $target
         if ($LASTEXITCODE) { throw 'Windows build failed.' }
+        & "$project/build/windows-previews.ps1" -Architecture $Architecture
+        if ($LASTEXITCODE) { throw 'Windows previews failed.' }
         & $Python build/notices.py
         if ($LASTEXITCODE) { throw 'Third-party notice generation failed.' }
     }

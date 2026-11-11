@@ -105,6 +105,10 @@ fn utc_time(time: SystemTime) -> Option<String> {
 }
 
 pub fn read(path: &Path) -> Result<Metadata, String> {
+    #[cfg(all(target_os = "macos", not(test)))]
+    let access = crate::platform::mac_access::resolve(path)?;
+    #[cfg(all(target_os = "macos", not(test)))]
+    let path = access.path.as_path();
     let info = fs::metadata(path).map_err(|e| e.to_string())?;
     if !info.is_file() {
         return Err("Select a regular image file.".into());

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=NABI VIEW
+Comment=View local images and image archives
+Exec=nabi-view %f
+Icon=dev.nabi.NabiView
+Terminal=false
+Categories=Graphics;Viewer;
+MimeType=image/jpeg;image/png;image/gif;image/webp;image/bmp;image/tiff;image/avif;image/jxl;image/svg+xml;image/vnd.microsoft.icon;image/x-portable-bitmap;image/x-portable-graymap;image/x-portable-pixmap;image/x-tga;application/zip;application/x-7z-compressed;
+StartupNotify=true

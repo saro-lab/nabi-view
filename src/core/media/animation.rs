@@ -2,7 +2,7 @@
 //! worker with one queued frame and one in flight, independent of their length.
 use super::{
     AnimationFrame, CancelReader, Frame, MAX_DECODE_BYTES, MAX_EDGE, MAX_FILE_BYTES, MAX_PIXELS,
-    output_size,
+    color, output_size,
 };
 use eframe::egui;
 use image::{AnimationDecoder, DynamicImage, ImageDecoder, ImageFormat, Limits};
@@ -93,7 +93,7 @@ impl Animation {
                 max_side,
                 size,
             },
-            frame_bytes: image.pixels.len() * 4,
+            frame_bytes: image.pixels.len() * if format == ImageFormat::Avif { 20 } else { 4 },
             playback: None,
         }
     }
@@ -115,7 +115,7 @@ impl Animation {
         &mut self,
         ctx: &egui::Context,
         now: Instant,
-    ) -> Result<Option<egui::ColorImage>, String> {
+    ) -> Result<Option<AnimationFrame>, String> {
         if self.playback.is_none() {
             self.playback = Some(self.source.start(ctx.clone())?);
         }
@@ -135,7 +135,7 @@ impl Animation {
                     .checked_add(frame.delay)
                     .ok_or("Invalid animation frame delay")?;
                 ctx.request_repaint_after(frame.delay);
-                Ok(Some(frame.image))
+                Ok(Some(frame))
             }
             Ok(Err(error)) => {
                 playback.finished = true;
@@ -212,7 +212,7 @@ fn open_frames<'a>(
     path: &Path,
     format: ImageFormat,
     live: &'a dyn Fn() -> bool,
-) -> Result<Option<(image::Frames<'a>, [u32; 2])>, String> {
+) -> Result<Option<(image::Frames<'a>, [u32; 2], Option<Vec<u8>>)>, String> {
     let started = Instant::now();
     check_work(live, started)?;
     let file = File::open(path).map_err(|e| e.to_string())?;
@@ -225,13 +225,13 @@ fn open_frames<'a>(
     limits.max_image_width = Some(MAX_EDGE);
     limits.max_image_height = Some(MAX_EDGE);
     limits.max_alloc = Some(MAX_DECODE_BYTES);
-    let (frames, (w, h)) = match format {
+    let (frames, (w, h), icc) = match format {
         ImageFormat::Gif => {
             let mut decoder =
                 image::codecs::gif::GifDecoder::new(reader).map_err(|e| e.to_string())?;
             decoder.set_limits(limits).map_err(|e| e.to_string())?;
             let size = decoder.dimensions();
-            (decoder.into_frames(), size)
+            (decoder.into_frames(), size, None)
         }
         ImageFormat::WebP => {
             let mut decoder =
@@ -241,7 +241,8 @@ fn open_frames<'a>(
             }
             decoder.set_limits(limits).map_err(|e| e.to_string())?;
             let size = decoder.dimensions();
-            (decoder.into_frames(), size)
+            let icc = decoder.icc_profile().ok().flatten();
+            (decoder.into_frames(), size, icc)
         }
         ImageFormat::Png => {
             let mut decoder =
@@ -251,9 +252,11 @@ fn open_frames<'a>(
             }
             decoder.set_limits(limits).map_err(|e| e.to_string())?;
             let size = decoder.dimensions();
+            let icc = decoder.icc_profile().ok().flatten();
             (
                 decoder.apng().map_err(|e| e.to_string())?.into_frames(),
                 size,
+                icc,
             )
         }
         _ => return Ok(None),
@@ -262,13 +265,14 @@ fn open_frames<'a>(
         return Err("Animation exceeds pixel limit".into());
     }
     check_work(live, started)?;
-    Ok(Some((frames, [w, h])))
+    Ok(Some((frames, [w, h], icc)))
 }
 
 fn next_frame(
     frames: &mut image::Frames<'_>,
     size: [u32; 2],
     max_side: u32,
+    icc: Option<&[u8]>,
     live: &dyn Fn() -> bool,
 ) -> Result<Option<AnimationFrame>, String> {
     let started = Instant::now();
@@ -290,9 +294,10 @@ fn next_frame(
             .thumbnail_exact(w, h)
             .into_rgba8()
     };
-    let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+    let rgba = color::to_srgb(DynamicImage::ImageRgba8(rgba), icc)?;
+    let (image, hdr) = color::display(rgba);
     check_work(live, started)?;
-    Ok(Some(AnimationFrame { image, delay }))
+    Ok(Some(AnimationFrame { image, hdr, delay }))
 }
 
 pub(super) fn decode_first(
@@ -304,13 +309,15 @@ pub(super) fn decode_first(
     let Some(format @ (ImageFormat::Gif | ImageFormat::WebP | ImageFormat::Png)) = format else {
         return Ok(None);
     };
-    let Some((mut frames, size)) = open_frames(path, format, live)? else {
+    let Some((mut frames, size, icc)) = open_frames(path, format, live)? else {
         return Ok(None);
     };
-    let first = next_frame(&mut frames, size, max_side, live)?.ok_or("Empty animation")?;
+    let first =
+        next_frame(&mut frames, size, max_side, icc.as_deref(), live)?.ok_or("Empty animation")?;
     Ok(Some(Frame {
         animation: Some(Animation::new(path, format, max_side, size, &first.image)),
         image: first.image,
+        hdr: first.hdr,
         original_size: size,
     }))
 }
@@ -320,19 +327,22 @@ fn visit(
     live: &dyn Fn() -> bool,
     emit: &mut dyn FnMut(AnimationFrame, [u32; 2]) -> Result<bool, String>,
 ) -> Result<usize, String> {
+    #[cfg(all(target_os = "macos", not(test)))]
+    let access = crate::platform::mac_access::resolve(&source.path)?;
+    #[cfg(all(target_os = "macos", not(test)))]
+    let path = access.path.as_path();
+    #[cfg(not(all(target_os = "macos", not(test))))]
+    let path = source.path.as_path();
     if source.format == ImageFormat::Avif {
-        return super::avif::visit(
-            &source.path,
-            source.max_side,
-            live,
-            &mut |frame, size, _| emit(frame, size),
-        );
+        return super::avif::visit(path, source.max_side, live, &mut |frame, size, _| {
+            emit(frame, size)
+        });
     }
-    let Some((mut frames, size)) = open_frames(&source.path, source.format, live)? else {
+    let Some((mut frames, size, icc)) = open_frames(path, source.format, live)? else {
         return Err("Image is no longer an animation".into());
     };
     let mut count = 0;
-    while let Some(frame) = next_frame(&mut frames, size, source.max_side, live)? {
+    while let Some(frame) = next_frame(&mut frames, size, source.max_side, icc.as_deref(), live)? {
         count += 1;
         if !emit(frame, size)? {
             break;
@@ -368,6 +378,45 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert!(!live.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn apng_profile_is_applied_to_first_and_following_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profile.apng");
+        let profile = moxcms::ColorProfile::new_adobe_rgb().encode().unwrap();
+        let mut info = png::Info::with_size(1, 1);
+        info.color_type = png::ColorType::Rgba;
+        info.bit_depth = png::BitDepth::Eight;
+        info.icc_profile = Some(std::borrow::Cow::Owned(profile));
+        let mut encoder =
+            png::Encoder::with_info(std::fs::File::create(&path).unwrap(), info).unwrap();
+        encoder.set_animated(2, 0).unwrap();
+        let mut writer = encoder.write_header().unwrap();
+        for _ in 0..2 {
+            writer.write_image_data(&[120, 150, 80, 97]).unwrap();
+        }
+        writer.finish().unwrap();
+        let first = decode_first(&path, Some(ImageFormat::Png), 1024, &|| true)
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            first.image.pixels[0],
+            egui::Color32::from_rgba_unmultiplied(120, 150, 80, 97)
+        );
+        assert_eq!(first.image.pixels[0].a(), 97);
+        let source = Source {
+            path,
+            format: ImageFormat::Png,
+            max_side: 1024,
+            size: [1, 1],
+        };
+        let count = visit(&source, &|| true, &mut |frame, _| {
+            assert_eq!(frame.image.pixels, first.image.pixels);
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(count, 2);
     }
 
     #[test]

@@ -4,6 +4,9 @@ pub(crate) mod animation;
 #[cfg(test)]
 pub(crate) mod animation_fixtures;
 pub(crate) mod avif;
+pub(crate) mod color;
+mod persistent;
+pub(crate) mod regions;
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
@@ -54,11 +57,13 @@ pub(crate) fn images_in_folder(dir: &Path) -> io::Result<impl Iterator<Item = Pa
 }
 
 pub struct AnimationFrame {
+    pub hdr: Option<color::HdrImage>,
     pub image: egui::ColorImage,
     pub delay: Duration,
 }
 
 pub struct Frame {
+    pub hdr: Option<color::HdrImage>,
     pub animation: Option<animation::Animation>,
     pub image: egui::ColorImage,
     pub original_size: [u32; 2],
@@ -119,6 +124,8 @@ struct Shared {
     visible_epoch: AtomicU64,
     thumbnail_epoch: AtomicU64,
     next_id: AtomicU64,
+    disk_cache: Mutex<Option<crate::core::disk_cache::Cache>>,
+    folder_stamps: Mutex<(u64, HashMap<PathBuf, FileSortMetadata>)>,
 }
 
 /// Two visible image slots share one decoder; directory discovery runs independently.
@@ -138,8 +145,8 @@ impl Media {
         Self(shared)
     }
 
-    pub fn request_image(&self, path: PathBuf, max_side: u32) -> u64 {
-        self.request_image_in_slot(0, path, max_side)
+    pub(crate) fn configure_cache(&self, cache: Option<crate::core::disk_cache::Cache>) {
+        *self.0.disk_cache.lock().unwrap() = cache;
     }
 
     pub fn request_image_in_slot(&self, slot: usize, path: PathBuf, max_side: u32) -> u64 {
@@ -149,6 +156,17 @@ impl Media {
 
     pub fn request_folder(&self, dir: PathBuf) -> u64 {
         self.submit(FOLDER_SLOT, dir, 0)
+    }
+
+    /// Memory-only metadata captured by the folder worker. Call on folder
+    /// events, not every frame; stale folder generations cannot leak across tabs.
+    pub(crate) fn folder_stamps(&self, id: u64) -> HashMap<PathBuf, FileSortMetadata> {
+        let snapshot = self.0.folder_stamps.lock().unwrap();
+        if snapshot.0 == id {
+            snapshot.1.clone()
+        } else {
+            HashMap::new()
+        }
     }
 
     pub fn request_thumbnail(&self, path: PathBuf, max_side: u32) -> u64 {
@@ -221,6 +239,7 @@ impl Drop for Media {
 }
 
 fn worker(shared: Arc<Shared>, ctx: egui::Context, slots: &[usize]) {
+    let writer = persistent::Writer::new();
     loop {
         let (slot, job, visible_epoch, thumbnail_epoch) = {
             let mut q = shared.queues.lock().unwrap();
@@ -266,7 +285,34 @@ fn worker(shared: Arc<Shared>, ctx: egui::Context, slots: &[usize]) {
                 || (slot == PREFETCH_SLOT
                     && shared.thumbnail_epoch.load(AtomicOrdering::Relaxed) != thumbnail_epoch)
         };
-        let result = decode(&job.path, job.max_side, &|| live() && !preempted());
+        let cache = shared.disk_cache.lock().unwrap().clone();
+        let cache_key = cache
+            .as_ref()
+            .and_then(|cache| cache.key(&job.path, job.max_side));
+        let cached = cache
+            .as_ref()
+            .zip(cache_key.as_ref())
+            .and_then(|(cache, key)| cache.load(key));
+        let result = if let Some(cached) = cached {
+            Ok(Frame {
+                hdr: None,
+                animation: None,
+                image: cached.image,
+                original_size: cached.original_size,
+            })
+        } else {
+            let result = decode(&job.path, job.max_side, &|| live() && !preempted());
+            if live()
+                && !preempted()
+                && let Ok(frame) = &result
+                && frame.animation.is_none()
+                && frame.hdr.is_none()
+                && let Some((cache, key)) = cache.zip(cache_key)
+            {
+                writer.store(cache, key, frame);
+            }
+            result
+        };
         if slot >= THUMB_SLOT {
             let mut q = shared.queues.lock().unwrap();
             if live() && preempted() && !q.closed {
@@ -306,7 +352,16 @@ fn worker(shared: Arc<Shared>, ctx: egui::Context, slots: &[usize]) {
 /// Prefetch retains only the first frame; playback starts when visible.
 pub fn prefetch_output_budget(max_side: u32) -> usize {
     let pixels = (u64::from(max_side) * u64::from(max_side)).min(MAX_OUTPUT_PIXELS);
-    (pixels * 4) as usize
+    // SDR texture plus retained float HDR source and FP16 texture (worst case).
+    (pixels * 28) as usize
+}
+
+/// Ordering keys only: archive timestamps may have no timezone, so callers must
+/// not display `modified` as an epoch timestamp or compare different sources.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FileSortMetadata {
+    pub bytes: u64,
+    pub modified: Option<u128>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -323,6 +378,10 @@ struct FolderSnapshot {
 }
 
 fn scan_snapshot(dir: &Path, live: &dyn Fn() -> bool) -> Result<FolderSnapshot, String> {
+    #[cfg(all(target_os = "macos", not(test)))]
+    let access = crate::platform::mac_access::resolve(dir)?;
+    #[cfg(all(target_os = "macos", not(test)))]
+    let dir = access.path.as_path();
     let mut files = Vec::new();
     let mut stamps = HashMap::new();
     let entries = match fs::read_dir(dir) {
@@ -342,8 +401,8 @@ fn scan_snapshot(dir: &Path, live: &dyn Fn() -> bool) -> Result<FolderSnapshot, 
         }
         let metadata = match fs::metadata(&path) {
             Ok(metadata) => metadata,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(format!("Could not read file information. {e}")),
+            // Like the folder listing, leave out a file that cannot be read.
+            Err(_) => continue,
         };
         if metadata.is_file() {
             stamps.insert(
@@ -372,6 +431,31 @@ pub fn compare_file_names(a: &Path, b: &Path) -> Ordering {
         b.to_string_lossy().as_bytes(),
     )
     .then_with(|| a.cmp(b))
+}
+
+/// Natural order of relative paths, one component at a time, so the pages of
+/// a folder inside an archive stay together.
+pub(crate) fn compare_paths(a: &Path, b: &Path) -> Ordering {
+    let mut a_parts = a.components();
+    let mut b_parts = b.components();
+    loop {
+        match (a_parts.next(), b_parts.next()) {
+            (None, None) => return a.cmp(b),
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) => {
+                let (x, y) = (x.as_os_str(), y.as_os_str());
+                let order = natural_cmp(
+                    x.to_string_lossy().as_bytes(),
+                    y.to_string_lossy().as_bytes(),
+                )
+                .then_with(|| x.cmp(y));
+                if order.is_ne() {
+                    return order;
+                }
+            }
+        }
+    }
 }
 
 fn folder_worker(shared: Arc<Shared>, ctx: egui::Context) {
@@ -415,6 +499,30 @@ fn folder_worker(shared: Arc<Shared>, ctx: egui::Context) {
         let mut published = false;
         match result {
             Ok(snapshot) => {
+                if initial || previous.as_ref() != Some(&snapshot) || last_error.is_some() {
+                    *shared.folder_stamps.lock().unwrap() = (
+                        job.id,
+                        snapshot
+                            .stamps
+                            .iter()
+                            .map(|(path, stamp)| {
+                                let modified = stamp.modified.map(|time| {
+                                    match time.duration_since(SystemTime::UNIX_EPOCH) {
+                                        Ok(value) => (1u128 << 127) + value.as_nanos(),
+                                        Err(value) => (1u128 << 127) - value.duration().as_nanos(),
+                                    }
+                                });
+                                (
+                                    path.clone(),
+                                    FileSortMetadata {
+                                        bytes: stamp.bytes,
+                                        modified,
+                                    },
+                                )
+                            })
+                            .collect(),
+                    );
+                }
                 if initial {
                     q.ready[FOLDER_SLOT] = Some(MediaEvent::Folder {
                         id: job.id,
@@ -562,7 +670,16 @@ fn output_size(w: u32, h: u32, max_side: u32) -> [u32; 2] {
     ]
 }
 
+/// Decodes the first frame outside the viewer's queues, for cached thumbnails.
+pub(crate) fn decode_still(path: &Path, max_side: u32) -> Result<Frame, String> {
+    decode(path, max_side, &|| true)
+}
+
 fn decode(path: &Path, max_side: u32, live: &dyn Fn() -> bool) -> Result<Frame, String> {
+    #[cfg(all(target_os = "macos", not(test)))]
+    let access = crate::platform::mac_access::resolve(path)?;
+    #[cfg(all(target_os = "macos", not(test)))]
+    let path = access.path.as_path();
     let meta = fs::metadata(path).map_err(|e| format!("Could not open the image. {e}"))?;
     if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
         return Err("Choose a regular image file no larger than 256 MiB.".into());
@@ -572,6 +689,11 @@ fn decode(path: &Path, max_side: u32, live: &dyn Fn() -> bool) -> Result<Frame, 
         .and_then(|x| x.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
+    if extension == "png"
+        && let Some(frame) = regions::png_preview(path, max_side, live)?
+    {
+        return Ok(frame);
+    }
     if extension == "avif" {
         return avif::decode(path, max_side, live);
     }
@@ -587,6 +709,7 @@ fn decode(path: &Path, max_side: u32, live: &dyn Fn() -> bool) -> Result<Frame, 
         let [out_w, out_h] = output_size(w, h, max_side);
         let rgba = image.thumbnail_exact(out_w, out_h).into_rgba8();
         return Ok(Frame {
+            hdr: None,
             animation: None,
             image: egui::ColorImage::from_rgba_unmultiplied(
                 [out_w as usize, out_h as usize],
@@ -619,6 +742,7 @@ fn decode(path: &Path, max_side: u32, live: &dyn Fn() -> bool) -> Result<Frame, 
             return Err("Cancelled".into());
         }
         return Ok(Frame {
+            hdr: None,
             animation: None,
             image: egui::ColorImage::from_rgba_premultiplied(
                 [w as usize, h as usize],
@@ -675,6 +799,7 @@ fn decode(path: &Path, max_side: u32, live: &dyn Fn() -> bool) -> Result<Frame, 
     {
         return Err("Image dimensions exceed the decoding limit.".into());
     }
+    let icc = decoder.icc_profile().ok().flatten();
     let orientation = decoder
         .orientation()
         .unwrap_or(image::metadata::Orientation::NoTransforms);
@@ -692,6 +817,7 @@ fn decode(path: &Path, max_side: u32, live: &dyn Fn() -> bool) -> Result<Frame, 
     if !live() {
         return Err("Cancelled".into());
     }
+    image = color::to_srgb(image, icc.as_deref())?;
     image.apply_orientation(orientation);
     let original_size = match orientation {
         image::metadata::Orientation::Rotate90
@@ -700,10 +826,9 @@ fn decode(path: &Path, max_side: u32, live: &dyn Fn() -> bool) -> Result<Frame, 
         | image::metadata::Orientation::Rotate270FlipH => [h, w],
         _ => [w, h],
     };
-    let (w, h) = image.dimensions();
-    let rgba = image.into_rgba8();
-    let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+    let (image, hdr) = color::display(image);
     Ok(Frame {
+        hdr,
         animation: None,
         image,
         original_size,

@@ -29,6 +29,9 @@ impl PreparedMetadata {
 
 type Report = Result<PreparedMetadata, String>;
 const COPY_FADE_SECONDS: f64 = 0.55;
+const FILTER_BACKGROUND: Color32 = Color32::from_black_alpha(110);
+// Behind filter matches; the white, outlined text stays legible on top.
+const MATCH_BACKGROUND: Color32 = Color32::from_rgba_premultiplied(150, 112, 0, 150);
 
 struct Pending {
     generation: u64,
@@ -42,6 +45,15 @@ pub(super) struct Inspector {
 }
 
 impl Inspector {
+    pub fn configure(&mut self, font_size: u32, reduce_motion: bool) {
+        for page in &mut self.pages {
+            if page.font_size != font_size {
+                page.row_heights.clear();
+                page.font_size = font_size;
+            }
+            page.reduce_motion = reduce_motion;
+        }
+    }
     pub fn invalidate(&mut self) {
         for page in &mut self.pages {
             page.set_target(None);
@@ -51,6 +63,31 @@ impl Inspector {
     pub fn close(&mut self) {
         self.open = false;
         self.invalidate();
+        // Filters survive navigation, but closing the inspector starts over.
+        for page in &mut self.pages {
+            page.filter.clear();
+        }
+    }
+
+    /// While a filter field has keyboard focus, keys are text, not shortcuts.
+    pub fn filter_focused(&self, ctx: &egui::Context) -> bool {
+        self.open
+            && (0..self.pages.len()).any(|index| ctx.memory(|m| m.has_focus(filter_id(index))))
+    }
+
+    /// Escape empties a focused filter first, then releases its focus. It never
+    /// reaches the viewer, where Escape closes the window.
+    pub fn escape_focused_filter(&mut self, ctx: &egui::Context) {
+        for (index, page) in self.pages.iter_mut().enumerate() {
+            let id = filter_id(index);
+            if ctx.memory(|m| m.has_focus(id)) {
+                if page.filter.is_empty() {
+                    ctx.memory_mut(|m| m.surrender_focus(id));
+                } else {
+                    page.filter.clear();
+                }
+            }
+        }
     }
 
     pub(super) fn poll(&mut self) {
@@ -92,7 +129,16 @@ struct PageInspector {
     row_heights: HashMap<(usize, usize), f32>,
     layout_width: f32,
     layout_scale: f32,
+    font_size: u32,
+    reduce_motion: bool,
     copied_at: HashMap<egui::Id, f64>,
+    filter: String,
+    // Rows matching `filter` for the current report, rebuilt when either changes.
+    filtered: Option<(String, Vec<Row>)>,
+}
+
+fn filter_id(index: usize) -> egui::Id {
+    egui::Id::unique(("metadata-filter", index))
 }
 
 impl PageInspector {
@@ -101,6 +147,7 @@ impl PageInspector {
             self.target = path.map(Path::to_owned);
             self.generation = self.generation.wrapping_add(1);
             self.report = None;
+            self.filtered = None;
             self.row_heights.clear();
             self.copied_at.clear();
         }
@@ -117,6 +164,7 @@ impl PageInspector {
         };
         if job.generation == self.generation {
             self.row_heights.clear();
+            self.filtered = None;
             self.report = Some(result);
         }
         self.pending = None;
@@ -148,6 +196,12 @@ impl PageInspector {
     }
 
     fn show(&mut self, parent: &mut Ui, rect: Rect, index: usize) -> bool {
+        let font_size = if self.font_size == 0 {
+            12.
+        } else {
+            self.font_size as f32
+        };
+        let reduce_motion = self.reduce_motion;
         let mut ui = parent.new_child(
             egui::UiBuilder::new()
                 .id_salt(("metadata-on-image", index))
@@ -156,15 +210,57 @@ impl PageInspector {
         );
         ui.set_clip_rect(parent.clip_rect().intersect(rect));
         ui.spacing_mut().item_spacing = egui::vec2(6., 1.);
-        ui.spacing_mut().interact_size.y = 16.;
+        ui.spacing_mut().interact_size.y = font_size + 4.;
         if self.target.is_none() {
             return false;
         }
+        // Shown while reading too, so the layout and focus stay put on navigation.
+        // Translucent and borderless so the field reads as part of the overlay,
+        // not as a separate control on top of the photo.
+        let filter = ui
+            .scope(|ui| {
+                let visuals = ui.visuals_mut();
+                visuals.override_text_color = Some(Color32::WHITE);
+                visuals.selection.stroke = egui::Stroke::NONE;
+                for widget in [
+                    &mut visuals.widgets.inactive,
+                    &mut visuals.widgets.hovered,
+                    &mut visuals.widgets.active,
+                ] {
+                    widget.bg_stroke = egui::Stroke::NONE;
+                    widget.expansion = 0.;
+                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.filter)
+                        .id(filter_id(index))
+                        .hint_text(crate::i18n::tr("shortcut-filter"))
+                        .font(FontId::proportional(font_size))
+                        .text_color(Color32::WHITE)
+                        .background_color(FILTER_BACKGROUND)
+                        .desired_width(f32::INFINITY),
+                )
+            })
+            .inner;
+        if filter.has_focus() {
+            // The viewer handles Escape. Otherwise egui drops focus before the
+            // frame and the same press reaches the close-window shortcut.
+            ui.memory_mut(|m| {
+                m.set_focus_lock_filter(
+                    filter.id,
+                    egui::EventFilter {
+                        horizontal_arrows: true,
+                        escape: true,
+                        ..Default::default()
+                    },
+                )
+            });
+        }
+        ui.add_space(4.);
         let Some(report) = &mut self.report else {
             metadata_label(
                 &mut ui,
                 crate::i18n::tr("reading-metadata-dialog"),
-                12.,
+                font_size,
                 Sense::hover(),
             );
             return false;
@@ -172,7 +268,7 @@ impl PageInspector {
         let prepared = match report {
             Ok(report) => report,
             Err(error) => {
-                metadata_label(&mut ui, error, 12., Sense::hover());
+                metadata_label(&mut ui, error, font_size, Sense::hover());
                 return false;
             }
         };
@@ -188,17 +284,33 @@ impl PageInspector {
         ui.horizontal_wrapped(|ui| {
             for (n, (index, text)) in summary(metadata).iter().enumerate() {
                 if n > 0 {
-                    metadata_label(ui, "/", 12., Sense::hover());
+                    metadata_label(ui, "/", font_size, Sense::hover());
                 }
                 copied |= copyable(
                     ui,
                     text,
+                    "",
                     || text.clone(),
-                    egui::Id::new(("summary", index)),
+                    egui::Id::unique(("summary", index)),
                     &mut self.copied_at,
+                    font_size,
+                    reduce_motion,
                 );
             }
         });
+        let query = self.filter.trim().to_lowercase();
+        let rows: &[Row] = if query.is_empty() {
+            rows
+        } else {
+            if self
+                .filtered
+                .as_ref()
+                .is_none_or(|(query, _)| *query != self.filter)
+            {
+                self.filtered = Some((self.filter.clone(), tree.filtered_rows(&self.filter)));
+            }
+            &self.filtered.as_ref().expect("filtered rows").1
+        };
         let available = ui.available_height();
         egui::ScrollArea::vertical()
             .id_salt(("on-image-text", self.generation))
@@ -217,7 +329,11 @@ impl PageInspector {
                 let mut y = 0.;
                 for row in rows.iter() {
                     let key = (row.node, row.chunk);
-                    let mut height = self.row_heights.get(&key).copied().unwrap_or(22.);
+                    let mut height = self
+                        .row_heights
+                        .get(&key)
+                        .copied()
+                        .unwrap_or(font_size + 10.);
                     // Only lay out and paint visible text. Unvisited rows use a
                     // small height estimate until scrolled into view, so even a
                     // multi-megabyte workflow remains a single scrollable list.
@@ -243,9 +359,12 @@ impl PageInspector {
                             copied |= copyable(
                                 ui,
                                 &label,
+                                &query,
                                 || tree.copy_text(row.node),
-                                egui::Id::new(("tree", row.node)),
+                                egui::Id::unique(("tree", row.node)),
                                 &mut self.copied_at,
+                                font_size,
+                                reduce_motion,
                             );
                         });
                         height = row_ui.min_rect().height() + 3.;
@@ -258,12 +377,12 @@ impl PageInspector {
                     metadata_label(
                         ui,
                         crate::i18n::tr("large-or-deeply-nested-json-is-shown-as-text"),
-                        12.,
+                        font_size,
                         Sense::hover(),
                     );
                 }
                 for warning in &metadata.warnings {
-                    metadata_label(ui, warning, 12., Sense::hover());
+                    metadata_label(ui, warning, font_size, Sense::hover());
                 }
             });
         copied
@@ -310,28 +429,40 @@ fn summary(metadata: &Metadata) -> Vec<(usize, String)> {
 fn copyable(
     ui: &mut Ui,
     text: &str,
+    highlight: &str,
     value: impl FnOnce() -> String,
     index: egui::Id,
     copied_at: &mut HashMap<egui::Id, f64>,
+    font_size: f32,
+    reduce_motion: bool,
 ) -> bool {
     let now = ui.input(|i| i.time);
     let ctx = ui.ctx().clone();
-    let response = metadata_label_color(ui, text, 12., Sense::click(), |response| {
-        if response.clicked() {
-            ctx.copy_text(value());
-            copied_at.insert(index, now);
-        }
-        let Some(started) = copied_at.get(&index) else {
-            return Color32::WHITE;
-        };
-        let progress = ((now - started - 0.1) / (COPY_FADE_SECONDS - 0.1)).clamp(0., 1.) as f32;
-        if progress < 1. {
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
-        }
-        let channel =
-            |start: u8| (f32::from(start) + (255. - f32::from(start)) * progress).round() as u8;
-        Color32::from_rgb(channel(150), channel(205), 255)
-    });
+    let response =
+        metadata_label_color(ui, text, highlight, font_size, Sense::click(), |response| {
+            if response.clicked() {
+                ctx.copy_text(value());
+                copied_at.insert(index, now);
+            }
+            let Some(started) = copied_at.get(&index) else {
+                return Color32::WHITE;
+            };
+            if reduce_motion {
+                let remaining = COPY_FADE_SECONDS - (now - started);
+                if remaining > 0. {
+                    ctx.request_repaint_after(std::time::Duration::from_secs_f64(remaining));
+                    return Color32::from_rgb(150, 205, 255);
+                }
+                return Color32::WHITE;
+            }
+            let progress = ((now - started - 0.1) / (COPY_FADE_SECONDS - 0.1)).clamp(0., 1.) as f32;
+            if progress < 1. {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            }
+            let channel =
+                |start: u8| (f32::from(start) + (255. - f32::from(start)) * progress).round() as u8;
+            Color32::from_rgb(channel(150), channel(205), 255)
+        });
     response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .clicked()
@@ -339,12 +470,44 @@ fn copyable(
 
 /// Keep the regular-weight fill legible over photos with a black outer outline.
 fn metadata_label(ui: &mut Ui, text: &str, size: f32, sense: Sense) -> Response {
-    metadata_label_color(ui, text, size, sense, |_| Color32::WHITE)
+    metadata_label_color(ui, text, "", size, sense, |_| Color32::WHITE)
+}
+
+/// Char ranges of `text` matching the lowercased `query`, ignoring case the
+/// same way the tree filter does, so highlights agree with filtered rows.
+fn match_ranges(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
+    let query: Vec<char> = query.chars().collect();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let (mut matched, mut end) = (0, start);
+        'chars: while matched < query.len() && end < chars.len() {
+            for lower in chars[end].to_lowercase() {
+                if query.get(matched) != Some(&lower) {
+                    break 'chars;
+                }
+                matched += 1;
+            }
+            end += 1;
+        }
+        if matched == query.len() {
+            ranges.push(start..end);
+            start = end;
+        } else {
+            start += 1;
+        }
+    }
+    ranges
 }
 
 fn metadata_label_color(
     ui: &mut Ui,
     text: &str,
+    highlight: &str,
     size: f32,
     sense: Sense,
     color: impl FnOnce(&Response) -> Color32,
@@ -360,6 +523,31 @@ fn metadata_label_color(
     let color = color(&response);
     if ui.is_rect_visible(rect) {
         let position = rect.min + padding;
+        let matches = match_ranges(text, highlight);
+        if !matches.is_empty() {
+            let mut row_start = 0;
+            for row in &galley.rows {
+                let row_end = row_start + row.char_count_excluding_newline().0;
+                for range in &matches {
+                    let (start, end) = (range.start.max(row_start), range.end.min(row_end));
+                    if start < end {
+                        let x = |column: usize| {
+                            row.pos.x + row.x_offset(egui::text::CharIndex(column - row_start))
+                        };
+                        let span = Rect::from_x_y_ranges(
+                            x(start)..=x(end),
+                            row.rect().min.y..=row.rect().max.y,
+                        );
+                        ui.painter().rect_filled(
+                            span.translate(position.to_vec2()).expand(1.),
+                            2.,
+                            MATCH_BACKGROUND,
+                        );
+                    }
+                }
+                row_start += row.char_count_including_newline().0;
+            }
+        }
         // Reuse the same layout for a one-point outline in all directions.
         // Paint the regular fill last so the outline does not thicken the text.
         for (x, y) in [
@@ -410,7 +598,7 @@ mod tests {
         let mut time = 0.;
         let mut draw = |page: &mut PageInspector, events: Vec<egui::Event>| {
             time += 0.1;
-            ctx.run(
+            ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -420,8 +608,8 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |root| {
+                    egui::CentralPanel::default().show(root, |ui| {
                         page.show(ui, ui.max_rect(), 0);
                     });
                 },
@@ -458,6 +646,8 @@ mod tests {
                 vec![
                     egui::Event::PointerMoved(pointer),
                     egui::Event::MouseWheel {
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Wheel,
                         unit: egui::MouseWheelUnit::Point,
                         delta: egui::vec2(0., -100_000.),
                         modifiers: egui::Modifiers::NONE,
@@ -491,7 +681,6 @@ mod tests {
         // Clear the smoothed wheel delta before clicking the final visible chunk.
         ctx.input_mut(|input| {
             input.smooth_scroll_delta = egui::Vec2::ZERO;
-            input.raw_scroll_delta = egui::Vec2::ZERO;
         });
         draw(
             &mut page,
@@ -520,6 +709,17 @@ mod tests {
             }),
             "Clicking the last layout chunk must copy the complete value"
         );
+    }
+
+    #[test]
+    fn filter_highlights_every_case_insensitive_match_by_char_range() {
+        assert_eq!(match_ranges("Seed: 42 / seedling", "seed"), [0..4, 11..15]);
+        assert_eq!(match_ranges("별밤 Starry 별밤", "별밤"), [0..2, 10..12]);
+        assert_eq!(match_ranges("aaaa", "aa"), [0..2, 2..4]);
+        // `İ` lowercases to two chars; the match still ends on a char boundary.
+        assert_eq!(match_ranges("xİy", "i\u{307}y"), [1..3]);
+        assert!(match_ranges("anything", "").is_empty());
+        assert!(match_ranges("seed", "seeds").is_empty());
     }
 
     #[test]

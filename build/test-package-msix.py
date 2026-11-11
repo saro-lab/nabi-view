@@ -33,10 +33,16 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(parsed.find("Identity", msix.NS).attrib["Publisher"], identity["publisher"])
         association = parsed.find(".//uap3:FileTypeAssociation", msix.NS)
         self.assertEqual(association.attrib["Parameters"], '"%1"')
-        types = [node.text for node in association.findall(".//uap:FileType", msix.NS)]
+        types = [node.text for node in parsed.findall(".//uap:FileType", msix.NS)]
         self.assertIn(".png", types)
         self.assertIn(".avif", types)
         self.assertEqual(len(types), len(set(types)))
+        thumbnail = parsed.find(".//desktop2:ThumbnailHandler", msix.NS)
+        preview = parsed.find(".//desktop2:DesktopPreviewHandler", msix.NS)
+        server = parsed.find(".//com:Class", msix.NS)
+        self.assertEqual(thumbnail.attrib["Clsid"], server.attrib["Id"])
+        self.assertEqual(preview.attrib["Clsid"], server.attrib["Id"])
+        self.assertIsNone(association.find("desktop2:ThumbnailHandler", msix.NS))
 
     def test_binary_architecture_and_runtime_checks(self):
         with tempfile.TemporaryDirectory() as tmp:

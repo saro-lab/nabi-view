@@ -147,6 +147,14 @@ fi
 if [ "$action" != package-only ]; then
     for build_target in $targets; do
         "$builder" build --locked --release --bin nabi-view --target "$build_target"
+        case "$build_target" in
+            *-unknown-linux-gnu) "$builder" build --locked --release -p nabi-preview --target "$build_target" ;;
+            *-pc-windows-msvc)
+                preview_arch=x64
+                case "$build_target" in aarch64-*) preview_arch=arm64 ;; esac
+                powershell.exe -NoProfile -ExecutionPolicy Bypass -File build/windows-previews.ps1 -Architecture "$preview_arch"
+                ;;
+        esac
     done
 fi
 if [ "$action" != binary ]; then

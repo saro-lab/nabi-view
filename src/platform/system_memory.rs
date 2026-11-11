@@ -5,6 +5,8 @@
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Snapshot {
+    /// Physical RAM on desktop/Android; iOS uses the smaller effective app
+    /// allocation ceiling (current footprint + current OS-provided headroom).
     pub total: u64,
     pub available: u64,
 }
@@ -157,7 +159,27 @@ fn platform_snapshot() -> Option<Snapshot> {
     Snapshot::checked(total, available_pages.saturating_mul(page_size as u64))
 }
 
-#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+#[cfg(any(target_os = "ios", target_os = "android"))]
+fn platform_snapshot() -> Option<Snapshot> {
+    unsafe extern "C" {
+        fn nabi_mobile_memory(total: *mut u64, available: *mut u64) -> bool;
+    }
+    let (mut total, mut available) = (0, 0);
+    // SAFETY: the host synchronously fills two u64 output locations; Android
+    // attaches the calling probe worker to the JVM and releases it afterward.
+    if !unsafe { nabi_mobile_memory(&mut total, &mut available) } {
+        return None;
+    }
+    Snapshot::checked(total, available)
+}
+
+#[cfg(not(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android"
+)))]
 fn platform_snapshot() -> Option<Snapshot> {
     None
 }
@@ -165,6 +187,25 @@ fn platform_snapshot() -> Option<Snapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mobile_probe_contract_preserves_pressure_and_bounds_available() {
+        assert_eq!(Snapshot::checked(0, u64::MAX), None);
+        assert_eq!(
+            Snapshot::checked(100, 0),
+            Some(Snapshot {
+                total: 100,
+                available: 0
+            })
+        );
+        assert_eq!(
+            Snapshot::checked(100, u64::MAX),
+            Some(Snapshot {
+                total: 100,
+                available: 100
+            })
+        );
+    }
 
     #[test]
     fn meminfo_uses_available_not_free() {

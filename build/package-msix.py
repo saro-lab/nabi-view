@@ -18,6 +18,8 @@ NS = {
     "uap": "http://schemas.microsoft.com/appx/manifest/uap/windows10",
     "uap3": "http://schemas.microsoft.com/appx/manifest/uap/windows10/3",
     "rescap": "http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities",
+    "desktop2": "http://schemas.microsoft.com/appx/manifest/desktop/windows10/2",
+    "com": "http://schemas.microsoft.com/appx/manifest/com/windows10",
 }
 TARGETS = {"x64": "x86_64-pc-windows-msvc", "arm64": "aarch64-pc-windows-msvc"}
 for prefix, uri in NS.items():
@@ -62,7 +64,7 @@ def supported_extensions():
 
 
 def manifest(identity, version, arch):
-    package = ET.Element(f"{{{NS['']}}}Package", {"IgnorableNamespaces": "uap uap3 rescap"})
+    package = ET.Element(f"{{{NS['']}}}Package", {"IgnorableNamespaces": "uap uap3 rescap desktop2 com"})
     element(package, "Identity", {"Name": identity["name"], "Publisher": identity["publisher"],
                                  "Version": validate_version(version), "ProcessorArchitecture": arch})
     properties = element(package, "Properties")
@@ -84,13 +86,23 @@ def manifest(identity, version, arch):
             "Square150x150Logo": "Assets/Square150x150Logo.png",
             "Square44x44Logo": "Assets/Square44x44Logo.png"})
     extensions = element(app, "Extensions")
-    extension = element(extensions, "uap:Extension", {"Category": "windows.fileTypeAssociation"})
-    association = element(extension, "uap3:FileTypeAssociation", {
-        "Name": "nabiview.images", "Parameters": '"%1"'})
-    element(association, "uap:DisplayName", text="NABI VIEW Image")
-    types = element(association, "uap:SupportedFileTypes")
-    for ext in supported_extensions():
-        element(types, "uap:FileType", text=f".{ext}")
+    preview_types = {"avif", "jxl", "qoi", "exr", "hdr", "dds", "ff"}
+    clsid = "6B130EF4-E2C7-4BFD-A5A9-62CD3BF82F40"
+    for name, preview in (("images", False), ("previews", True)):
+        extension = element(extensions, "uap:Extension", {"Category": "windows.fileTypeAssociation"})
+        association = element(extension, "uap3:FileTypeAssociation", {
+            "Name": "nabiview." + name, "Parameters": '\"%1\"'})
+        element(association, "uap:DisplayName", text="NABI VIEW Image")
+        types = element(association, "uap:SupportedFileTypes")
+        for ext in supported_extensions():
+            if (ext in preview_types) == preview:
+                element(types, "uap:FileType", text=f".{ext}")
+        if preview:
+            element(association, "desktop2:ThumbnailHandler", {"Clsid": clsid})
+            element(association, "desktop2:DesktopPreviewHandler", {"Clsid": clsid})
+    extension = element(extensions, "com:Extension", {"Category": "windows.comServer"})
+    server = element(element(extension, "com:ComServer"), "com:SurrogateServer", {"DisplayName": "NABI VIEW preview"})
+    element(server, "com:Class", {"Id": clsid, "Path": "previews/nabi-shell-preview.dll", "ThreadingModel": "STA"})
     capabilities = element(package, "Capabilities")
     element(capabilities, "rescap:Capability", {"Name": "runFullTrust"})
     ET.indent(package)
@@ -158,6 +170,11 @@ def main():
     # Retain each build's staging tree for inspection, signing and local registration.
     stage = Path(tempfile.mkdtemp(prefix="package-", dir=output))
     shutil.copy2(binary, stage / "nabi-view.exe")
+    (stage / "previews").mkdir()
+    for name in ("nabi_preview.dll", "nabi-shell-preview.dll"):
+        library = target / TARGETS[args.arch] / "release" / name
+        validate_binary(library, args.arch)
+        shutil.copy2(library, stage / "previews" / name)
     shutil.copytree(ROOT / "assets/field-notes", stage / "field-notes")
     shutil.copytree(ROOT / "platforms/windows/Assets", stage / "Assets")
     shutil.copy2(notices, stage / notices.name)

@@ -3,16 +3,23 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 extern void nabi_mobile_back(void);
 extern bool nabi_mobile_import_begin(void);
+extern bool nabi_mobile_import_begin_folder(void);
+extern void nabi_mobile_settings_import(int);
+extern void nabi_mobile_export_result(bool);
 extern bool nabi_mobile_import_utf16(int, const unsigned short *, size_t);
 extern void nabi_mobile_import_error(const char *);
 extern void nabi_mobile_import_finish(void);
+extern void nabi_mobile_source_utf16(const unsigned short *, size_t, const unsigned short *, size_t);
 
 static JavaVM *vm;
 static jobject activity;
 static jmethodID pick_method, awake_method, copy_method, exit_method;
+static jmethodID folder_method, orientation_method, immersive_method, share_method, export_method, import_method;
+static jmethodID reopen_method, memory_method, hdr_method;
 static char *paths[3];
 static _Atomic float safe_area[4];
 
@@ -33,6 +40,9 @@ static bool clear_exception(JNIEnv *env) {
     return true;
 }
 static jboolean begin(JNIEnv *env, jobject self) { (void)env; (void)self; return nabi_mobile_import_begin(); }
+static jboolean begin_folder(JNIEnv *env, jobject self) { (void)env; (void)self; return nabi_mobile_import_begin_folder(); }
+static void settings(JNIEnv *env, jobject self, jint fd) { (void)env; (void)self; nabi_mobile_settings_import(fd); }
+static void export_result(JNIEnv *env, jobject self, jboolean saved) { (void)env; (void)self; nabi_mobile_export_result(saved); }
 static jboolean document(JNIEnv *env, jobject self, jint fd, jstring name) {
     (void)self;
     const jchar *characters = name ? (*env)->GetStringChars(env, name, NULL) : NULL;
@@ -42,6 +52,16 @@ static jboolean document(JNIEnv *env, jobject self, jint fd, jstring name) {
     return result;
 }
 static void back(JNIEnv *env, jobject self) { (void)env; (void)self; nabi_mobile_back(); }
+static void source(JNIEnv *env, jobject self, jstring id, jstring name) {
+    (void)self;
+    if (!id || !name) return;
+    const jchar *key = (*env)->GetStringChars(env, id, NULL);
+    const jchar *label = (*env)->GetStringChars(env, name, NULL);
+    if (key && label) nabi_mobile_source_utf16(key, (size_t)(*env)->GetStringLength(env, id),
+        label, (size_t)(*env)->GetStringLength(env, name));
+    if (key) (*env)->ReleaseStringChars(env, id, key);
+    if (label) (*env)->ReleaseStringChars(env, name, label);
+}
 static void finish(JNIEnv *env, jobject self) { (void)env; (void)self; nabi_mobile_import_finish(); }
 static void error(JNIEnv *env, jobject self) {
     (void)env; (void)self;
@@ -67,12 +87,25 @@ void nabi_android_init(void *java_vm, void *native_activity) {
         {"nativeError", "()V", (void *)error},
         {"nativeBack", "()V", (void *)back},
         {"nativeInsets", "(FFFF)V", (void *)insets},
+        {"nativeBeginFolder", "()Z", (void *)begin_folder},
+        {"nativeSettings", "(I)V", (void *)settings},
+        {"nativeExportResult", "(Z)V", (void *)export_result},
+        {"nativeSource", "(Ljava/lang/String;Ljava/lang/String;)V", (void *)source},
     };
     (*env)->RegisterNatives(env, cls, methods, sizeof(methods) / sizeof(methods[0]));
     pick_method = (*env)->GetMethodID(env, cls, "pickImages", "()V");
     copy_method = (*env)->GetMethodID(env, cls, "copyText", "(Ljava/lang/String;)V");
     exit_method = (*env)->GetMethodID(env, cls, "closeViewer", "()V");
     awake_method = (*env)->GetMethodID(env, cls, "keepAwake", "(Z)V");
+    folder_method = (*env)->GetMethodID(env, cls, "pickFolder", "()V");
+    orientation_method = (*env)->GetMethodID(env, cls, "setOrientation", "(I)V");
+    immersive_method = (*env)->GetMethodID(env, cls, "setImmersive", "(Z)V");
+    share_method = (*env)->GetMethodID(env, cls, "share", "(Ljava/lang/String;)V");
+    export_method = (*env)->GetMethodID(env, cls, "exportSettings", "(Ljava/lang/String;)V");
+    import_method = (*env)->GetMethodID(env, cls, "importSettings", "()V");
+    reopen_method = (*env)->GetMethodID(env, cls, "reopenSource", "(Ljava/lang/String;)Z");
+    memory_method = (*env)->GetMethodID(env, cls, "memorySnapshot", "()[J");
+    hdr_method = (*env)->GetMethodID(env, cls, "hdrDisplay", "()[F");
     jmethodID path_method = (*env)->GetMethodID(env, cls, "storagePath", "(I)Ljava/lang/String;");
     if (!clear_exception(env) && path_method) {
         for (int i = 0; i < 3; ++i) {
@@ -115,6 +148,92 @@ void nabi_mobile_copy_text(const unsigned short *text, int length) {
     if (value && copy_method) (*env)->CallVoidMethod(env, activity, copy_method, value);
     if (value) (*env)->DeleteLocalRef(env, value);
     clear_exception(env); release(attached);
+}
+void nabi_mobile_pick_folder(void) {
+    bool attached; JNIEnv *env = environment(&attached);
+    if (!env) return;
+    if (folder_method) (*env)->CallVoidMethod(env, activity, folder_method);
+    if (clear_exception(env)) {
+        nabi_mobile_import_begin_folder(); nabi_mobile_import_error("The folder picker is unavailable."); nabi_mobile_import_finish();
+    }
+    release(attached);
+}
+void nabi_mobile_set_orientation(int mode) {
+    bool attached; JNIEnv *env = environment(&attached);
+    if (!env) return;
+    if (orientation_method) (*env)->CallVoidMethod(env, activity, orientation_method, (jint)mode);
+    clear_exception(env); release(attached);
+}
+void nabi_mobile_set_immersive(bool enabled) {
+    bool attached; JNIEnv *env = environment(&attached);
+    if (!env) return;
+    if (immersive_method) (*env)->CallVoidMethod(env, activity, immersive_method, (jboolean)enabled);
+    clear_exception(env); release(attached);
+}
+static void call_with_text(jmethodID method, const unsigned short *text, int length) {
+    if (length < 0) return;
+    bool attached; JNIEnv *env = environment(&attached);
+    if (!env) return;
+    jstring value = (*env)->NewString(env, text, length);
+    if (value && method) (*env)->CallVoidMethod(env, activity, method, value);
+    if (value) (*env)->DeleteLocalRef(env, value);
+    clear_exception(env); release(attached);
+}
+void nabi_mobile_share(const unsigned short *path, int length) { call_with_text(share_method, path, length); }
+void nabi_mobile_export_settings(const unsigned short *path, int length) {
+    if (!export_method) { nabi_mobile_export_result(false); return; }
+    call_with_text(export_method, path, length);
+}
+void nabi_mobile_import_settings(void) {
+    bool attached; JNIEnv *env = environment(&attached);
+    if (!env) return;
+    if (import_method) (*env)->CallVoidMethod(env, activity, import_method);
+    if (clear_exception(env)) nabi_mobile_settings_import(-1);
+    release(attached);
+}
+
+bool nabi_mobile_reopen(const unsigned short *text, int length) {
+    if (length < 0) return false;
+    bool attached; JNIEnv *env = environment(&attached);
+    if (!env) return false;
+    jstring value = (*env)->NewString(env, text, length);
+    bool accepted = value && reopen_method && (*env)->CallBooleanMethod(env, activity, reopen_method, value);
+    if (clear_exception(env)) accepted = false;
+    if (value) (*env)->DeleteLocalRef(env, value);
+    release(attached);
+    return accepted;
+}
+
+bool nabi_mobile_memory(uint64_t *total, uint64_t *available) {
+    bool attached; JNIEnv *env = environment(&attached);
+    if (!env) return false;
+    jlongArray values = memory_method ? (jlongArray)(*env)->CallObjectMethod(env, activity, memory_method) : NULL;
+    bool ok = !clear_exception(env) && values && (*env)->GetArrayLength(env, values) == 2;
+    if (ok) {
+        jlong memory[2] = {0, 0};
+        (*env)->GetLongArrayRegion(env, values, 0, 2, memory);
+        ok = !clear_exception(env) && memory[0] > 0 && memory[1] >= 0;
+        if (ok) { *total = (uint64_t)memory[0]; *available = (uint64_t)memory[1]; }
+    }
+    if (values) (*env)->DeleteLocalRef(env, values);
+    release(attached);
+    return ok;
+}
+
+bool nabi_mobile_hdr(float *desired_max_nits, float *hdr_sdr_ratio) {
+    bool attached; JNIEnv *env = environment(&attached);
+    if (!env) return false;
+    jfloatArray values = hdr_method ? (jfloatArray)(*env)->CallObjectMethod(env, activity, hdr_method) : NULL;
+    bool ok = !clear_exception(env) && values && (*env)->GetArrayLength(env, values) == 2;
+    if (ok) {
+        jfloat hdr[2] = {0, 0};
+        (*env)->GetFloatArrayRegion(env, values, 0, 2, hdr);
+        ok = !clear_exception(env);
+        if (ok) { *desired_max_nits = hdr[0]; *hdr_sdr_ratio = hdr[1]; }
+    }
+    if (values) (*env)->DeleteLocalRef(env, values);
+    release(attached);
+    return ok;
 }
 void nabi_mobile_exit(void) {
     bool attached; JNIEnv *env = environment(&attached);

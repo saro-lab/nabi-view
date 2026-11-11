@@ -84,10 +84,9 @@ impl Viewer {
             error: String::new(),
         });
         self.menu_open = false;
-        self.recent_open = false;
+        self.library.open = false;
         self.zoom_input = None;
-        self.held_key = None;
-        self.held_button = None;
+        self.release_held_input();
         self.canvas_drag = None;
     }
 
@@ -162,7 +161,7 @@ impl Viewer {
                         let response = ui.add_sized(
                             [width, forms::height()],
                             forms::text_edit(&mut dialog.text)
-                                .id(egui::Id::new("move-path"))
+                                .id(egui::Id::unique("move-path"))
                                 .hint_text(tr("destination-path")),
                         );
                         if dialog.focus_input {
@@ -211,7 +210,7 @@ impl Viewer {
                         .max(1.),
                     )
                     .auto_shrink([false, true])
-                    .drag_to_scroll(false)
+                    .scroll_source(scroll_source(false))
                     .show(ui, |ui| {
                         for (index, path) in self.recent_moves.iter().enumerate() {
                             ui.push_id(("move-history", path), |ui| {
@@ -232,11 +231,11 @@ impl Viewer {
                                     if response.clicked() {
                                         dialog.select(path, Some(index));
                                     }
-                                    response.on_hover_text(path.display().to_string());
+                                    response.hover_text(path.display().to_string());
                                     let (_, rect) = ui.allocate_space(Vec2::splat(forms::height()));
                                     let response = ui.interact(
                                         rect,
-                                        egui::Id::new(("move-history-remove", path)),
+                                        egui::Id::unique(("move-history-remove", path)),
                                         egui::Sense::click(),
                                     );
                                     if response.hovered() || response.has_focus() {
@@ -249,7 +248,7 @@ impl Viewer {
                                         MUTED,
                                         false,
                                     );
-                                    if response.on_hover_text(tr("remove-move-path")).clicked() {
+                                    if response.hover_text(tr("remove-move-path")).clicked() {
                                         remove = Some(path.clone());
                                     }
                                 });
@@ -281,7 +280,7 @@ impl Viewer {
             dialog.selected = None;
         }
         if (close || modal.should_close()) && !busy {
-            ctx.memory_mut(|memory| memory.surrender_focus(egui::Id::new("move-path")));
+            ctx.memory_mut(|memory| memory.surrender_focus(egui::Id::unique("move-path")));
             self.held_key = None;
             return;
         }
@@ -310,7 +309,8 @@ impl Viewer {
             }
             forms::number(
                 ui,
-                egui::DragValue::new(&mut self.settings.recent_move_limit).range(1..=500),
+                egui::DragValue::new(&mut self.settings.recent_move_limit)
+                    .range(limits::RECENT_LIMIT),
             );
         });
         if before != self.settings.recent_move_limit {

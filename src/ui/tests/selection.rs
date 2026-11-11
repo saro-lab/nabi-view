@@ -1,4 +1,5 @@
 use super::*;
+use crate::i18n::tr;
 
 #[test]
 fn checks_survive_a_full_cycle_and_shift_toggles_before_moving() {
@@ -111,12 +112,12 @@ fn random_mode_requires_confirmation_to_clear_checks_and_blocks_new_checks() {
 
     window.reveal_controls();
     window.draw(Some(Key::Space));
-    window.wait_for("Checks are not available in random mode.");
+    window.wait_for(tr("checks-are-not-available-in-random-mode"));
     settle_checks(&mut window);
     assert!(checked_sample_pages(&window).is_empty());
     let before = focused_thumbnail_pages(&window);
     shift_navigation(&mut window, Key::ArrowRight);
-    window.wait_for("Checks are not available in random mode.");
+    window.wait_for(tr("checks-are-not-available-in-random-mode"));
     settle_checks(&mut window);
     assert_ne!(focused_thumbnail_pages(&window), before);
     assert!(checked_sample_pages(&window).is_empty());
@@ -130,7 +131,7 @@ fn random_mode_requires_confirmation_to_clear_checks_and_blocks_new_checks() {
     korean.wait_for("1 / 5");
     korean.click(korean.titlebar_icon("random").rect.center());
     korean.draw(Some(Key::Space));
-    korean.wait_for("체크는 랜덤에서 사용할 수 없습니다.");
+    korean.wait_for(crate::i18n::tr("checks-are-not-available-in-random-mode"));
 }
 
 #[test]

@@ -20,20 +20,8 @@ impl Viewer {
     pub(super) fn image_canvas(&self, mut screen: Rect) -> Rect {
         // Hover reveals an overlay; explicit pin/Tab reserves space for chrome.
         if !self.hide_controls && !self.settings_open {
-            screen.min.y = (screen.top()
-                + if crate::app::is_mobile() {
-                    crate::ui::mobile::BAR_HEIGHT
-                } else {
-                    TOP_BAR_HEIGHT
-                })
-            .min(screen.bottom());
-            screen.max.y = (screen.bottom()
-                - if crate::app::is_mobile() {
-                    crate::ui::mobile::BAR_HEIGHT
-                } else {
-                    BOTTOM_CHROME_HEIGHT
-                })
-            .max(screen.top());
+            screen.min.y = (screen.top() + TOP_BAR_HEIGHT).min(screen.bottom());
+            screen.max.y = (screen.bottom() - BOTTOM_CHROME_HEIGHT).max(screen.top());
         }
         screen
     }
@@ -50,7 +38,7 @@ impl Viewer {
             return self.zoom * 100.;
         };
         let (a, b) = self.focus_span();
-        let mut slot = self.image_canvas(ctx.screen_rect()).size();
+        let mut slot = self.image_canvas(ctx.viewport_rect()).size();
         if a != b {
             slot.x /= 2.;
         }
@@ -63,23 +51,52 @@ impl Viewer {
     }
 
     pub(super) fn change_zoom(&mut self, ctx: &egui::Context, factor: f32) {
-        let percent = (self.zoom_percent(ctx) * factor).clamp(10., 3000.);
+        let percent = clamp_zoom_percent(self.zoom_percent(ctx) * factor);
         self.zoom_override = Some(percent / 100.);
     }
 
     pub(super) fn wheel_zoom(&mut self, ctx: &egui::Context, up: bool) -> bool {
         let before = self.zoom_percent(ctx);
-        let next = (before * if up { 1.25 } else { 1. / 1.25 }).clamp(10., 3000.);
+        let next = clamp_zoom_percent(before * if up { ZOOM_STEP } else { 1. / ZOOM_STEP });
         let stopped = (before < 100. && next >= 100.) || (before > 100. && next <= 100.);
         self.zoom_override = Some(if stopped { 1. } else { next / 100. });
         ctx.request_repaint();
         stopped
     }
 
-    pub(super) fn canvas(&mut self, ctx: &egui::Context) {
+    pub(super) fn canvas(&mut self, root: &mut egui::Ui) {
+        let ctx = &root.ctx().clone();
+        if self.cache_budget() > 0
+            && (self.zoom_override.is_some()
+                || self.settings.view_mode == "actual"
+                || self.zoom > 1.1)
+        {
+            self.trim_cache(self.cache_budget() / 3);
+        }
+        let detail_budget = if self.cache_budget() > 0 {
+            self.cache_budget().saturating_sub(
+                self.cache_bytes()
+                    .saturating_sub(self.details.retained_bytes()),
+            )
+        } else {
+            0
+        };
+        self.details
+            .begin(ctx, self.render_state.as_ref(), detail_budget);
+        if self.pictures.values().any(|p| p.hdr.is_some())
+            || self.details.hdr_textures().next().is_some()
+            || self.presentation.images.iter().any(|p| p.hdr.is_some())
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
+        let background = Color32::from_rgb(
+            self.settings.background_rgb[0],
+            self.settings.background_rgb[1],
+            self.settings.background_rgb[2],
+        );
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(Color32::BLACK))
-            .show(ctx, |ui| {
+            .frame(egui::Frame::NONE.fill(background))
+            .show(root, |ui| {
                 let canvas = self.image_canvas(ui.available_rect_before_wrap());
                 let response = ui.allocate_rect(canvas, egui::Sense::click_and_drag());
                 if self.files.is_empty() {
@@ -90,7 +107,7 @@ impl Viewer {
                 // Bucket requests so resizing the window a few pixels does not restart the decoder.
                 self.fit_limit =
                     ((((canvas.width().max(canvas.height()) * ppp) as u32).div_ceil(512)) * 512)
-                        .clamp(1024, 4096);
+                        .clamp(1024, MAX_DECODE_SIDE);
                 let (first, last) = self.focus_span();
                 let mut ids = vec![first];
                 if first != last {
@@ -106,7 +123,13 @@ impl Viewer {
                 self.transition_waiting = pending && !self.presentation.images.is_empty();
                 let image_uv = image_uv(self.settings.flip_horizontal, self.settings.flip_vertical);
                 if self.transition_waiting {
-                    self.presentation.paint(ui, canvas, image_uv);
+                    self.presentation.paint(
+                        ui,
+                        canvas,
+                        image_uv,
+                        background,
+                        self.settings.transparency_checker,
+                    );
                 } else {
                     let mut presented = Vec::new();
                     let spread = ids.len() > 1;
@@ -131,27 +154,66 @@ impl Viewer {
                             } else {
                                 slot.center()
                             };
-                            let rect = Rect::from_center_size(center + self.pan, shown);
-                            crate::ui::transparency::paint(
-                                &ui.painter().with_clip_rect(slot),
-                                rect,
-                                12.,
-                            );
+                            let mut rect = Rect::from_center_size(center + self.pan, shown);
+                            if (factor * ppp - 1.).abs() < 0.0001 {
+                                // One source pixel per physical pixel: an odd
+                                // image size must not introduce half-pixel blur.
+                                rect = Rect::from_min_size(
+                                    egui::pos2(
+                                        (rect.min.x * ppp).round() / ppp,
+                                        (rect.min.y * ppp).round() / ppp,
+                                    ),
+                                    shown,
+                                );
+                            }
+                            if self.settings.transparency_checker {
+                                crate::ui::transparency::paint(
+                                    &ui.painter().with_clip_rect(slot),
+                                    rect,
+                                    12.,
+                                );
+                            }
                             ui.painter().with_clip_rect(slot).image(
-                                p.handle.id(),
+                                p.hdr
+                                    .as_ref()
+                                    .filter(|hdr| hdr.active())
+                                    .map_or_else(|| p.handle.id(), |hdr| hdr.id()),
                                 rect,
                                 image_uv,
                                 Color32::WHITE,
                             );
                             presented.push(PresentedImage {
+                                hdr: p.hdr.clone(),
                                 handle: p.handle.clone(),
                                 rect,
                                 clip: slot,
+                                backdrop: rect,
                             });
                             let source_px_per_texel = size.x / p.handle.size_vec2().x;
-                            if factor * ppp * source_px_per_texel > 1.02
-                                && source_px_per_texel > 1.02
-                            {
+                            let needs_detail = factor * ppp * source_px_per_texel > 1.02
+                                && source_px_per_texel > 1.02;
+                            let mut detailed = false;
+                            if needs_detail && p.animation.is_none() {
+                                if let Some(layer) = self.details.paint(
+                                    col,
+                                    path,
+                                    p.original,
+                                    rect,
+                                    slot,
+                                    [self.settings.flip_horizontal, self.settings.flip_vertical],
+                                    ctx,
+                                    ui,
+                                    background,
+                                    self.settings.transparency_checker,
+                                    1. / source_px_per_texel,
+                                ) {
+                                    detailed = layer.rect.contains_rect(rect.intersect(slot))
+                                        && layer.rect.width() / rect.width() * p.original[0] as f32
+                                            <= layer.handle.size_vec2().x * 1.02;
+                                    presented.push(layer);
+                                }
+                            }
+                            if needs_detail && !detailed {
                                 let tag = Rect::from_min_size(
                                     slot.left_bottom() + egui::vec2(10., -32.),
                                     egui::vec2(127., 22.),
@@ -211,6 +273,10 @@ impl Viewer {
                         .is_some_and(|p| overlays.iter().any(|overlay| overlay.contains(p)));
                 if self.inspector.open && !self.transition_waiting && !self.settings_open {
                     let visible: Vec<_> = ids.iter().map(|&i| self.files[i].as_path()).collect();
+                    self.inspector.configure(
+                        self.settings.metadata_font_size,
+                        self.settings.reduce_motion,
+                    );
                     let copied = self.inspector.show(ui, &overlays, &visible);
                     if copied {
                         self.show_toast(ctx, tr("copied"));
@@ -222,21 +288,17 @@ impl Viewer {
                 }
                 if !reading
                     && !self.settings_open
-                    && !self.random_prompt
-                    && !self.menu_open
-                    && self.move_dialog.is_none()
+                    && !self.overlay_open()
                     && !self.popup_open_at_input
                 {
                     if response.double_clicked() {
-                        self.run("fullscreen", ctx);
+                        let action = self.settings.mouse.double_click.clone();
+                        self.mouse_click(ctx, &action);
                     }
                     if response.hovered()
                         && ctx.input(|i| i.focused)
-                        && !self.settings_open
-                        && !self.recent_open
-                        && !self.clear_prompt
                         && self.zoom_input.is_none()
-                        && !ctx.memory(|m| m.any_popup_open())
+                        && !ctx.any_popup_open()
                     {
                         // Use each event's modifiers, not the final keyboard state or
                         // egui's smoothed scroll/zoom delta. Show the 100% stop even
@@ -247,12 +309,19 @@ impl Viewer {
                                 egui::Event::MouseWheel {
                                     delta, modifiers, ..
                                 } if delta.y.is_finite() && delta.y != 0. => {
-                                    if modifiers.ctrl || modifiers.command {
-                                        if !stopped_at_actual {
-                                            stopped_at_actual = self.wheel_zoom(ctx, delta.y > 0.);
-                                        }
+                                    let mouse = &self.settings.mouse;
+                                    let action = if modifiers.ctrl || modifiers.command {
+                                        &mouse.primary_wheel
                                     } else {
-                                        self.move_page(ctx, delta.y < 0.);
+                                        &mouse.wheel
+                                    };
+                                    let up = (delta.y > 0.) != mouse.reverse_wheel;
+                                    match action.as_str() {
+                                        "zoom" if !stopped_at_actual => {
+                                            stopped_at_actual = self.wheel_zoom(ctx, up);
+                                        }
+                                        "page" => self.move_page(ctx, !up),
+                                        _ => {}
                                     }
                                 }
                                 egui::Event::Zoom(factor) if factor.is_finite() && factor > 0. => {
@@ -264,6 +333,42 @@ impl Viewer {
                     }
                 }
             });
+        self.details.finish();
+        if self.details.pending() {
+            self.cancel_prefetch();
+            self.media.clear_thumbnail();
+            self.thumb_ticket = None;
+        }
+    }
+
+    /// What a primary-button drag does with these modifiers held.
+    fn drag_action(&self, modifiers: egui::Modifiers) -> &str {
+        let mouse = &self.settings.mouse;
+        if modifiers.ctrl || modifiers.command {
+            &mouse.primary_drag
+        } else {
+            &mouse.drag
+        }
+    }
+
+    /// Whether a point is on a visible part of a shown image, not the background.
+    fn over_image(&self, point: egui::Pos2) -> bool {
+        self.presentation
+            .images
+            .iter()
+            .any(|image| image.rect.intersect(image.clip).contains(point))
+    }
+
+    /// Runs the action assigned to a mouse click: the menu, nothing, or a command.
+    pub(super) fn mouse_click(&mut self, ctx: &egui::Context, action: &str) {
+        self.canvas_drag = None;
+        self.release_held_input();
+        match action {
+            crate::core::settings::CLICK_MENU => self.menu_open = true,
+            crate::core::settings::MOUSE_NONE => {}
+            id if command_supported(id) => self.run(id, ctx),
+            _ => {}
+        }
     }
 
     pub(super) fn canvas_pointer(
@@ -277,11 +382,7 @@ impl Viewer {
             return;
         }
         if self.settings_open
-            || self.random_prompt
-            || self.recent_open
-            || self.move_dialog.is_some()
-            || self.clear_prompt
-            || self.menu_open
+            || self.overlay_open()
             || self.popup_open_at_input
             || self.zoom_input.is_some()
             || !ctx.input(|i| i.focused)
@@ -289,12 +390,26 @@ impl Viewer {
             self.canvas_drag = None;
             return;
         }
-        if !reading && response.secondary_clicked() {
-            self.menu_open = true;
-            self.canvas_drag = None;
-            self.held_key = None;
-            self.held_button = None;
-            return;
+        if !reading {
+            let mouse = &self.settings.mouse;
+            let clicked = [
+                (response.secondary_clicked(), &mouse.right_click),
+                (response.middle_clicked(), &mouse.middle_click),
+                (
+                    response.clicked_by(egui::PointerButton::Extra1),
+                    &mouse.back_button,
+                ),
+                (
+                    response.clicked_by(egui::PointerButton::Extra2),
+                    &mouse.forward_button,
+                ),
+            ]
+            .into_iter()
+            .find_map(|(clicked, action)| clicked.then(|| action.clone()));
+            if let Some(action) = clicked {
+                self.mouse_click(ctx, &action);
+                return;
+            }
         }
         if ctx.input(|i| i.pointer.primary_pressed()) {
             self.canvas_drag = None;
@@ -311,14 +426,16 @@ impl Viewer {
                     })
                 });
                 if let Some((pointer_origin, modifiers)) = press {
-                    self.canvas_drag = if modifiers.ctrl || modifiers.command {
-                        (!self.presentation.images.is_empty() && !self.transition_waiting)
+                    let window = (!self.fullscreen).then_some(CanvasDrag::Window);
+                    self.canvas_drag = match self.drag_action(modifiers) {
+                        "pan" if self.over_image(pointer_origin) => (!self.transition_waiting)
                             .then_some(CanvasDrag::Image {
                                 pointer_origin,
                                 pan_origin: self.pan,
-                            })
-                    } else {
-                        (!self.fullscreen).then_some(CanvasDrag::Window)
+                            }),
+                        // Panning from the background moves the window instead.
+                        "pan" | "window" => window,
+                        _ => None,
                     };
                 }
             }
@@ -345,8 +462,10 @@ impl Viewer {
             _ => {
                 if !reading
                     && response.hovered()
-                    && !self.presentation.images.is_empty()
-                    && ctx.input(|i| i.modifiers.ctrl || i.modifiers.command)
+                    && ctx
+                        .pointer_hover_pos()
+                        .is_some_and(|pointer| self.over_image(pointer))
+                    && self.drag_action(ctx.input(|i| i.modifiers)) == "pan"
                 {
                     ctx.set_cursor_icon(egui::CursorIcon::Grab);
                 }

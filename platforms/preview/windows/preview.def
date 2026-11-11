@@ -1,0 +1,4 @@
+LIBRARY nabi-shell-preview
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE

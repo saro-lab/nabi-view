@@ -127,9 +127,14 @@ mod platform {
 }
 
 #[cfg(all(target_os = "linux", not(test)))]
-mod platform {
+use linux_bus as platform;
+
+// Compile the Linux D-Bus adapter in native Unix tests without opening a bus.
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+#[cfg_attr(test, allow(dead_code))]
+mod linux_bus {
     use std::time::Duration;
-    use zbus::blocking::{Connection, Proxy, connection::Builder};
+    use zbus::{Connection, Proxy, connection::Builder};
 
     const SCREENSAVER: (&str, &str, &str) = (
         "org.freedesktop.ScreenSaver",
@@ -147,48 +152,59 @@ mod platform {
         cookie: u32,
     }
     pub fn acquire() -> Result<Guard, String> {
-        let connection = Builder::session()
-            .map_err(|e| e.to_string())?
-            .method_timeout(Duration::from_secs(3))
-            .build()
-            .map_err(|e| e.to_string())?;
-        let mut errors = Vec::new();
-        for service in [SCREENSAVER, GNOME] {
-            let result: zbus::Result<u32> = (|| {
-                let proxy = Proxy::new(&connection, service.0, service.1, service.0)?;
-                if service == GNOME {
-                    // Inhibit becoming idle, not logout or explicit suspend.
-                    proxy.call(
-                        "Inhibit",
-                        &("dev.nabi.NabiView", 0u32, "Viewing images", 8u32),
-                    )
-                } else {
-                    proxy.call("Inhibit", &("dev.nabi.NabiView", "Viewing images"))
+        zbus::block_on(async {
+            let connection = Builder::session()
+                .method_timeout(Duration::from_secs(3))
+                .build()
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut errors = Vec::new();
+            for service in [SCREENSAVER, GNOME] {
+                let result: zbus::Result<u32> = async {
+                    let proxy = Proxy::new(&connection, service.0, service.1, service.0).await?;
+                    if service == GNOME {
+                        // Inhibit becoming idle, not logout or explicit suspend.
+                        proxy
+                            .call(
+                                "Inhibit",
+                                &("dev.nabi.NabiView", 0u32, "Viewing images", 8u32),
+                            )
+                            .await
+                    } else {
+                        proxy
+                            .call("Inhibit", &("dev.nabi.NabiView", "Viewing images"))
+                            .await
+                    }
                 }
-            })();
-            match result {
-                Ok(cookie) => {
-                    return Ok(Guard {
-                        connection,
-                        service,
-                        cookie,
-                    });
+                .await;
+                match result {
+                    Ok(cookie) => {
+                        return Ok(Guard {
+                            connection,
+                            service,
+                            cookie,
+                        });
+                    }
+                    Err(error) => errors.push(error.to_string()),
                 }
-                Err(error) => errors.push(error.to_string()),
             }
-        }
-        Err(errors.join("; "))
+            Err(errors.join("; "))
+        })
     }
     impl Drop for Guard {
         fn drop(&mut self) {
-            if let Ok(proxy) = Proxy::new(
-                &self.connection,
-                self.service.0,
-                self.service.1,
-                self.service.0,
-            ) {
-                let _: zbus::Result<()> = proxy.call(self.service.2, &(self.cookie,));
-            }
+            zbus::block_on(async {
+                if let Ok(proxy) = Proxy::new(
+                    &self.connection,
+                    self.service.0,
+                    self.service.1,
+                    self.service.0,
+                )
+                .await
+                {
+                    let _: zbus::Result<()> = proxy.call(self.service.2, &(self.cookie,)).await;
+                }
+            });
             // The dedicated bus connection also releases inhibition on exit.
         }
     }

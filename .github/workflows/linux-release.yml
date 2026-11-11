@@ -1,0 +1,43 @@
+name: Linux Flatpak bundles
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  flatpak:
+    name: Flatpak / ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Flatpak tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+          rustup show
+      - name: Install isolated runtime and build SDK
+        run: |
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user --noninteractive flathub \
+            org.freedesktop.Platform/${{ matrix.arch }}/25.08 \
+            org.freedesktop.Sdk/${{ matrix.arch }}/25.08
+      - name: Test, build and package inside SDK
+        run: dbus-run-session -- sh build/linux-flatpak.sh
+      - name: Record SDK commits
+        run: |
+          flatpak list --user --runtime --columns=ref,active > target/package/flatpak/${{ matrix.arch }}/runtime-commits.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nabi-view-linux-flatpak-${{ matrix.arch }}
+          path: target/package/flatpak/${{ matrix.arch }}/
+          if-no-files-found: error

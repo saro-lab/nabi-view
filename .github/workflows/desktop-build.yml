@@ -42,8 +42,7 @@ jobs:
           python-version: '3.13'
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup show
           rustup target add '${{ matrix.triple }}'
       - name: Add Intel Mac target
         if: runner.os == 'macOS'
@@ -70,8 +69,8 @@ jobs:
           perl -v
       - name: Check locale catalogs and native declarations
         run: |
-          rustup component add rustfmt
           python build/locales.py --check
+          python build/test-notices.py
       - name: Test on the host
         run: cargo test --locked --release --target '${{ matrix.triple }}'
       - name: Build and package
@@ -80,6 +79,16 @@ jobs:
       - name: Build and package Universal Mac bundle
         if: runner.os == 'macOS'
         run: sh build.sh macos-universal --package
+      - name: Exercise Windows preview COM without registration
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./build/windows-previews.ps1 -SkipRust -Smoke
+      - name: Exercise independent thumbnail process
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p ai/tmp/preview-smoke
+          'target/${{ matrix.triple }}/release/nabi-thumbnailer' --size 128 --input 'assets/field-notes/01 Alpine Light.png' --output ai/tmp/preview-smoke/image.png
+          python build/check-preview-png.py ai/tmp/preview-smoke/image.png 128
       - name: Archive Mac bundle preserving permissions
         if: runner.os == 'macOS'
         run: ditto -c -k --sequesterRsrc --keepParent 'target/package/universal-apple-darwin/NABI VIEW.app' target/package/universal-apple-darwin/nabi-view-universal-apple-darwin.zip
@@ -106,8 +115,7 @@ jobs:
           python-version: '3.13'
       - name: Install Rust and cross
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup show
           cargo install cross --git https://github.com/cross-rs/cross --locked --root "$PWD/ai/runtime/cross"
           echo "$PWD/ai/runtime/cross/bin" >> "$GITHUB_PATH"
       - name: Cross compile and package

@@ -5,8 +5,10 @@ const ITEMS: &[&str] = &[
     "open",
     "folder",
     "recent",
+    "bookmark",
     "new-window",
     "metadata",
+    "share",
     "fit",
     "width",
     "height",
@@ -22,6 +24,9 @@ const ITEMS: &[&str] = &[
     "trash",
     "undo-trash",
     "fullscreen",
+    "orientation-auto",
+    "orientation-portrait",
+    "orientation-landscape",
 ];
 const TILE_HEIGHT: f32 = 108.;
 const GAP: f32 = 8.;
@@ -35,6 +40,7 @@ impl Viewer {
             .iter()
             .copied()
             .filter(|id| command_supported(id))
+            .filter(|id| self.landscape || !is_layout_command(id))
             .collect();
         if crate::app::is_mobile() {
             items.extend(["random", "slideshow"]);
@@ -47,7 +53,7 @@ impl Viewer {
                 .id_salt("command-menu-scroll")
                 .max_height(ui.available_height().max(1.))
                 .auto_shrink([false, false])
-                .drag_to_scroll(crate::app::is_mobile())
+                .scroll_source(scroll_source(crate::app::is_mobile()))
                 .show(ui, |ui| {
                     // Reserve room even with the platform's floating scrollbar style.
                     let width = (ui.available_width() - 14.).max(100.);
@@ -57,7 +63,7 @@ impl Viewer {
                     for row in items.chunks(columns) {
                         ui.horizontal(|ui| {
                             for &id in row {
-                                let label = COMMANDS.iter().find(|c| c.0 == id).unwrap().1;
+                                let label = command_label(id);
                                 let keys = if crate::app::is_mobile() {
                                     String::new()
                                 } else {
@@ -75,8 +81,7 @@ impl Viewer {
         });
         if close || modal.should_close() || selected.is_some() {
             self.menu_open = false;
-            self.held_key = None;
-            self.held_button = None;
+            self.release_held_input();
         }
         // Close the layer before opening a dialog or dispatching the command.
         if let Some(id) = selected {
@@ -96,6 +101,9 @@ impl Viewer {
             "flip-horizontal" => self.settings.flip_horizontal,
             "flip-vertical" => self.settings.flip_vertical,
             "fullscreen" => self.fullscreen,
+            "orientation-auto" | "orientation-portrait" | "orientation-landscape" => {
+                orientation_command(&self.settings.orientation) == id
+            }
             _ => false,
         }
     }
@@ -112,11 +120,10 @@ fn tile(
     let (_, rect) = ui.allocate_space(egui::vec2(width, TILE_HEIGHT));
     let response = ui.interact(
         rect,
-        egui::Id::new(("menu-command", id)),
+        egui::Id::unique(("menu-command", id)),
         egui::Sense::click(),
     );
-    response
-        .widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, active, label));
+    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, active, label));
     if ui.is_rect_visible(rect) {
         let color = if active { ACCENT } else { INK };
         let painter = ui.painter();
@@ -164,7 +171,7 @@ fn tile(
             MUTED,
         );
     }
-    response.on_hover_text(if keys.is_empty() {
+    response.hover_text(if keys.is_empty() {
         label.to_owned()
     } else {
         format!("{label}\n{keys}")

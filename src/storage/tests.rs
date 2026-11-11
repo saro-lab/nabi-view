@@ -11,7 +11,12 @@ fn trash_default_upgrade_preserves_custom_deleted_and_previously_migrated_bindin
             .iter()
             .any(|row| row.action == "trash" && row.key == "Primary+S")
     );
-    let mut old = defaults.clone();
+    // Releases with Primary+S for trash predate the settings Ctrl+S default.
+    let mut old: Vec<_> = defaults
+        .iter()
+        .filter(|row| !(row.action == "settings" && row.key == "Ctrl+S"))
+        .cloned()
+        .collect();
     for row in &mut old {
         if row.action == "trash" && row.key == "Primary+E" {
             row.key = "Primary+S".into();
@@ -37,17 +42,17 @@ fn trash_default_upgrade_preserves_custom_deleted_and_previously_migrated_bindin
             ..Default::default()
         })
         .unwrap();
-        json.as_object_mut()
-            .unwrap()
-            .remove("trash_shortcut_migrated");
+        for field in ["trash_shortcut_migrated", "settings_shortcut_migrated"] {
+            json.as_object_mut().unwrap().remove(field);
+        }
         let mut settings: Settings = serde_json::from_value(json).unwrap();
-        settings.normalize_shortcuts();
+        settings.normalize();
         assert_eq!(settings.keyboard_shortcuts, Some(defaults.clone()));
         settings.validate().unwrap();
         settings.keyboard_shortcuts = Some(old.clone());
         let mut reloaded: Settings =
             serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
-        reloaded.normalize_shortcuts();
+        reloaded.normalize();
         assert_eq!(reloaded.keyboard_shortcuts, Some(old.clone()));
     }
     let mut conflicting = old.clone();
@@ -66,7 +71,7 @@ fn trash_default_upgrade_preserves_custom_deleted_and_previously_migrated_bindin
             trash_shortcut_migrated: false,
             ..Default::default()
         };
-        settings.normalize_shortcuts();
+        settings.normalize();
         assert_eq!(settings.keyboard_shortcuts, Some(rows));
         settings.validate().unwrap();
     }
@@ -103,12 +108,12 @@ fn slideshow_defaults_upgrade_old_versions_and_preserve_custom_or_deleted_keys()
             )
             .unwrap();
             let mut settings: Settings = serde_json::from_value(json).unwrap();
-            settings.normalize_shortcuts();
+            settings.normalize();
             assert_eq!(settings.keyboard_shortcuts.as_ref(), Some(&defaults));
             settings.keyboard_shortcuts = Some(old.clone());
             let json = serde_json::to_vec(&settings).unwrap();
             let mut reloaded: Settings = serde_json::from_slice(&json).unwrap();
-            reloaded.normalize_shortcuts();
+            reloaded.normalize();
             assert_eq!(
                 reloaded.keyboard_shortcuts,
                 Some(old.clone()),
@@ -128,7 +133,7 @@ fn slideshow_defaults_upgrade_old_versions_and_preserve_custom_or_deleted_keys()
             slideshow_shortcuts_migrated: false,
             ..Settings::default()
         };
-        settings.normalize_shortcuts();
+        settings.normalize();
         assert_eq!(settings.keyboard_shortcuts, Some(rows));
         settings.validate().unwrap();
     }
@@ -143,7 +148,7 @@ fn legacy_help_binding_moves_to_about_without_changing_its_key() {
         }]),
         ..Settings::default()
     };
-    settings.normalize_shortcuts();
+    settings.normalize();
     assert_eq!(
         settings.keyboard_shortcuts,
         Some(vec![KeyboardShortcut {
@@ -151,7 +156,7 @@ fn legacy_help_binding_moves_to_about_without_changing_its_key() {
             key: "F2".into()
         },])
     );
-    settings.normalize_shortcuts();
+    settings.normalize();
     assert_eq!(settings.keyboard_shortcuts.as_ref().unwrap().len(), 1);
 }
 
@@ -171,7 +176,7 @@ fn help_default_upgrade_handles_old_defaults_and_preserves_custom_bindings() {
         json["keyboard_shortcuts"] = serde_json::to_value(old).unwrap();
         json["close_all_shortcut_migrated"] = (!without_close_all).into();
         let mut settings: Settings = serde_json::from_value(json).unwrap();
-        settings.normalize_shortcuts();
+        settings.normalize();
         assert_eq!(settings.keyboard_shortcuts.as_ref(), Some(&defaults));
         settings
             .keyboard_shortcuts
@@ -179,7 +184,7 @@ fn help_default_upgrade_handles_old_defaults_and_preserves_custom_bindings() {
             .unwrap()
             .retain(|r| r.action != "about");
         let deleted = settings.keyboard_shortcuts.clone();
-        settings.normalize_shortcuts();
+        settings.normalize();
         assert_eq!(settings.keyboard_shortcuts, deleted);
     }
     for rows in [
@@ -194,7 +199,7 @@ fn help_default_upgrade_handles_old_defaults_and_preserves_custom_bindings() {
             help_shortcut_migrated: false,
             ..Settings::default()
         };
-        settings.normalize_shortcuts();
+        settings.normalize();
         assert_eq!(settings.keyboard_shortcuts, Some(rows));
     }
 }
@@ -212,10 +217,10 @@ fn close_all_default_upgrade_runs_once_and_preserves_custom_bindings() {
         close_all_shortcut_migrated: false,
         ..Settings::default()
     };
-    settings.normalize_shortcuts();
+    settings.normalize();
     assert_eq!(settings.keyboard_shortcuts, Some(defaults));
     settings.keyboard_shortcuts = Some(old.clone());
-    settings.normalize_shortcuts();
+    settings.normalize();
     assert_eq!(settings.keyboard_shortcuts, Some(old));
     for rows in [
         vec![],
@@ -226,7 +231,7 @@ fn close_all_default_upgrade_runs_once_and_preserves_custom_bindings() {
     ] {
         settings.close_all_shortcut_migrated = false;
         settings.keyboard_shortcuts = Some(rows.clone());
-        settings.normalize_shortcuts();
+        settings.normalize();
         assert_eq!(settings.keyboard_shortcuts, Some(rows));
     }
 }
@@ -331,7 +336,7 @@ fn settings_validate_and_legacy_files_get_defaults() {
     }
     let mut migrated = serde_json::from_value::<Settings>(old).unwrap();
     assert!(migrated.keyboard_shortcuts.is_none());
-    migrated.normalize_shortcuts();
+    migrated.normalize();
     assert_eq!(
         migrated,
         Settings {
@@ -710,7 +715,9 @@ fn reorder_bound_clear_and_persist_folder_history() {
             let p = root.path().join(s);
             fs::create_dir(&p).unwrap();
             fs::write(p.join("1.png"), b"image").unwrap();
-            p.canonicalize().unwrap()
+            p.canonicalize()
+                .map(crate::core::paths::simplified)
+                .unwrap()
         })
         .into();
     for i in [0, 1, 0, 2] {
@@ -725,6 +732,33 @@ fn reorder_bound_clear_and_persist_folder_history() {
 }
 
 #[test]
+fn clear_data_removes_device_state_but_keeps_preferences() {
+    let root = tempfile::tempdir().unwrap();
+    let store = isolated(root.path());
+    store.clear_data().unwrap();
+    assert!(!store.database.exists());
+
+    let folder = root.path().join("folder");
+    fs::create_dir(&folder).unwrap();
+    fs::write(folder.join("1.png"), b"image").unwrap();
+    store.record_folder(&folder, 10).unwrap();
+    store.record_move(&folder, 10).unwrap();
+    store.save_window_size([1280., 800.]).unwrap();
+    let mut settings = Settings::default();
+    settings.recent_limit = 7;
+    store.save(&settings).unwrap();
+
+    store.clear_data().unwrap();
+    assert!(store.recent().unwrap().is_empty());
+    assert!(store.recent_moves(10).unwrap().is_empty());
+    assert_eq!(store.load_window_size().unwrap(), None);
+    assert_eq!(isolated(root.path()).load().unwrap().recent_limit, 7);
+
+    store.save_window_size([900., 600.]).unwrap();
+    assert_eq!(store.load_window_size().unwrap(), Some([900., 600.]));
+}
+
+#[test]
 fn recent_removes_unavailable_paths_from_persisted_history() {
     let root = tempfile::tempdir().unwrap();
     let store = isolated(root.path());
@@ -732,7 +766,10 @@ fn recent_removes_unavailable_paths_from_persisted_history() {
         let path = root.path().join(name);
         fs::create_dir(&path).unwrap();
         fs::write(path.join("1.png"), b"image").unwrap();
-        let path = path.canonicalize().unwrap();
+        let path = path
+            .canonicalize()
+            .map(crate::core::paths::simplified)
+            .unwrap();
         store.record_folder(&path, 10).unwrap();
         path
     });
@@ -776,7 +813,13 @@ fn recent_removes_unreadable_folders_even_when_they_exist() {
         assert!(isolated(root.path()).recent().unwrap().is_empty());
     } else {
         // Elevated test runners may retain access despite the permission bits.
-        assert_eq!(recent.unwrap(), [folder.canonicalize().unwrap()]);
+        assert_eq!(
+            recent.unwrap(),
+            [folder
+                .canonicalize()
+                .map(crate::core::paths::simplified)
+                .unwrap()]
+        );
     }
 }
 
@@ -788,7 +831,9 @@ fn recent_removes_folders_without_images_and_keeps_their_contents() {
         let path = root.path().join(name);
         fs::create_dir(&path).unwrap();
         store.record_folder(&path, 10).unwrap();
-        path.canonicalize().unwrap()
+        path.canonicalize()
+            .map(crate::core::paths::simplified)
+            .unwrap()
     });
     fs::write(folders[1].join("notes.txt"), b"keep these notes").unwrap();
     let nested = folders[2].join("directory.png");
@@ -880,7 +925,7 @@ fn move_shortcut_upgrade_uses_free_m_and_preserves_explicit_choices() {
         .remove("move_shortcut_migrated");
     json.as_object_mut().unwrap().remove("recent_move_limit");
     let mut upgraded: Settings = serde_json::from_value(json).unwrap();
-    upgraded.normalize_shortcuts();
+    upgraded.normalize();
     assert_eq!(upgraded.recent_move_limit, 10);
     assert!(
         upgraded
@@ -907,11 +952,636 @@ fn move_shortcut_upgrade_uses_free_m_and_preserves_explicit_choices() {
             move_shortcut_migrated: false,
             ..Default::default()
         };
-        settings.normalize_shortcuts();
+        settings.normalize();
         assert_eq!(settings.keyboard_shortcuts.as_ref(), Some(&rows));
         settings.validate().unwrap();
     }
     upgraded.keyboard_shortcuts = Some(old.clone());
-    upgraded.normalize_shortcuts();
+    upgraded.normalize();
     assert_eq!(upgraded.keyboard_shortcuts, Some(old));
+}
+
+#[test]
+fn settings_ctrl_s_upgrade_keeps_primary_comma_and_respects_taken_chords() {
+    let defaults = crate::core::commands::default_shortcut_rows();
+    let keys = |rows: &[KeyboardShortcut]| -> Vec<String> {
+        rows.iter()
+            .filter(|row| row.action == "settings")
+            .map(|row| row.key.clone())
+            .collect()
+    };
+    assert_eq!(keys(&defaults), ["Primary+Comma", "Ctrl+S"]);
+    let old: Vec<_> = defaults
+        .iter()
+        .filter(|row| !(row.action == "settings" && row.key == "Ctrl+S"))
+        .cloned()
+        .collect();
+    let mut json = serde_json::to_value(Settings {
+        keyboard_shortcuts: Some(old.clone()),
+        ..Default::default()
+    })
+    .unwrap();
+    json.as_object_mut()
+        .unwrap()
+        .remove("settings_shortcut_migrated");
+    let mut upgraded: Settings = serde_json::from_value(json).unwrap();
+    upgraded.normalize();
+    assert_eq!(
+        keys(upgraded.keyboard_shortcuts.as_ref().unwrap()),
+        ["Primary+Comma", "Ctrl+S"]
+    );
+    upgraded.validate().unwrap();
+    // A chord the user already gave to another command stays theirs.
+    let taken = crate::core::commands::canonical_chord("Ctrl+S");
+    let mut conflict = old.clone();
+    conflict.push(KeyboardShortcut {
+        action: "open".into(),
+        key: taken,
+    });
+    for rows in [conflict, Vec::new()] {
+        let mut settings = Settings {
+            keyboard_shortcuts: Some(rows.clone()),
+            settings_shortcut_migrated: false,
+            ..Default::default()
+        };
+        settings.normalize();
+        assert_eq!(settings.keyboard_shortcuts.as_ref(), Some(&rows));
+        settings.validate().unwrap();
+    }
+    // Removing it later is not undone.
+    upgraded.keyboard_shortcuts = Some(old.clone());
+    upgraded.normalize();
+    assert_eq!(upgraded.keyboard_shortcuts, Some(old));
+}
+
+#[cfg(windows)]
+#[test]
+fn verbatim_history_from_older_versions_is_shown_as_plain_paths() {
+    let root = tempfile::tempdir().unwrap();
+    let store = isolated(root.path());
+    let folders = ["old", "both"].map(|name| {
+        let path = root.path().join(name);
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("1.png"), b"image").unwrap();
+        crate::core::paths::canonicalize(&path).unwrap()
+    });
+    let verbatim = |path: &Path| PathBuf::from(format!(r"\\?\{}", path.display()));
+    // Older versions stored fs::canonicalize output directly.
+    let conn = store.connection().unwrap();
+    for (table, path) in [
+        ("library", verbatim(&folders[0])),
+        ("library", folders[1].clone()),
+        ("library", verbatim(&folders[1])),
+        ("recent_moves", verbatim(&folders[0])),
+        ("recent_moves", verbatim(&folders[1])),
+        ("recent_moves", folders[1].clone()),
+    ] {
+        let columns = if table == "library" {
+            "(kind, path) VALUES (0, ?1)"
+        } else {
+            "(path) VALUES (?1)"
+        };
+        conn.execute(
+            &format!("INSERT INTO {table} {columns}"),
+            [encode_path(&path)],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let newest_first = [folders[1].clone(), folders[0].clone()];
+    assert_eq!(store.recent().unwrap(), newest_first);
+    assert_eq!(store.recent_moves(10).unwrap(), newest_first);
+    store.remove_entry(Kind::Recent, &folders[0]).unwrap();
+    store.remove_recent_move(Some(&folders[0])).unwrap();
+    assert_eq!(store.recent().unwrap(), [folders[1].clone()]);
+    assert_eq!(store.recent_moves(10).unwrap(), [folders[1].clone()]);
+}
+
+fn image_folder(root: &Path, name: &str, images: &[&str]) -> PathBuf {
+    let path = root.join(name);
+    fs::create_dir(&path).unwrap();
+    for image in images {
+        fs::write(path.join(image), b"image").unwrap();
+    }
+    crate::core::paths::canonicalize(&path).unwrap()
+}
+
+#[test]
+fn legacy_recent_folders_migrate_in_order_once() {
+    let root = tempfile::tempdir().unwrap();
+    let store = isolated(root.path());
+    let folders: Vec<_> = ["a", "b", "c"]
+        .iter()
+        .map(|name| image_folder(root.path(), name, &["1.png"]))
+        .collect();
+    fs::create_dir_all(store.database.parent().unwrap()).unwrap();
+    let conn = Connection::open(&store.database).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE recent_folders (
+            id INTEGER PRIMARY KEY, path BLOB NOT NULL UNIQUE, opened_at INTEGER NOT NULL);",
+    )
+    .unwrap();
+    // Older versions listed the highest id first.
+    for folder in [&folders[1], &folders[0], &folders[2]] {
+        conn.execute(
+            "INSERT INTO recent_folders (path, opened_at) VALUES (?1, 0)",
+            [encode_path(folder)],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let expected = [folders[2].clone(), folders[0].clone(), folders[1].clone()];
+    assert_eq!(store.recent().unwrap(), expected);
+    assert_eq!(isolated(root.path()).recent().unwrap(), expected);
+    let legacy: bool = store
+        .connection()
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='recent_folders')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!legacy);
+    // Migrated entries start at their folder's first image.
+    let entry = &store.library().unwrap()[0];
+    assert_eq!(
+        entry.image.as_deref(),
+        Some(folders[2].join("1.png").as_path())
+    );
+    assert_eq!(
+        (entry.name.as_deref(), entry.thumbnail.as_deref()),
+        (None, None)
+    );
+}
+
+#[test]
+fn recent_folders_reopen_at_the_page_last_shown() {
+    let root = tempfile::tempdir().unwrap();
+    let store = isolated(root.path());
+    let folder = image_folder(root.path(), "album", &["1.png", "2.png", "10.png"]);
+    let other = image_folder(root.path(), "other", &["1.png"]);
+    // Nothing is created for a folder that is not in the list.
+    store.remember_page(&folder.join("2.png")).unwrap();
+    assert!(!store.database.exists());
+
+    store.record_folder(&folder, 10).unwrap();
+    assert_eq!(
+        store.library().unwrap()[0].image,
+        Some(folder.join("1.png"))
+    );
+    store.remember_page(&folder.join("10.png")).unwrap();
+    store
+        .set_thumbnail(Kind::Recent, &folder, &"a".repeat(32))
+        .unwrap();
+    // Reopening moves the folder up and keeps its page and thumbnail.
+    store.record_folder(&other, 10).unwrap();
+    store.record_folder(&folder, 10).unwrap();
+    let entries = store.library().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].folder, folder);
+    assert_eq!(entries[0].image, Some(folder.join("10.png")));
+    assert_eq!(entries[0].thumbnail, Some("a".repeat(32)));
+    assert!(store.set_thumbnail(Kind::Recent, &folder, "../x").is_err());
+
+    // A deleted page falls back to the first image.
+    fs::remove_file(folder.join("10.png")).unwrap();
+    assert_eq!(
+        store.library().unwrap()[0].image,
+        Some(folder.join("1.png"))
+    );
+    // Remembering a page never adds a bookmark or another folder.
+    store.remember_page(&other.join("1.png")).unwrap();
+    assert_eq!(store.recent().unwrap(), [folder.clone(), other.clone()]);
+    assert!(
+        store
+            .library()
+            .unwrap()
+            .iter()
+            .all(|entry| entry.kind == Kind::Recent)
+    );
+}
+
+#[test]
+fn bookmarks_are_folders_with_an_image_title_and_stay_when_unavailable() {
+    let root = tempfile::tempdir().unwrap();
+    let store = isolated(root.path());
+    let comics = image_folder(root.path(), "comics", &["1.png", "2.png"]);
+    let photos = image_folder(root.path(), "photos", &["a.png"]);
+    assert!(store.add_bookmark(&comics, "Folder only").is_err());
+    assert!(
+        store
+            .add_bookmark(&comics.join("missing.png"), "x")
+            .is_err()
+    );
+    fs::write(comics.join("notes.txt"), b"notes").unwrap();
+    assert!(store.add_bookmark(&comics.join("notes.txt"), "x").is_err());
+    assert_eq!(store.bookmark_title(&comics).unwrap(), None);
+
+    assert_eq!(
+        store
+            .add_bookmark(&comics.join("2.png"), "  Comics \n")
+            .unwrap(),
+        comics.join("2.png")
+    );
+    store.add_bookmark(&photos.join("a.png"), "   ").unwrap();
+    store.record_folder(&comics, 10).unwrap();
+    assert_eq!(
+        store.bookmark_title(&comics).unwrap(),
+        Some("Comics".into())
+    );
+    assert_eq!(
+        store.bookmark_title(&photos).unwrap(),
+        Some("photos".into())
+    );
+
+    let entries = store.library().unwrap();
+    let titles: Vec<_> = entries
+        .iter()
+        .map(|entry| (entry.kind, entry.title()))
+        .collect();
+    assert_eq!(
+        titles,
+        [
+            (Kind::Recent, "comics".to_owned()),
+            (Kind::Bookmark, "photos".to_owned()),
+            (Kind::Bookmark, "Comics".to_owned()),
+        ]
+    );
+    assert_eq!(entries[2].image, Some(comics.join("2.png")));
+
+    // Adding again updates the bookmark in place, without moving it.
+    store
+        .add_bookmark(&comics.join("1.png"), "Renamed")
+        .unwrap();
+    store.rename_bookmark(&photos, "Trips").unwrap();
+    let bookmarks: Vec<_> = store
+        .library()
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.kind == Kind::Bookmark)
+        .map(|entry| (entry.title(), entry.image))
+        .collect();
+    assert_eq!(
+        bookmarks,
+        [
+            ("Trips".to_owned(), Some(photos.join("a.png"))),
+            ("Renamed".to_owned(), Some(comics.join("1.png"))),
+        ]
+    );
+
+    // An emptied or missing folder stays bookmarked, unlike a recent folder.
+    for image in ["1.png", "2.png"] {
+        fs::remove_file(comics.join(image)).unwrap();
+    }
+    fs::remove_dir_all(&photos).unwrap();
+    let entries = store.library().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|entry| entry.kind == Kind::Bookmark));
+    assert!(
+        entries
+            .iter()
+            .all(|entry| !entry.available && entry.image.is_none())
+    );
+    fs::write(comics.join("3.png"), b"image").unwrap();
+    let comics_entry = store
+        .library()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.folder == comics)
+        .unwrap();
+    assert!(comics_entry.available);
+    assert_eq!(comics_entry.image, Some(comics.join("3.png")));
+
+    // Clearing recent items or device data keeps bookmarks; removal is explicit.
+    store.clear_recent().unwrap();
+    store.clear_data().unwrap();
+    assert_eq!(store.library().unwrap().len(), 2);
+    store.remove_entry(Kind::Bookmark, &photos).unwrap();
+    assert_eq!(store.library().unwrap().len(), 1);
+}
+
+#[test]
+fn thumbnails_are_pruned_once_no_entry_uses_them() {
+    let root = tempfile::tempdir().unwrap();
+    let store = isolated(root.path());
+    store.prune_thumbnails(Duration::ZERO).unwrap();
+    assert!(!store.thumbnail_dir().exists());
+    let folder = image_folder(root.path(), "album", &["1.png"]);
+    let marked = image_folder(root.path(), "marked", &["1.png"]);
+    store.record_folder(&folder, 10).unwrap();
+    store.add_bookmark(&marked.join("1.png"), "").unwrap();
+    let dir = store.thumbnail_dir();
+    fs::create_dir_all(&dir).unwrap();
+    let keys = ["1", "2", "3", "4"].map(|digit| digit.repeat(32));
+    for key in &keys {
+        fs::write(library::thumbnail_file(&dir, key), b"png").unwrap();
+        fs::write(dir.join(format!("{key}.jpg")), b"legacy jpeg").unwrap();
+    }
+    fs::write(dir.join(".tmpABC"), b"partial").unwrap();
+    fs::write(dir.join("keep.txt"), b"not ours").unwrap();
+    store
+        .set_thumbnail(Kind::Recent, &folder, &keys[0])
+        .unwrap();
+    store
+        .set_thumbnail(Kind::Bookmark, &marked, &keys[1])
+        .unwrap();
+
+    // Young files may belong to another window that has not recorded them yet.
+    store.prune_thumbnails(Duration::from_secs(600)).unwrap();
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 10);
+    store.prune_thumbnails(Duration::ZERO).unwrap();
+    let mut left: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|file| file.unwrap().file_name().into_string().unwrap())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        [
+            format!("{}.jpg", keys[0]),
+            format!("{}.png", keys[0]),
+            format!("{}.jpg", keys[1]),
+            format!("{}.png", keys[1]),
+            "keep.txt".to_owned()
+        ]
+    );
+
+    // Clearing recent items deletes their thumbnails but not the bookmark's.
+    store.clear_recent().unwrap();
+    assert!(!library::thumbnail_file(&dir, &keys[0]).exists());
+    assert!(!dir.join(format!("{}.jpg", keys[0])).exists());
+    assert!(library::thumbnail_file(&dir, &keys[1]).exists());
+    assert!(dir.join(format!("{}.jpg", keys[1])).exists());
+    store.remove_entry(Kind::Bookmark, &marked).unwrap();
+    store.prune_thumbnails(Duration::ZERO).unwrap();
+    assert!(!library::thumbnail_file(&dir, &keys[1]).exists());
+    assert!(!dir.join(format!("{}.jpg", keys[1])).exists());
+}
+
+#[test]
+fn bookmark_key_is_added_once_to_saved_lists_where_it_is_free() {
+    let defaults = crate::core::commands::default_shortcut_rows();
+    let without: Vec<_> = defaults
+        .iter()
+        .filter(|row| row.action != "bookmark")
+        .cloned()
+        .collect();
+    let upgrade = |rows: Vec<KeyboardShortcut>| {
+        let mut settings = Settings {
+            keyboard_shortcuts: Some(rows),
+            bookmark_shortcut_migrated: false,
+            ..Default::default()
+        };
+        settings.normalize();
+        assert!(settings.bookmark_shortcut_migrated);
+        settings.keyboard_shortcuts.unwrap()
+    };
+    // An untouched older list gains B right after the recent-folders key.
+    assert_eq!(upgrade(without.clone()), defaults);
+    // B already used for something else, or a deliberately empty list, stays.
+    let mut taken = without.clone();
+    taken.push(KeyboardShortcut {
+        action: "next".into(),
+        key: "B".into(),
+    });
+    assert_eq!(upgrade(taken.clone()), taken);
+    assert_eq!(upgrade(Vec::new()), Vec::new());
+    // Settings saved by this version never get the key back after removal.
+    let mut settings = Settings {
+        keyboard_shortcuts: Some(without.clone()),
+        ..Default::default()
+    };
+    settings.normalize();
+    assert_eq!(settings.keyboard_shortcuts, Some(without));
+}
+
+#[test]
+fn mouse_gestures_default_for_old_files_and_repair_unknown_values_per_gesture() {
+    use crate::core::settings::MouseSettings;
+    let defaults = MouseSettings::default();
+    assert_eq!(
+        (
+            defaults.wheel.as_str(),
+            defaults.primary_wheel.as_str(),
+            defaults.right_click.as_str(),
+            defaults.middle_click.as_str(),
+            defaults.double_click.as_str(),
+            defaults.back_button.as_str(),
+            defaults.forward_button.as_str(),
+            defaults.drag.as_str(),
+            defaults.primary_drag.as_str(),
+        ),
+        (
+            "zoom",
+            "none",
+            "menu",
+            "recent",
+            "fullscreen",
+            "prev",
+            "next",
+            "pan",
+            "none"
+        )
+    );
+    assert!(!defaults.reverse_wheel);
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = isolated(dir.path());
+    let mut old = serde_json::to_value(Settings::default()).unwrap();
+    old.as_object_mut().unwrap().remove("mouse");
+    std::fs::create_dir_all(dir.path().join("config")).unwrap();
+    let file = dir.path().join("config").join("settings.json");
+    std::fs::write(&file, serde_json::to_vec(&old).unwrap()).unwrap();
+    assert_eq!(store.load().unwrap().mouse, defaults);
+
+    // A partial object keeps its valid choices; unknown ones fall back alone.
+    old["mouse"] = serde_json::json!({
+        "wheel": "page",
+        "primary_wheel": "spin",
+        "right_click": "trash",
+        "middle_click": "no-such-command",
+        "drag": "window",
+        "primary_drag": "fly",
+        "reverse_wheel": true
+    });
+    std::fs::write(&file, serde_json::to_vec(&old).unwrap()).unwrap();
+    let loaded = store.load().unwrap().mouse;
+    assert_eq!(
+        loaded,
+        MouseSettings {
+            wheel: "page".into(),
+            right_click: "trash".into(),
+            drag: "window".into(),
+            reverse_wheel: true,
+            ..defaults.clone()
+        }
+    );
+
+    let mut invalid = Settings::default();
+    invalid.mouse.double_click = "bogus".into();
+    assert!(invalid.validate().is_err());
+    invalid.normalize();
+    invalid.validate().unwrap();
+    assert_eq!(invalid.mouse.double_click, "fullscreen");
+}
+
+#[test]
+fn mouse_gestures_round_trip_and_merge_across_windows() {
+    let before = Settings::default();
+    let mut after = before.clone();
+    after.mouse.middle_click = "none".into();
+    after.mouse.primary_drag = "window".into();
+    let imported: Settings = serde_json::from_str(&serde_json::to_string(&after).unwrap()).unwrap();
+    assert_eq!(imported.mouse, after.mouse);
+    let mut merged = before.clone();
+    merged.language = crate::i18n::Language::Korean;
+    merged.merge_changes(&before, &imported);
+    assert_eq!(merged.mouse, after.mouse);
+    assert_eq!(merged.language, crate::i18n::Language::Korean);
+}
+
+#[test]
+fn new_display_preferences_round_trip_default_old_files_and_merge_independently() {
+    let root = tempfile::tempdir().unwrap();
+    let first = isolated(root.path());
+    let second = isolated(root.path());
+    let mut original = serde_json::to_value(Settings::default()).unwrap();
+    for key in [
+        "sort_by",
+        "sort_descending",
+        "background_rgb",
+        "transparency_checker",
+        "metadata_font_size",
+        "reduce_motion",
+        "disk_cache_enabled",
+        "disk_cache_mb",
+    ] {
+        original.as_object_mut().unwrap().remove(key);
+    }
+    let old: Settings = serde_json::from_value(original).unwrap();
+    assert_eq!(old.sort_by, "natural");
+    assert_eq!(old.background_rgb, [0, 0, 0]);
+    assert!(old.transparency_checker && old.disk_cache_enabled);
+    assert_eq!(old.metadata_font_size, 12);
+    assert_eq!(old.disk_cache_mb, 1024);
+    first.save(&old).unwrap();
+    let mut a = first.load().unwrap();
+    let mut b = second.load().unwrap();
+    a.sort_by = "modified".into();
+    a.sort_descending = true;
+    a.background_rgb = [15, 20, 25];
+    a.transparency_checker = false;
+    first.save(&a).unwrap();
+    b.metadata_font_size = 24;
+    b.reduce_motion = true;
+    b.disk_cache_enabled = false;
+    b.disk_cache_mb = 512;
+    second.save(&b).unwrap();
+    let merged = first.load().unwrap();
+    assert_eq!(merged.sort_by, "modified");
+    assert!(merged.sort_descending && merged.reduce_motion);
+    assert_eq!(merged.background_rgb, [15, 20, 25]);
+    assert!(!merged.transparency_checker && !merged.disk_cache_enabled);
+    assert_eq!(merged.metadata_font_size, 24);
+    assert_eq!(merged.disk_cache_mb, 512);
+    let exported = root.path().join("export.json");
+    first.export(&exported, &merged).unwrap();
+    assert_eq!(first.import(&exported).unwrap(), merged);
+    for invalid in [
+        Settings {
+            sort_by: "random".into(),
+            ..Default::default()
+        },
+        Settings {
+            metadata_font_size: 100,
+            ..Default::default()
+        },
+        Settings {
+            disk_cache_mb: 0,
+            ..Default::default()
+        },
+    ] {
+        assert!(invalid.validate().is_err());
+    }
+}
+
+#[test]
+fn legacy_thumbnail_migration_preserves_keys_and_keeps_user_state_separate() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let legacy = state.join("thumbnails");
+    fs::create_dir_all(&legacy).unwrap();
+    let key = "a".repeat(32);
+    fs::write(legacy.join(format!("{key}.png")), b"rgba png").unwrap();
+    fs::write(legacy.join(format!("{key}.jpg")), b"old jpeg").unwrap();
+    fs::write(legacy.join("keep.txt"), b"unowned").unwrap();
+    let cache = root.path().join("os-cache");
+    let store =
+        Store::in_directories_with_cache(root.path().join("config"), state.clone(), cache.clone());
+    assert_eq!(store.thumbnail_dir(), cache.join("v1/thumbnails"));
+    assert!(store.library().unwrap().is_empty());
+    for (extension, expected) in [
+        ("png", b"rgba png".as_slice()),
+        ("jpg", b"old jpeg".as_slice()),
+    ] {
+        assert_eq!(
+            fs::read(store.thumbnail_dir().join(format!("{key}.{extension}"))).unwrap(),
+            expected
+        );
+        assert!(!legacy.join(format!("{key}.{extension}")).exists());
+    }
+    assert!(legacy.join("keep.txt").is_file());
+    assert!(!state.join("state.sqlite").exists());
+    crate::core::disk_cache::Cache::new(store.cache_dir(), 0)
+        .clear()
+        .unwrap();
+    assert!(legacy.join("keep.txt").is_file());
+    assert!(store.library().unwrap().is_empty());
+}
+
+#[test]
+fn saved_mobile_source_history_and_bookmark_survive_released_import_pixels() {
+    let root = tempfile::tempdir().unwrap();
+    let store = isolated(root.path());
+    let sources = root.path().join("document-sources");
+    let mut batch = crate::core::documents::ImportBatch::new(root.path()).unwrap();
+    batch.add("one.png", &b"image"[..]).unwrap();
+    batch
+        .set_source(&sources, "12345678-source", "Selected album")
+        .unwrap();
+    batch.commit_source().unwrap();
+    let copy = batch.first().unwrap().to_owned();
+    let logical = batch.logical_path(&copy).unwrap();
+    let folder = logical.parent().unwrap();
+    store.record_folder(folder, 50).unwrap();
+    store.remember_page(&logical).unwrap();
+    store.add_bookmark(&logical, "Saved page").unwrap();
+    drop(batch);
+    assert!(!copy.exists());
+    let entries = store.library().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.available && entry.image.as_ref() == Some(&logical))
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .find(|entry| entry.kind == Kind::Recent)
+            .unwrap()
+            .title(),
+        "Selected album"
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .find(|entry| entry.kind == Kind::Bookmark)
+            .unwrap()
+            .title(),
+        "Saved page"
+    );
 }

@@ -34,9 +34,7 @@ jobs:
       - name: Install build tools
         shell: pwsh
         run: |
-          rustup toolchain install stable --profile minimal
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          rustup default stable
+          rustup show
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           choco install nasm --yes --no-progress
           if ($LASTEXITCODE) { exit $LASTEXITCODE }

@@ -1,9 +1,12 @@
+mod archive;
 mod chrome;
 mod input;
+mod library;
 mod localization;
 mod media;
 mod metadata;
 mod mobile;
+mod mouse;
 mod move_files;
 mod navigation;
 mod overlays;
@@ -29,6 +32,8 @@ struct TestWindow {
     focused: bool,
     screen_size: egui::Vec2,
     monitor_size: Option<egui::Vec2>,
+    /// Native display scale (e.g. 1.25 for 125% on Windows).
+    scale: f32,
     _storage: tempfile::TempDir,
     _images: Option<tempfile::TempDir>,
 }
@@ -50,6 +55,22 @@ impl TestWindow {
     fn sample() -> Self {
         Self::sample_with_settings(&crate::core::settings::Settings {
             language: crate::i18n::Language::Korean,
+            ..Default::default()
+        })
+    }
+
+    /// The sample with the non-default gestures: the wheel turns pages, a plain
+    /// drag moves the window, and Ctrl/⌘ zooms or pans instead.
+    fn sample_with_modifier_gestures() -> Self {
+        Self::sample_with_settings(&crate::core::settings::Settings {
+            language: crate::i18n::Language::Korean,
+            mouse: crate::core::settings::MouseSettings {
+                wheel: "page".into(),
+                primary_wheel: "zoom".into(),
+                drag: "window".into(),
+                primary_drag: "pan".into(),
+                ..Default::default()
+            },
             ..Default::default()
         })
     }
@@ -109,6 +130,7 @@ impl TestWindow {
             focused: true,
             screen_size: egui::vec2(1080., 760.),
             monitor_size: Some(egui::vec2(1920., 1080.)),
+            scale: 1.,
             _storage: storage,
             _images: None,
         }
@@ -134,6 +156,9 @@ impl TestWindow {
     fn reveal_controls(&mut self) {
         self.pointer(500., 2.);
         self.draw(None);
+        // Area fade-in now follows real frame time; inspect settled paint colors.
+        self.time += f64::from(self.ctx.global_style().animation_time);
+        self.draw(None);
     }
 
     fn titlebar_visible(&self) -> bool {
@@ -150,7 +175,7 @@ impl TestWindow {
     fn titlebar_icon(&self, name: &str) -> egui::Response {
         assert!(self.titlebar_visible(), "Titlebar is not painted");
         self.ctx
-            .read_response(egui::Id::new(("titlebar", name)))
+            .read_response(egui::Id::unique(("titlebar", name)))
             .unwrap_or_else(|| panic!("Missing titlebar icon: {name}"))
     }
 
@@ -249,12 +274,9 @@ impl TestWindow {
     fn is_photo_texture(&self, id: egui::TextureId) -> bool {
         id != egui::TextureId::default()
             && !crate::ui::transparency::is_backdrop(&self.ctx, id)
-            && self
-                .ctx
-                .tex_manager()
-                .read()
-                .meta(id)
-                .is_some_and(|meta| meta.name != "nabi-app-icon")
+            && self.ctx.tex_manager().read().meta(id).is_some_and(|meta| {
+                meta.name != "nabi-app-icon" && !meta.name.starts_with("library-thumbnail-")
+            })
     }
 
     fn photo_rects(&self) -> (egui::Rect, egui::Rect) {
@@ -294,8 +316,13 @@ impl TestWindow {
         }
     }
 
-    fn draw_events(&mut self, events: Vec<Event>, modifiers: egui::Modifiers) -> (String, bool) {
+    fn draw_events(
+        &mut self,
+        mut events: Vec<Event>,
+        modifiers: egui::Modifiers,
+    ) -> (String, bool) {
         self.time += 1. / 60.;
+        events.insert(0, Event::ModifiersChanged(modifiers));
         let mut input = egui::RawInput {
             time: Some(self.time),
             focused: self.focused,
@@ -304,23 +331,24 @@ impl TestWindow {
                 self.screen_size,
             )),
             events,
-            modifiers,
             ..Default::default()
         };
-        input
-            .viewports
-            .get_mut(&egui::ViewportId::ROOT)
-            .unwrap()
-            .monitor_size = self.monitor_size;
+        let viewport = input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap();
+        viewport.monitor_size = self.monitor_size;
+        viewport.native_pixels_per_point = Some(self.scale);
         // eframe gives the application the native events before egui starts its
-        // focus traversal for this frame; update() alone cannot reproduce it.
+        // focus traversal, then calls logic before ui for a visible frame.
         self.app.raw_input_hook(&self.ctx, &mut input);
-        let output = self
-            .ctx
-            .run(input, |ctx| self.app.update(ctx, &mut self.frame));
+        let mut output = self.ctx.run_ui(input, |ui| {
+            self.app.logic(ui.ctx(), &mut self.frame);
+            self.app.ui(ui, &mut self.frame);
+        });
         let mut text = String::new();
         let mut image = false;
-        self.texture_updates = output.textures_delta.set;
+        self.texture_updates = std::mem::take(&mut output.textures_delta.set)
+            .into_iter()
+            .flat_map(|(id, updates)| updates.into_iter().map(move |delta| (id, delta)))
+            .collect();
         self.repaint_delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
         self.cursor = output.platform_output.cursor_icon;
         self.clipboard_writes
@@ -529,7 +557,7 @@ fn checked_sample_pages(window: &TestWindow) -> Vec<usize> {
     .filter_map(|(index, filename)| {
         window
             .ctx
-            .read_response(egui::Id::new(("thumbnail-check", folder.join(filename))))
+            .read_response(egui::Id::unique(("thumbnail-check", folder.join(filename))))
             .map(|badge| {
                 assert!(
                     window.paint.iter().any(|shape| matches!(&shape.shape,
@@ -618,7 +646,7 @@ fn assert_canvas_flips(window: &TestWindow, horizontal: bool, vertical: bool) ->
 fn zoom_widget(window: &TestWindow, name: &str) -> egui::Response {
     window
         .ctx
-        .read_response(egui::Id::new(name))
+        .read_response(egui::Id::unique(name))
         .unwrap_or_else(|| panic!("Missing zoom widget: {name}"))
 }
 
@@ -709,6 +737,8 @@ fn choose_shortcut_action(window: &mut TestWindow, current_title: &str, action_t
         window.pointer(popup.center().x, popup.center().y);
         window.draw_events(
             vec![Event::MouseWheel {
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Wheel,
                 unit: egui::MouseWheelUnit::Point,
                 delta: egui::vec2(0., -60.),
                 modifiers: egui::Modifiers::NONE,
@@ -736,14 +766,14 @@ fn record_new_shortcut_row(window: &mut TestWindow, key: Key, action_title: &str
 fn shortcut_row(window: &TestWindow, index: usize) -> egui::Response {
     window
         .ctx
-        .read_response(egui::Id::new(("shortcut-row", index)))
+        .read_response(egui::Id::unique(("shortcut-row", index)))
         .unwrap_or_else(|| panic!("Missing shortcut row {index}"))
 }
 
 fn close_settings_screen(window: &mut TestWindow) {
     let close = window
         .ctx
-        .read_response(egui::Id::new(("titlebar", "settings-close")))
+        .read_response(egui::Id::unique(("titlebar", "settings-close")))
         .expect("Missing settings close icon");
     window.click(close.rect.center());
     window.time += 0.25;

@@ -1,5 +1,5 @@
 {
-  "reviewed": "2026-11-08",
+  "reviewed": "2026-11-12",
   "packages": {
     "alloc-stdlib 0.2.4": {
       "sources": [
@@ -572,6 +572,141 @@
           "file": "njaard-libavif-rs/LICENSE",
           "url": "https://github.com/njaard/libavif-rs/blob/18304417e422120835c358cdd0721ee43e4c6d7c/LICENSE",
           "sha256": "fe490679de7d4c113698ef4a4f130b10c2b561f6b847db87efbaefa64b9ac057"
+        }
+      ]
+    },
+    "accesskit 0.25.2": {
+      "sources": [
+        {
+          "file": "AccessKit-accesskit-f3026222/LICENSE-MIT",
+          "url": "https://github.com/AccessKit/accesskit/blob/f3026222559c7f5f46d8f25cb7404de68eb149f0/LICENSE-MIT",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        }
+      ]
+    },
+    "anes 0.1.6": {
+      "sources": [
+        {
+          "file": "qwandor-anes-rs-378ac746/LICENSE-MIT",
+          "url": "https://github.com/qwandor/anes-rs/blob/378ac7461ecac29fde9e10df7b08359d1315a9ad/LICENSE-MIT",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        }
+      ]
+    },
+    "ecolor 0.37.0": {
+      "sources": [
+        {
+          "file": "emilk-egui-841a328b/LICENSE-MIT",
+          "url": "https://github.com/emilk/egui/blob/841a328ba2dd8f6996beb7189ebb7fc00e668a2a/LICENSE-MIT",
+          "sha256": "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+        }
+      ]
+    },
+    "egui 0.37.0": {
+      "sources": [
+        {
+          "file": "emilk-egui-841a328b/LICENSE-MIT",
+          "url": "https://github.com/emilk/egui/blob/841a328ba2dd8f6996beb7189ebb7fc00e668a2a/LICENSE-MIT",
+          "sha256": "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+        }
+      ]
+    },
+    "egui-winit 0.37.0": {
+      "sources": [
+        {
+          "file": "emilk-egui-841a328b/LICENSE-MIT",
+          "url": "https://github.com/emilk/egui/blob/841a328ba2dd8f6996beb7189ebb7fc00e668a2a/LICENSE-MIT",
+          "sha256": "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+        }
+      ]
+    },
+    "egui_glow 0.37.0": {
+      "sources": [
+        {
+          "file": "emilk-egui-841a328b/LICENSE-MIT",
+          "url": "https://github.com/emilk/egui/blob/841a328ba2dd8f6996beb7189ebb7fc00e668a2a/LICENSE-MIT",
+          "sha256": "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+        }
+      ]
+    },
+    "emath 0.37.0": {
+      "sources": [
+        {
+          "file": "emilk-egui-841a328b/LICENSE-MIT",
+          "url": "https://github.com/emilk/egui/blob/841a328ba2dd8f6996beb7189ebb7fc00e668a2a/LICENSE-MIT",
+          "sha256": "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+        }
+      ]
+    },
+    "epaint_default_fonts 0.37.0": {
+      "sources": [
+        {
+          "file": "emilk-egui-841a328b/LICENSE-MIT",
+          "url": "https://github.com/emilk/egui/blob/841a328ba2dd8f6996beb7189ebb7fc00e668a2a/LICENSE-MIT",
+          "sha256": "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+        }
+      ]
+    },
+    "eframe 0.37.0": {
+      "sources": [
+        {
+          "file": "emilk-egui-3c6eb826/LICENSE-MIT",
+          "url": "https://github.com/emilk/egui/blob/3c6eb8261c3293ad9c7ea1ed58487e038860ebef/LICENSE-MIT",
+          "sha256": "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+        }
+      ]
+    },
+    "objc2-metal 0.3.2": {
+      "sources": [
+        {
+          "file": "madsmtm-objc2-7b1abfd7/LICENSE.md",
+          "url": "https://github.com/madsmtm/objc2/blob/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54"
+        }
+      ]
+    },
+    "objc2-quartz-core 0.3.2": {
+      "sources": [
+        {
+          "file": "madsmtm-objc2-7b1abfd7/LICENSE.md",
+          "url": "https://github.com/madsmtm/objc2/blob/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54"
+        }
+      ]
+    },
+    "objc2-ui-kit 0.3.2": {
+      "sources": [
+        {
+          "file": "madsmtm-objc2-7b1abfd7/LICENSE.md",
+          "url": "https://github.com/madsmtm/objc2/blob/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54"
+        }
+      ]
+    },
+    "objc2-uniform-type-identifiers 0.3.2": {
+      "sources": [
+        {
+          "file": "madsmtm-objc2-7b1abfd7/LICENSE.md",
+          "url": "https://github.com/madsmtm/objc2/blob/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54"
+        }
+      ]
+    },
+    "rsqlite-vfs 0.2.0": {
+      "sources": [
+        {
+          "file": "Spxg-sqlite-wasm-rs-3d831843/LICENSE",
+          "url": "https://github.com/Spxg/sqlite-wasm-rs/blob/3d8318430bacd7d6a1aafdf5b5e54fb0fee8d451/LICENSE",
+          "sha256": "e1c1975c3474cce31722836f101a40ffaf1cc784e4d2f38ce3e77b9712934e78"
+        }
+      ]
+    },
+    "spirv 0.4.0+sdk-1.4.341.0": {
+      "sources": [
+        {
+          "file": "gfx-rs-rspirv-8afc3d0a/LICENSE",
+          "url": "https://github.com/gfx-rs/rspirv/blob/8afc3d0ac8e158128cd1410bb2e4b4c26ab11bb4/LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
         }
       ]
     }

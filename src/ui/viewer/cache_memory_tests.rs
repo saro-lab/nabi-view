@@ -31,16 +31,17 @@ fn viewer() -> (egui::Context, Viewer) {
 
 fn picture(ctx: &egui::Context, index: usize) -> Picture {
     Picture {
+        hdr: None,
         animation: Some(media::animation::Animation::new(
             &PathBuf::from(format!("memory-test-{index}.gif")),
             image::ImageFormat::Gif,
             2048,
             [8, 8],
-            &egui::ColorImage::new([8, 8], Color32::WHITE),
+            &egui::ColorImage::filled([8, 8], Color32::WHITE),
         )),
         handle: ctx.load_texture(
             format!("cache-test-{index}"),
-            egui::ColorImage::new([8, 8], Color32::WHITE),
+            egui::ColorImage::filled([8, 8], Color32::WHITE),
             egui::TextureOptions::LINEAR,
         ),
         original: [8, 8],
@@ -64,9 +65,11 @@ fn pressure_releases_neighbors_and_jobs_but_preserves_current_and_presented_imag
         let rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800., 600.));
         app.presentation = Presentation {
             images: vec![PresentedImage {
+                hdr: None,
                 handle: previous,
                 rect,
                 clip: rect,
+                backdrop: rect,
             }],
             canvas: Some(rect),
         };
@@ -74,7 +77,7 @@ fn pressure_releases_neighbors_and_jobs_but_preserves_current_and_presented_imag
             app.files[3].clone(),
             ctx.load_texture(
                 "thumbnail-test",
-                egui::ColorImage::new([4, 4], Color32::WHITE),
+                egui::ColorImage::filled([4, 4], Color32::WHITE),
                 egui::TextureOptions::LINEAR,
             ),
         );
@@ -164,6 +167,94 @@ fn recovered_budget_retries_neighbors_rejected_under_the_smaller_budget() {
 }
 
 #[test]
+fn native_detail_keeps_the_preview_and_releases_pixels_under_pressure() {
+    let (ctx, mut app) = viewer();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wide.png");
+    image::RgbaImage::from_fn(9001, 33, |x, y| image::Rgba([x as u8, y as u8, 80, 128]))
+        .save(&path)
+        .unwrap();
+    let source = std::fs::read(&path).unwrap();
+    let frame = media::decode_still(&path, 512).unwrap();
+    let handle = ctx.load_texture("wide-preview", frame.image, egui::TextureOptions::LINEAR);
+    app.files = vec![path.clone()];
+    app.pictures.insert(
+        path.clone(),
+        Picture {
+            hdr: None,
+            animation: None,
+            handle,
+            original: frame.original_size,
+            requested: 512,
+            last_used: 0,
+        },
+    );
+    app.settings.view_mode = "actual".into();
+    app.apply_memory_sample(memory(8 * 1024));
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(5120., 2880.),
+        )),
+        ..Default::default()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let _ = ctx.run_pass(input.clone(), |ctx| ctx.root_ui(|ui| app.canvas(ui)));
+        if app.presentation.images.len() == 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Native detail never arrived"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let base = &app.presentation.images[0];
+    let detail = &app.presentation.images[1];
+    assert_eq!(detail.handle.size()[1], 33);
+    assert!(detail.handle.size()[0] > 4096);
+    assert_eq!(base.rect.min.x.fract(), 0.);
+    assert_eq!(base.rect.min.y.fract(), 0.);
+    assert!((detail.rect.width() - detail.handle.size_vec2().x).abs() < 0.01);
+    assert!(detail.rect.contains_rect(base.rect.intersect(base.clip)));
+    assert!(
+        base.handle.size()[0] < 9000,
+        "The full image must remain a bounded preview"
+    );
+    // A reduced nonzero budget must release the previous native crop promptly.
+    app.details.begin(&ctx, None, 1);
+    assert_eq!(app.details.retained_bytes(), 0);
+    app.apply_memory_sample(memory(128));
+    let _ = ctx.run_pass(input, |ctx| ctx.root_ui(|ui| app.canvas(ui)));
+    assert_eq!(app.presentation.images.len(), 1);
+    assert_eq!(app.details.retained_bytes(), 0);
+    assert_eq!(std::fs::read(path).unwrap(), source);
+}
+
+#[test]
+fn automatic_fit_can_be_below_manual_twenty_percent_floor() {
+    let (ctx, mut app) = viewer();
+    let mut image = picture(&ctx, 0);
+    image.original = [10000, 8000];
+    app.pictures.insert(app.files[0].clone(), image);
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1080., 760.),
+        )),
+        ..Default::default()
+    };
+    let _ = ctx.run_pass(input, |ctx| {
+        assert!(app.zoom_percent(ctx) < 20.);
+        app.change_zoom(ctx, 0.5);
+        assert_eq!(app.zoom_percent(ctx), 20.);
+        app.zoom_override = None;
+        assert!(app.zoom_percent(ctx) < 20.);
+    });
+}
+
+#[test]
 fn unavailable_memory_defers_prefetch_and_visible_thumbnail_requests() {
     let (ctx, mut app) = viewer();
     app.pictures.insert(app.files[0].clone(), picture(&ctx, 0));
@@ -173,7 +264,7 @@ fn unavailable_memory_defers_prefetch_and_visible_thumbnail_requests() {
     assert!(app.prefetch_ticket.is_none());
 
     let draw_thumbnails = |app: &mut Viewer| {
-        let _ = ctx.run(
+        let _ = ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(
                     egui::Pos2::ZERO,

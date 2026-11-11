@@ -2,7 +2,7 @@
 use eframe::egui::{self, Color32, Rect};
 
 fn texture(ctx: &egui::Context) -> egui::TextureHandle {
-    let key = egui::Id::new("transparency-checkerboard");
+    let key = egui::Id::unique("transparency-checkerboard");
     if let Some(handle) = ctx.data(|data| data.get_temp::<egui::TextureHandle>(key)) {
         return handle;
     }
@@ -10,10 +10,7 @@ fn texture(ctx: &egui::Context) -> egui::TextureHandle {
     let dark = Color32::from_gray(152);
     let handle = ctx.load_texture(
         "transparency-checkerboard",
-        egui::ColorImage {
-            size: [2, 2],
-            pixels: vec![light, dark, dark, light],
-        },
+        egui::ColorImage::new([2, 2], vec![light, dark, dark, light]),
         egui::TextureOptions::NEAREST_REPEAT,
     );
     ctx.data_mut(|data| data.insert_temp(key, handle.clone()));

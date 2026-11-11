@@ -1,0 +1,108 @@
+{
+  "app-id": "dev.nabi.NabiView",
+  "runtime": "org.freedesktop.Platform",
+  "runtime-version": "25.08",
+  "sdk": "org.freedesktop.Sdk",
+  "command": "nabi-view",
+  "default-branch": "stable",
+  "finish-args": [
+    "--socket=wayland",
+    "--socket=fallback-x11",
+    "--share=ipc",
+    "--device=dri"
+  ],
+  "build-options": {
+    "env": {
+      "CARGO_NET_OFFLINE": "true",
+      "CARGO_HOME": "/run/build/nabi-view/.cargo-home",
+      "CARGO_BUILD_JOBS": "2"
+    },
+    "prepend-path": "/run/build/nabi-view/.rust-toolchain/bin"
+  },
+  "modules": [
+    {
+      "name": "nabi-view",
+      "buildsystem": "simple",
+      "build-commands": [
+        "./_rust_dist/rustc/install.sh --prefix=\"$PWD/.rust-toolchain\" --disable-ldconfig",
+        "./_rust_dist/cargo/install.sh --prefix=\"$PWD/.rust-toolchain\" --disable-ldconfig",
+        "./_rust_dist/rust-std/install.sh --prefix=\"$PWD/.rust-toolchain\" --disable-ldconfig",
+        "python3 build/linux-flatpak-prepare.py --check-toolchain",
+        "rustc --version && cargo --version && cmake --version",
+        "cargo test --frozen --release",
+        "cargo build --frozen --release --bin nabi-view",
+        "cargo build --frozen --release -p nabi-preview --bin nabi-thumbnailer",
+        "python3 build/notices.py",
+        "install -Dm755 target/release/nabi-view /app/lib/nabi-view/nabi-view",
+        "mkdir -p /app/bin && ln -s ../lib/nabi-view/nabi-view /app/bin/nabi-view",
+        "python3 build/package_resources.py /app/lib/nabi-view",
+        "install -m644 LICENSE THIRD_PARTY.md target/notices/THIRD_PARTY_NOTICES.txt /app/lib/nabi-view/",
+        "install -Dm644 platforms/linux/dev.nabi.NabiView.desktop /app/share/applications/dev.nabi.NabiView.desktop",
+        "install -Dm644 platforms/linux/dev.nabi.NabiView.metainfo.xml /app/share/metainfo/dev.nabi.NabiView.metainfo.xml",
+        "install -Dm644 assets/icons/png/nabi-icon-256.png /app/share/icons/hicolor/256x256/apps/dev.nabi.NabiView.png",
+        "install -Dm755 target/release/nabi-thumbnailer /app/bin/nabi-thumbnailer",
+        "install -Dm644 platforms/preview/linux/nabi-view.thumbnailer /app/share/thumbnailers/nabi-view.thumbnailer"
+      ],
+      "sources": [
+        {
+          "type": "dir",
+          "path": "@PREPARED_SOURCE@"
+        },
+        {
+          "type": "archive",
+          "url": "https://static.rust-lang.org/dist/2026-10-15/rustc-1.99.1-x86_64-unknown-linux-gnu.tar.xz",
+          "sha256": "2ff05ff9c08a90861e7f6e4065b40a8b87463b4576186fd613871c3e37f2091f",
+          "dest": "_rust_dist/rustc",
+          "only-arches": [
+            "x86_64"
+          ]
+        },
+        {
+          "type": "archive",
+          "url": "https://static.rust-lang.org/dist/2026-10-15/cargo-1.99.1-x86_64-unknown-linux-gnu.tar.xz",
+          "sha256": "53f3521949404d595efb06a55c12c5658d4ed1c75566f33d3d514eaebe70bd8a",
+          "dest": "_rust_dist/cargo",
+          "only-arches": [
+            "x86_64"
+          ]
+        },
+        {
+          "type": "archive",
+          "url": "https://static.rust-lang.org/dist/2026-10-15/rust-std-1.99.1-x86_64-unknown-linux-gnu.tar.xz",
+          "sha256": "109b074225bf5b9ea3820890876bfdf4ed161adbfaf94b2b4b5984c85ee5d958",
+          "dest": "_rust_dist/rust-std",
+          "only-arches": [
+            "x86_64"
+          ]
+        },
+        {
+          "type": "archive",
+          "url": "https://static.rust-lang.org/dist/2026-10-15/rustc-1.99.1-aarch64-unknown-linux-gnu.tar.xz",
+          "sha256": "acdcdfe09ae1f103aa9a2b7f88903a9588bc2e99288af10e6fbf5514e2e49f25",
+          "dest": "_rust_dist/rustc",
+          "only-arches": [
+            "aarch64"
+          ]
+        },
+        {
+          "type": "archive",
+          "url": "https://static.rust-lang.org/dist/2026-10-15/cargo-1.99.1-aarch64-unknown-linux-gnu.tar.xz",
+          "sha256": "5156832e0c1254e9b49a79edabdc6d4c35f32f8fc1cf3ca700f268ff96087ab0",
+          "dest": "_rust_dist/cargo",
+          "only-arches": [
+            "aarch64"
+          ]
+        },
+        {
+          "type": "archive",
+          "url": "https://static.rust-lang.org/dist/2026-10-15/rust-std-1.99.1-aarch64-unknown-linux-gnu.tar.xz",
+          "sha256": "e25668477083d6a9ddb87b9beb9c00742225f38233ccb4bfba3afa7a07427f52",
+          "dest": "_rust_dist/rust-std",
+          "only-arches": [
+            "aarch64"
+          ]
+        }
+      ]
+    }
+  ]
+}

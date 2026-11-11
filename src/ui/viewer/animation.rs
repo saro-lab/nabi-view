@@ -5,14 +5,10 @@ impl Viewer {
         if !self.slideshow
             || self.files.is_empty()
             || self.listing.is_some()
-            || self.recent_open
-            || self.move_dialog.is_some()
-            || self.menu_open
-            || self.clear_prompt
-            || self.random_prompt
+            || self.overlay_open()
             || self.file_job.is_some()
             || self.zoom_input.is_some()
-            || ctx.memory(|m| m.any_popup_open())
+            || ctx.any_popup_open()
         {
             self.slide_deadline = None;
             return;
@@ -52,7 +48,19 @@ impl Viewer {
                 continue;
             }
             match animation.advance(ctx, now) {
-                Ok(Some(image)) => picture.handle.set(image, egui::TextureOptions::LINEAR),
+                Ok(Some(frame)) => {
+                    picture.hdr = frame
+                        .hdr
+                        .and_then(|hdr| {
+                            self.render_state
+                                .as_ref()
+                                .and_then(|state| crate::ui::hdr::Texture::new(state, hdr))
+                        })
+                        .map(std::sync::Arc::new);
+                    picture
+                        .handle
+                        .set(frame.image, egui::TextureOptions::LINEAR);
+                }
                 Ok(None) => {}
                 Err(error) => {
                     // Keep the last good texture, but release a failed worker

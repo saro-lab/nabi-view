@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.nabi.NabiView</id>
+  <name>NABI VIEW</name>
+  <summary>View local images and image archives</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>NABI VIEW is a local image viewer with zoom, two-page reading,
+    animated image playback, and embedded metadata inspection.</p>
+  </description>
+  <launchable type="desktop-id">dev.nabi.NabiView.desktop</launchable>
+  <url type="homepage">https://lab.saro.me/app/nabi-view</url>
+  <url type="bugtracker">https://github.com/saro-lab/nabi-view/issues</url>
+  <provides><binary>nabi-view</binary></provides>
+  <content_rating type="oars-1.1"/>
+</component>

@@ -20,7 +20,7 @@ fn shortcut_toolbar_keeps_equal_heights_and_wraps_whole_controls() {
             }
             let filter = window
                 .ctx
-                .read_response(egui::Id::new("shortcut-filter"))
+                .read_response(egui::Id::unique("shortcut-filter"))
                 .unwrap()
                 .rect;
             assert!(
@@ -61,7 +61,7 @@ fn shortcut_toolbar_keeps_equal_heights_and_wraps_whole_controls() {
                     "Unequal control height: {rect:?}"
                 );
                 assert!(
-                    window.ctx.screen_rect().contains_rect(*rect),
+                    window.ctx.viewport_rect().contains_rect(*rect),
                     "Control escaped {width}: {rect:?}"
                 );
                 for other in &controls[index + 1..] {
@@ -87,15 +87,15 @@ fn shortcut_changes_render_the_current_value_in_toasts() {
     window.reveal_controls();
     window.wait_for("1 / 5");
     for (key, expected) in [
-        (Key::Period, "슬라이드 간격: 1.1 초"),
-        (Key::Comma, "슬라이드 간격: 1.0 초"),
+        (Key::Period, "슬라이드 쇼 간격: 1.1 초"),
+        (Key::Comma, "슬라이드 쇼 간격: 1.0 초"),
         (Key::R, "좌우 반전: 켜짐"),
         (Key::R, "좌우 반전: 꺼짐"),
         (Key::T, "상하 반전: 켜짐"),
         (Key::T, "상하 반전: 꺼짐"),
-        (Key::OpenBracket, "배치: 양면 보기 (왼쪽)"),
-        (Key::CloseBracket, "배치: 양면 보기 (오른쪽)"),
-        (Key::P, "배치: 한면 보기 (양면 끔)"),
+        (Key::OpenBracket, "배치: 양면 (오른쪽에서 왼쪽)"),
+        (Key::CloseBracket, "배치: 양면 (왼쪽에서 오른쪽)"),
+        (Key::P, "배치: 단면 보기"),
         (Key::Num1, "이미지 표시: 실제 크기 (100%)"),
         (Key::Equals, "배율: 125%"),
         (Key::Num0, "이미지 표시: 이미지 전체 맞춤"),
@@ -140,7 +140,7 @@ fn phone_swipe_turns_pages_and_settings_uses_full_width() {
     window.wait_for("02 Pelagic.png");
     let settings = window
         .ctx
-        .read_response(egui::Id::new(("titlebar", "settings")))
+        .read_response(egui::Id::unique(("titlebar", "settings")))
         .unwrap()
         .rect
         .center();
@@ -240,9 +240,7 @@ fn large_gif_plays_in_settings_and_after_navigation() {
                 .iter()
                 .filter(|(id, _)| *id == texture)
             {
-                let egui::ImageData::Color(image) = &delta.image else {
-                    continue;
-                };
+                let egui::ImageData::Color(image) = &delta.image;
                 assert_eq!(image.size, [256, 256]);
                 if image.pixels != previous {
                     changes += 1;
@@ -297,9 +295,7 @@ fn animated_avif_updates_displayed_pixels_and_settings_background() {
         if drawn {
             let texture = window.photo_texture();
             if let Some((_, delta)) = window.texture_updates.iter().find(|(id, _)| *id == texture) {
-                let egui::ImageData::Color(image) = &delta.image else {
-                    panic!("Expected AVIF color pixels");
-                };
+                let egui::ImageData::Color(image) = &delta.image;
                 assert_eq!(image.size, [498, 286]);
                 break (texture, image.pixels.clone());
             }
@@ -335,9 +331,7 @@ fn animated_avif_updates_displayed_pixels_and_settings_background() {
                 "Animation did not schedule its next frame"
             );
             if let Some((_, delta)) = window.texture_updates.iter().find(|(id, _)| *id == texture) {
-                let egui::ImageData::Color(image) = &delta.image else {
-                    panic!("Expected AVIF color pixels");
-                };
+                let egui::ImageData::Color(image) = &delta.image;
                 if image.pixels != previous_pixels {
                     previous_pixels = image.pixels.clone();
                     break;
@@ -589,6 +583,8 @@ fn alternate_navigation_and_direct_layout_shortcuts_keep_the_current_page() {
 #[test]
 #[ignore = "Requires a desktop user session; moves only unique test fixtures through the Recycle Bin"]
 fn trash_shortcuts_restore_batches_lifo_and_fall_back_to_the_focused_spread() {
+    use crate::i18n::tr;
+
     let root = crate::test_support::root();
     std::fs::create_dir_all(&root).unwrap();
     let fixture = tempfile::Builder::new()
@@ -626,7 +622,7 @@ fn trash_shortcuts_restore_batches_lifo_and_fall_back_to_the_focused_spread() {
     window.draw(Some(Key::ArrowRight));
     window.wait_for("3 / 4");
     window.draw(Some(Key::Delete));
-    window.wait_for("Images deleted.");
+    window.wait_for(tr("images-moved-to-trash"));
     window.wait_for("1 / 2");
     assert!(!paths[0].exists() && !paths[1].exists());
     assert!(paths[2].exists() && paths[3].exists());
@@ -634,7 +630,7 @@ fn trash_shortcuts_restore_batches_lifo_and_fall_back_to_the_focused_spread() {
     // Once the checked files leave the list, Delete falls back to the single
     // focused image and records a separate undo batch.
     window.draw(Some(Key::Delete));
-    window.wait_for("Images deleted.");
+    window.wait_for(tr("images-moved-to-trash"));
     window.wait_for("1 / 1");
     assert!(!paths[2].exists() && paths[3].exists());
 
@@ -650,7 +646,7 @@ fn trash_shortcuts_restore_batches_lifo_and_fall_back_to_the_focused_spread() {
                 .into(),
             modifiers,
         );
-        window.wait_for("Image deletion undone.");
+        window.wait_for(tr("images-restored-from-trash"));
     };
     undo(&mut window);
     window.wait_for("2 / 2");
@@ -665,7 +661,7 @@ fn trash_shortcuts_restore_batches_lifo_and_fall_back_to_the_focused_spread() {
     window.draw(Some(Key::CloseBracket));
     window.wait_for("3–4 / 4");
     window.draw(Some(Key::Delete));
-    window.wait_for("Images deleted.");
+    window.wait_for(tr("images-moved-to-trash"));
     window.wait_for("1–2 / 2");
     assert!(paths[0].exists() && paths[1].exists());
     assert!(!paths[2].exists() && !paths[3].exists());
@@ -688,7 +684,7 @@ fn settings_sidebar_switches_the_right_hand_content() {
         "Connections",
         "Cache",
         "Keyboard shortcuts",
-        "Sharing",
+        "Data",
         "About",
     ] {
         assert!(
@@ -769,7 +765,7 @@ fn shortcut_text_filter_matches_names_and_keys_and_edits_the_original_row() {
         window.wait_for("1 / 5");
         window.click(window.titlebar_icon("settings").rect.center());
         window.click(window.label_position(tr("keyboard-shortcuts")));
-        let filter_id = egui::Id::new("shortcut-filter");
+        let filter_id = egui::Id::unique("shortcut-filter");
         let primary = egui::Modifiers {
             command: true,
             mac_cmd: cfg!(target_os = "macos"),
@@ -793,7 +789,7 @@ fn shortcut_text_filter_matches_names_and_keys_and_edits_the_original_row() {
         let visible = |window: &TestWindow, index| {
             window
                 .ctx
-                .read_response(egui::Id::new(("shortcut-row", index)))
+                .read_response(egui::Id::unique(("shortcut-row", index)))
                 .is_some()
         };
         // Switching from key capture to text typing must not capture typed letters.
@@ -879,7 +875,7 @@ fn shortcut_rows_can_be_added_edited_deleted_and_reset_without_resetting_other_s
     window.click(window.titlebar_icon("settings").rect.center());
     window.click(window.label_position("Keyboard shortcuts"));
     let text = window.draw(None).0;
-    assert!(text.contains("No shortcuts. Use + Add to create one."));
+    assert!(text.contains(crate::i18n::tr("no-shortcuts-use-add-to-create-one")));
     assert_eq!(text.matches("Reset shortcuts").count(), 1);
 
     add_shortcut_row(&mut window, Key::J, "Next page or spread");
@@ -919,13 +915,13 @@ fn shortcut_rows_can_be_added_edited_deleted_and_reset_without_resetting_other_s
     assert!(
         window
             .ctx
-            .read_response(egui::Id::new(("shortcut-row", 0)))
+            .read_response(egui::Id::unique(("shortcut-row", 0)))
             .is_some()
     );
     assert!(
         window
             .ctx
-            .read_response(egui::Id::new(("shortcut-row", 1)))
+            .read_response(egui::Id::unique(("shortcut-row", 1)))
             .is_none()
     );
     window.draw(Some(Key::Escape));
@@ -937,12 +933,17 @@ fn shortcut_rows_can_be_added_edited_deleted_and_reset_without_resetting_other_s
     assert!(
         window
             .ctx
-            .read_response(egui::Id::new(("shortcut-row", 1)))
+            .read_response(egui::Id::unique(("shortcut-row", 1)))
             .is_some()
     );
     window.click(window.label_position("Search by shortcut"));
     window.draw(Some(Key::Z));
-    assert!(window.draw(None).0.contains("No shortcuts match this key."));
+    assert!(
+        window
+            .draw(None)
+            .0
+            .contains(crate::i18n::tr("no-shortcuts-match-this-key"))
+    );
     window.click(window.label_position("Clear shortcut search"));
     close_settings_screen(&mut window);
     window.draw(Some(Key::J));
@@ -1007,7 +1008,7 @@ fn shortcut_rows_can_be_added_edited_deleted_and_reset_without_resetting_other_s
         window
             .draw(None)
             .0
-            .contains("No shortcuts. Use + Add to create one.")
+            .contains(crate::i18n::tr("no-shortcuts-use-add-to-create-one"))
     );
     close_settings_screen(&mut window);
     for key in [Key::ArrowRight, Key::L, Key::K] {
@@ -1051,7 +1052,7 @@ fn shortcut_rows_can_be_added_edited_deleted_and_reset_without_resetting_other_s
     assert_eq!(settings.toast_ms, 3_700);
     let text = window.draw(None).0;
     assert_eq!(text.matches("Reset shortcuts").count(), 1);
-    assert!(!text.contains("No shortcuts. Use + Add to create one."));
+    assert!(!text.contains(crate::i18n::tr("no-shortcuts-use-add-to-create-one")));
     let escape_row = settings
         .keyboard_shortcuts
         .as_ref()
@@ -1073,11 +1074,11 @@ fn shortcut_rows_can_be_added_edited_deleted_and_reset_without_resetting_other_s
         text.contains("Close window"),
         "The first Esc must search for its registered row"
     );
-    assert!(!text.contains("No shortcuts match this key."));
+    assert!(!text.contains(crate::i18n::tr("no-shortcuts-match-this-key")));
     assert!(
         window
             .ctx
-            .read_response(egui::Id::new(("shortcut-row", escape_row)))
+            .read_response(egui::Id::unique(("shortcut-row", escape_row)))
             .is_some()
     );
     window.draw(Some(Key::Escape));
@@ -1103,7 +1104,31 @@ fn shortcut_rows_can_be_added_edited_deleted_and_reset_without_resetting_other_s
 
 #[cfg(not(target_os = "macos"))]
 #[test]
-fn imported_ctrl_shortcut_matches_primary_input_and_shortcut_search() {
+fn default_ctrl_s_opens_settings_alongside_primary_comma() {
+    let mut window = TestWindow::sample_with_settings(&crate::core::settings::Settings {
+        language: crate::i18n::Language::English,
+        ..Default::default()
+    });
+    window.reveal_controls();
+    window.wait_for("1 / 5");
+    assert!(!window.draw(None).0.contains("Keyboard shortcuts"));
+    // Control is Primary on Windows/Linux and a separate modifier on macOS.
+    let modifiers = egui::Modifiers {
+        command: !cfg!(target_os = "macos"),
+        ctrl: true,
+        ..Default::default()
+    };
+    window.draw_events(
+        [true, false]
+            .map(|pressed| key_event(Key::S, pressed, false, modifiers))
+            .into(),
+        modifiers,
+    );
+    assert!(window.draw(None).0.contains("Keyboard shortcuts"));
+}
+
+#[test]
+fn imported_ctrl_shortcut_matches_platform_input_and_shortcut_search() {
     let mut window = TestWindow::sample_with_settings(&crate::core::settings::Settings {
         language: crate::i18n::Language::English,
         keyboard_shortcuts: Some(vec![crate::core::settings::KeyboardShortcut {
@@ -1116,9 +1141,10 @@ fn imported_ctrl_shortcut_matches_primary_input_and_shortcut_search() {
     window.reveal_controls();
     window.wait_for("1 / 5");
     window.click(window.titlebar_icon("pin").rect.center());
-    let primary_o = |window: &mut TestWindow| {
+    let ctrl_o = |window: &mut TestWindow| {
         let modifiers = egui::Modifiers {
-            command: true,
+            // Control is the primary modifier on Windows/Linux, but not macOS.
+            command: !cfg!(target_os = "macos"),
             ctrl: true,
             ..Default::default()
         };
@@ -1129,19 +1155,22 @@ fn imported_ctrl_shortcut_matches_primary_input_and_shortcut_search() {
             modifiers,
         );
     };
-    primary_o(&mut window);
+    ctrl_o(&mut window);
     assert!(window.draw(None).0.contains("2 / 5"));
     window.click(window.titlebar_icon("settings").rect.center());
     window.click(window.label_position("Keyboard shortcuts"));
     window.click(window.label_position("Search by shortcut"));
-    primary_o(&mut window);
+    ctrl_o(&mut window);
     let text = window.draw(None).0;
-    assert!(text.contains("Next page or spread") && text.contains("Ctrl+O"));
-    assert!(!text.contains("No shortcuts match this key."));
+    assert!(
+        text.contains(crate::i18n::tr("next-page-or-spread"))
+            && text.contains(&crate::core::commands::shortcut_label("Ctrl+O"))
+    );
+    assert!(!text.contains(crate::i18n::tr("no-shortcuts-match-this-key")));
     assert!(
         window
             .ctx
-            .read_response(egui::Id::new(("shortcut-row", 0)))
+            .read_response(egui::Id::unique(("shortcut-row", 0)))
             .is_some()
     );
     window.click(window.label_position("Clear shortcut search"));
@@ -1188,13 +1217,13 @@ fn a_partial_shortcut_list_runs_only_its_registered_rows() {
     assert!(
         window
             .ctx
-            .read_response(egui::Id::new(("shortcut-row", 0)))
+            .read_response(egui::Id::unique(("shortcut-row", 0)))
             .is_some()
     );
     assert!(
         window
             .ctx
-            .read_response(egui::Id::new(("shortcut-row", 1)))
+            .read_response(egui::Id::unique(("shortcut-row", 1)))
             .is_none()
     );
     let rows = saved_viewer_settings(&window).keyboard_shortcuts.unwrap();
@@ -1286,7 +1315,7 @@ fn about_f1_opens_settings_integrates_licenses_and_preserves_image() {
     window.draw(None);
     let close = window
         .ctx
-        .read_response(egui::Id::new(("titlebar", "settings-close")))
+        .read_response(egui::Id::unique(("titlebar", "settings-close")))
         .unwrap();
     window.click(close.rect.center());
     window.reveal_controls();
@@ -1334,7 +1363,7 @@ fn settings_replaces_viewer_and_close_returns_without_exiting() {
     assert!(!window.titlebar_visible());
     let close = window
         .ctx
-        .read_response(egui::Id::new(("titlebar", "settings-close")))
+        .read_response(egui::Id::unique(("titlebar", "settings-close")))
         .expect("Missing settings close icon");
     assert_eq!(close.rect.size(), egui::vec2(36., 36.));
     window.click(close.rect.center());
@@ -1370,7 +1399,7 @@ fn settings_blank_space_moves_window_but_controls_do_not() {
     assert!(!window.drag_pointer(reset, egui::vec2(-100., 0.)));
     let close = window
         .ctx
-        .read_response(egui::Id::new(("titlebar", "settings-close")))
+        .read_response(egui::Id::unique(("titlebar", "settings-close")))
         .unwrap();
     assert!(!window.drag_pointer(close.rect.center(), egui::vec2(-100., 0.)));
     // Scrollable content must also leave gaps available for window movement.
@@ -1430,7 +1459,7 @@ fn settings_columns_remain_visible_inside_a_small_viewport() {
         // portion must stay within the same settings window and its clip.
         for s in &window.paint {
             if let Shape::Text(t) = &s.shape
-                && ["Cache", "Keyboard shortcuts", "Sharing", "About"]
+                && ["Cache", "Keyboard shortcuts", "Data", "About"]
                     .iter()
                     .any(|label| t.galley.job.text == crate::i18n::test_tr(label))
             {
@@ -1461,6 +1490,8 @@ fn modified_mouse_input_respects_settings_and_zoom_editing() {
     window.pointer(540., 380.);
     window.draw_events(
         vec![Event::MouseWheel {
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
             unit: egui::MouseWheelUnit::Point,
             delta: egui::vec2(0., 100.),
             modifiers,
@@ -1477,6 +1508,8 @@ fn modified_mouse_input_respects_settings_and_zoom_editing() {
     window.drag_pointer_with_modifiers(egui::pos2(950., 690.), egui::vec2(-30., 0.), modifiers);
     window.draw_events(
         vec![Event::MouseWheel {
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
             unit: egui::MouseWheelUnit::Point,
             delta: egui::vec2(0., 100.),
             modifiers,
