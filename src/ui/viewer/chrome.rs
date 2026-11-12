@@ -14,7 +14,7 @@ impl Viewer {
             return;
         }
         if crate::app::is_mobile() {
-            self.controls_visible = !self.hide_controls || self.files.is_empty() || self.menu_open;
+            self.controls_visible = !self.fullscreen;
             return;
         }
         let now = ctx.input(|i| i.time);
@@ -177,16 +177,26 @@ impl Viewer {
                                 {
                                     self.run("orientation", ctx);
                                 }
+                                let (control, label, active, command) = if mobile {
+                                    (
+                                        "fullscreen",
+                                        "toggle-full-screen",
+                                        self.fullscreen,
+                                        "fullscreen",
+                                    )
+                                } else {
+                                    ("pin", "pin-controls", !self.hide_controls, "chrome")
+                                };
                                 if chrome_icons::button_with_shortcut(
                                     ui,
-                                    "pin",
-                                    "pin-controls",
-                                    !self.hide_controls,
-                                    &self.shortcut_text("chrome"),
+                                    control,
+                                    label,
+                                    active,
+                                    &self.shortcut_text(command),
                                 )
                                 .clicked()
                                 {
-                                    self.run("chrome", ctx);
+                                    self.run(command, ctx);
                                 }
                                 let menu = chrome_icons::button(ui, "menu", "menu", self.menu_open);
                                 if menu.clicked() {

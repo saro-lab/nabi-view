@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Reuse the exact color icon silhouette and placement; the launcher supplies the palette. -->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:insetLeft="24.0508%" android:insetRight="23.9492%"
+    android:insetTop="24.0254%" android:insetBottom="23.9746%">
+    <bitmap android:src="@drawable/nabi_launcher_artwork"
+        android:gravity="fill" android:filter="true"
+        android:tint="@android:color/black" android:tintMode="src_in" />
+</inset>

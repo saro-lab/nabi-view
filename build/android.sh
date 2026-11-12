@@ -132,13 +132,15 @@ else
         "CARGO_TARGET_${target_upper}_RUSTFLAGS=$link_flags" \
         "CMAKE_TOOLCHAIN_FILE=$(native_path "$project_dir/build/android-toolchain.cmake")" "NABI_ANDROID_ABI=$abi" \
         cargo build --locked --release -p nabi-view-android --target "$target"
-    mkdir -p "target/android/jniLibs/$abi" target/android/assets target/android/res/mipmap-xxxhdpi
+    mkdir -p "target/android/jniLibs/$abi" target/android/assets target/android/res/drawable-nodpi
     $python build/check-android-elf.py "$target_dir/$target/release/libnabi_view_android.so"
     cp "$target_dir/$target/release/libnabi_view_android.so" "target/android/jniLibs/$abi/"
     $python build/notices.py
     cp target/notices/THIRD_PARTY_NOTICES.txt target/android/assets/
     cp LICENSE THIRD_PARTY.md target/android/assets/
-    cp assets/icons/png/nabi-icon-256.png target/android/res/mipmap-xxxhdpi/ic_launcher.png
+    cp assets/icons/png/nabi-icon-1024.png target/android/res/drawable-nodpi/nabi_launcher_artwork.png
+    # Remove the previous generated legacy icon when reusing an existing build tree.
+    rm -f target/android/res/mipmap-xxxhdpi/ic_launcher.png
 fi
 [ "$mode" != native ] || exit 0
 case "$variant:$format" in

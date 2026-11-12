@@ -55,6 +55,15 @@
         }
       ]
     },
+    "dispatch 0.2.0": {
+      "sources": [
+        {
+          "file": "SSheldon-rust-dispatch-82d6c7a5/PACKAGE-LICENSE.toml",
+          "url": "https://github.com/SSheldon/rust-dispatch/blob/82d6c7a5b75dc0c71c3f46f87bb6c16a476f7748/Cargo.toml",
+          "sha256": "05c60b829931ef7f1f130735843c11f5cf9cc69546eca5fc941d014781c68e31"
+        }
+      ]
+    },
     "dispatch2 0.3.1": {
       "sources": [
         {

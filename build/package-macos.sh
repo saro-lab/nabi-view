@@ -268,7 +268,8 @@ else
             "$build_dir/x86_64-apple-darwin/release/nabi-view" \
             -output "$app/Contents/MacOS/nabi-view"
         chmod 755 "$app/Contents/MacOS/nabi-view"
-        xcrun lipo -verify_arch arm64 x86_64 "$app/Contents/MacOS/nabi-view"
+        xcrun lipo "$app/Contents/MacOS/nabi-view" -verify_arch arm64
+        xcrun lipo "$app/Contents/MacOS/nabi-view" -verify_arch x86_64
     else
         install -m 755 "$build_dir/$target/release/nabi-view" "$app/Contents/MacOS/nabi-view"
     fi

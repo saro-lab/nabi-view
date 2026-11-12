@@ -1,5 +1,286 @@
 use super::*;
 
+fn drag_touch(window: &mut TestWindow, start: egui::Pos2, delta: egui::Vec2) {
+    let touch = |phase, pos| Event::Touch {
+        device_id: egui::TouchDeviceId(1),
+        id: egui::TouchId(1),
+        phase,
+        pos,
+        force: None,
+    };
+    window.pointer(start.x, start.y);
+    window.draw_events(
+        vec![
+            touch(egui::TouchPhase::Start, start),
+            Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+        egui::Modifiers::NONE,
+    );
+    let end = start + delta;
+    window.draw_events(
+        vec![touch(egui::TouchPhase::Move, end), Event::PointerMoved(end)],
+        egui::Modifiers::NONE,
+    );
+    window.draw_events(
+        vec![
+            touch(egui::TouchPhase::End, end),
+            Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            Event::PointerGone,
+        ],
+        egui::Modifiers::NONE,
+    );
+    window.draw(None);
+    assert!(!window.started_window_drag());
+}
+
+#[test]
+fn phone_bars_stay_visible_and_fullscreen_taps_restore_them() {
+    let _phone = PhonePreview::enter();
+    let mut window = TestWindow::sample();
+    window.screen_size = egui::vec2(390., 844.);
+    window.wait_for("1 / 5");
+    window.time += 5.;
+    window.click(egui::pos2(195., 400.));
+    window.draw(Some(Key::H)); // The desktop hide-controls command cannot hide phone bars.
+    window.draw(Some(Key::I));
+    window.draw(Some(Key::I)); // Closing metadata used to hide the mobile bars too.
+    window.draw(None);
+    assert!(window.titlebar_visible());
+    assert!(window.draw(None).0.contains("1 / 5"));
+    let normal_canvas = window.photo_rects().0;
+    assert!(normal_canvas.top() > 0. && normal_canvas.bottom() < window.screen_size.y);
+    assert!(
+        window
+            .ctx
+            .read_response(egui::Id::unique(("titlebar", "pin")))
+            .is_none()
+    );
+
+    // The fullscreen button replaces the mobile pin. Top/bottom letterboxes
+    // and the photograph itself must all offer the same way back.
+    for position in [
+        egui::pos2(5., 5.),
+        egui::pos2(195., 400.),
+        egui::pos2(385., 839.),
+    ] {
+        let fullscreen = window.titlebar_icon("fullscreen").rect.center();
+        window.click(fullscreen);
+        window.draw(None);
+        assert!(!window.titlebar_visible());
+        assert_eq!(window.photo_rects().0, window.ctx.viewport_rect());
+        window.click(position);
+        window.draw(None);
+        assert!(window.titlebar_visible());
+        assert_eq!(window.photo_rects().0, normal_canvas);
+    }
+
+    // Metadata covers the canvas with interactive text, but a fullscreen tap
+    // still exits instead of requiring a tap on an uncovered part of the photo.
+    window.draw(Some(Key::I));
+    window.draw(Some(Key::F));
+    window.draw(None);
+    assert!(!window.titlebar_visible());
+    window.click(egui::pos2(50., 100.));
+    window.draw(None);
+    assert!(window.titlebar_visible());
+
+    // A long-press menu must not re-enter fullscreen when its fullscreen tile
+    // receives the same tap that exits fullscreen from the canvas handler.
+    window.draw(Some(Key::I));
+    window.draw(Some(Key::F));
+    let hold = egui::pos2(195., 400.);
+    window.pointer(hold.x, hold.y);
+    window.draw_events(
+        vec![
+            Event::Touch {
+                device_id: egui::TouchDeviceId(2),
+                id: egui::TouchId(2),
+                phase: egui::TouchPhase::Start,
+                pos: hold,
+                force: None,
+            },
+            Event::PointerButton {
+                pos: hold,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+        egui::Modifiers::NONE,
+    );
+    window.time += 1.;
+    window.draw(None);
+    window.draw_events(
+        vec![
+            Event::Touch {
+                device_id: egui::TouchDeviceId(2),
+                id: egui::TouchId(2),
+                phase: egui::TouchPhase::End,
+                pos: hold,
+                force: None,
+            },
+            Event::PointerButton {
+                pos: hold,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            Event::PointerGone,
+        ],
+        egui::Modifiers::NONE,
+    );
+    for _ in 0..3 {
+        window.draw(None);
+    }
+    let fullscreen_tile = window
+        .ctx
+        .read_response(egui::Id::unique(("menu-command", "fullscreen")))
+        .expect("Long press should open the fullscreen menu")
+        .rect
+        .center();
+    window.click(fullscreen_tile);
+    window.draw(None);
+    assert!(window.titlebar_visible());
+    assert!(
+        window
+            .ctx
+            .read_response(egui::Id::unique(("menu-command", "fullscreen")))
+            .is_none()
+    );
+}
+
+#[test]
+fn phone_horizontal_swipes_change_pages_even_when_zoomed_or_fullscreen() {
+    let _phone = PhonePreview::enter();
+    let mut window = TestWindow::sample();
+    window.screen_size = egui::vec2(390., 844.);
+    window.wait_for("1 / 5");
+    let start = egui::pos2(280., 400.);
+    drag_touch(&mut window, start, egui::vec2(-160., 5.));
+    window.wait_for("2 / 5");
+    assert!(window.titlebar_visible());
+    drag_touch(&mut window, egui::pos2(110., 400.), egui::vec2(160., -5.));
+    window.wait_for("1 / 5");
+
+    // The fit view can be zoomed, but a clear horizontal swipe still advances.
+    for _ in 0..4 {
+        window.draw(Some(Key::Equals));
+    }
+    let zoomed = window.photo_rects().1;
+    assert!(zoomed.width() > window.photo_rects().0.width());
+    drag_touch(&mut window, start, egui::vec2(5., 80.));
+    let panned = window.photo_rects().1;
+    assert!(panned.center().y > zoomed.center().y + 50.);
+    assert!(window.draw(None).0.contains("1 / 5"));
+    let previous = window.photo_texture();
+    drag_touch(&mut window, start, egui::vec2(-160., 0.));
+    window.wait_for("2 / 5");
+    window.wait_for_texture_replacement(previous);
+    assert!(
+        window
+            .photo_rects()
+            .0
+            .expand(1.)
+            .contains_rect(window.photo_rects().1)
+    );
+
+    window.draw(Some(Key::F));
+    window.draw(None);
+    drag_touch(&mut window, start, egui::vec2(-160., 0.));
+    assert!(
+        !window.titlebar_visible(),
+        "A swipe must not exit fullscreen"
+    );
+    window.click(egui::pos2(195., 400.));
+    window.wait_for("3 / 5");
+    assert!(window.titlebar_visible());
+}
+
+#[test]
+fn phone_pinch_and_two_finger_pan_do_not_swipe_or_exit_fullscreen() {
+    let _phone = PhonePreview::enter();
+    let mut window = TestWindow::sample();
+    window.screen_size = egui::vec2(390., 844.);
+    window.wait_for("1 / 5");
+    window.draw(Some(Key::F));
+    window.draw(None);
+    let before = window.photo_rects().1;
+    let touch = |id, phase, pos| Event::Touch {
+        device_id: egui::TouchDeviceId(1),
+        id: egui::TouchId(id),
+        phase,
+        pos,
+        force: None,
+    };
+    let first = egui::pos2(160., 400.);
+    let second = egui::pos2(230., 400.);
+    window.draw_events(
+        vec![
+            Event::PointerMoved(first),
+            Event::PointerButton {
+                pos: first,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            touch(1, egui::TouchPhase::Start, first),
+        ],
+        egui::Modifiers::NONE,
+    );
+    window.draw_events(
+        vec![touch(2, egui::TouchPhase::Start, second)],
+        egui::Modifiers::NONE,
+    );
+    let moved_first = egui::pos2(60., 430.);
+    let moved_second = egui::pos2(260., 430.);
+    window.draw_events(
+        vec![
+            Event::PointerMoved(moved_first),
+            touch(1, egui::TouchPhase::Move, moved_first),
+            touch(2, egui::TouchPhase::Move, moved_second),
+        ],
+        egui::Modifiers::NONE,
+    );
+    window.draw(None);
+    let after = window.photo_rects().1;
+    assert!(
+        after.width() > before.width() * 2.,
+        "before={before:?}, after={after:?}, touch={:?}",
+        window.ctx.input(|i| i.multi_touch())
+    );
+    assert!(after.center().x < before.center().x - 20.);
+    assert!(after.center().y > before.center().y + 20.);
+    window.draw_events(
+        vec![
+            touch(1, egui::TouchPhase::End, moved_first),
+            touch(2, egui::TouchPhase::End, moved_second),
+            Event::PointerButton {
+                pos: moved_first,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            Event::PointerGone,
+        ],
+        egui::Modifiers::NONE,
+    );
+    window.draw(None);
+    assert!(!window.titlebar_visible());
+    window.click(egui::pos2(195., 400.));
+    window.wait_for("1 / 5");
+    assert!(window.titlebar_visible());
+}
+
 #[test]
 fn tablet_settings_adapt_to_rotation_and_split_screen() {
     let _mobile = PhonePreview::enter();
@@ -89,7 +370,7 @@ fn phone_uses_desktop_bars_without_zoom_and_hides_desktop_commands() {
             "Spread control visibility at {width} points"
         );
         // The desktop top bar, status bar and thumbnail strip are all present.
-        for name in ["orientation", "pin", "menu", "settings", "random"] {
+        for name in ["orientation", "fullscreen", "menu", "settings", "random"] {
             let response = window
                 .ctx
                 .read_response(egui::Id::unique(("titlebar", name)))

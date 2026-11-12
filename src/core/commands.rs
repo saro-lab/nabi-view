@@ -375,9 +375,17 @@ pub(crate) fn mobile_supported(command: &str) -> bool {
     // Recent items/bookmarks use local source IDs whose native access grants
     // are resolved on reopen. They never point at temporary imported files.
     // Phones share the current image instead of revealing it in a file manager.
+    // Their controls stay visible until fullscreen; pinning is desktop-only.
     !matches!(
         command,
-        "new-window" | "reveal" | "move" | "close-window" | "close-all" | "minimize" | "maximize"
+        "new-window"
+            | "reveal"
+            | "move"
+            | "close-window"
+            | "close-all"
+            | "minimize"
+            | "maximize"
+            | "chrome"
     )
 }
 

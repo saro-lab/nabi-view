@@ -56,17 +56,19 @@ plus bundled native codecs, fonts and vendored packaging helpers. This is the
 resolved dependency inventory, not a claim that every component is linked into
 every platform's application binary.
 
-58 packages in the current inventory have supplemental upstream notices
+59 packages in the current inventory have supplemental upstream notices
 recorded with source URLs and SHA-256 hashes in
 `licenses/upstream/index.json`. Some upstream notices declare licenses by
 name; the generated catalog also supplies their standard terms.
 
-`dispatch` 0.2.0 declares MIT, but no separate upstream license file was found
-at its published source revision. Its published author, license declaration and
-reference terms are included in the generated catalog. Original upstream
-attribution remains flagged for review; reference terms are not represented as
-recovered originals. The former `block` 0.1.6 and `hexf-parse` 0.2.1 review entries
-are absent from the current resolved graph.
+`dispatch` 0.2.0 declares MIT in its published Cargo manifest. The exact
+upstream manifest, including its author attribution, is preserved under
+`licenses/upstream/SSheldon-rust-dispatch-82d6c7a5/` with its source URL and
+SHA-256. The generated catalog includes this declaration and the standard MIT
+terms. No separate license file or copyright-year notice was found at that
+revision; none has been invented or represented as a recovered original.
+The former `block` 0.1.6 and `hexf-parse` 0.2.1 review entries are absent from
+the current resolved graph.
 
 References:
 

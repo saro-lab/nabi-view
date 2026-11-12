@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Center the artwork's alpha bounds (59,54)-(963,969) on the 108dp layer.
+     Its 56.16dp bitmap fits the complete butterfly inside the 66dp safe circle.
+     Keep these insets identical to ic_launcher_monochrome.xml. -->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:insetLeft="24.0508%" android:insetRight="23.9492%"
+    android:insetTop="24.0254%" android:insetBottom="23.9746%">
+    <bitmap android:src="@drawable/nabi_launcher_artwork"
+        android:gravity="fill" android:filter="true" />
+</inset>

@@ -250,6 +250,11 @@ impl Viewer {
         ui.add_space(4.);
         ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
         ui.hyperlink_to(env!("CARGO_PKG_HOMEPAGE"), env!("CARGO_PKG_HOMEPAGE"));
+        #[cfg(target_os = "macos")]
+        ui.hyperlink_to(
+            tr("privacy-policy-english"),
+            "https://lab.saro.me/privacy/nabi-view/",
+        );
         ui.add_space(12.);
         ui.separator();
         ui.add_space(8.);

@@ -51,9 +51,9 @@ impl TouchGesture {
         self.start = None;
         self.multiple = false;
     }
-    pub fn finish(&mut self, end: Pos2, zoomed: bool, rtl: bool) -> Option<bool> {
+    pub fn finish(&mut self, end: Pos2, rtl: bool) -> Option<bool> {
         let delta = end - self.start.take()?;
-        if self.multiple || zoomed || delta.x.abs() < 48. || delta.x.abs() < delta.y.abs() * 1.5 {
+        if self.multiple || delta.x.abs() < 48. || delta.x.abs() < delta.y.abs() * 1.5 {
             return None;
         }
         Some((delta.x < 0.) != rtl)
@@ -70,25 +70,19 @@ impl TouchGesture {
 mod tests {
     use super::*;
     #[test]
-    fn swipe_respects_zoom_direction_and_multitouch() {
+    fn swipe_respects_reading_direction_and_multitouch() {
         let mut gesture = TouchGesture::default();
         gesture.start(Pos2::new(200., 100.));
-        assert_eq!(
-            gesture.finish(Pos2::new(120., 105.), false, false),
-            Some(true)
-        );
+        assert_eq!(gesture.finish(Pos2::new(120., 105.), false), Some(true));
         gesture.start(Pos2::new(200., 100.));
-        assert_eq!(
-            gesture.finish(Pos2::new(120., 105.), false, true),
-            Some(false)
-        );
+        assert_eq!(gesture.finish(Pos2::new(120., 105.), true), Some(false));
         gesture.start(Pos2::new(200., 100.));
         gesture.multiple();
-        assert_eq!(gesture.finish(Pos2::new(120., 105.), false, false), None);
+        assert_eq!(gesture.finish(Pos2::new(120., 105.), false), None);
         gesture.start(Pos2::new(200., 100.));
-        assert_eq!(gesture.finish(Pos2::new(120., 105.), true, false), None);
+        assert_eq!(gesture.finish(Pos2::new(170., 105.), false), None);
         gesture.start(Pos2::new(200., 100.));
-        assert_eq!(gesture.finish(Pos2::new(120., 220.), false, false), None);
+        assert_eq!(gesture.finish(Pos2::new(120., 220.), false), None);
     }
     #[test]
     fn converts_safe_area_from_physical_pixels() {

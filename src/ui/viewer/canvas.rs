@@ -18,8 +18,14 @@ impl Viewer {
     }
 
     pub(super) fn image_canvas(&self, mut screen: Rect) -> Rect {
-        // Hover reveals an overlay; explicit pin/Tab reserves space for chrome.
-        if !self.hide_controls && !self.settings_open {
+        // Mobile always reserves its bars outside fullscreen. Desktop hover
+        // reveals an overlay; explicit pin/Tab reserves space for chrome.
+        let reserve_controls = if crate::app::is_mobile() {
+            !self.fullscreen
+        } else {
+            !self.hide_controls
+        };
+        if reserve_controls && !self.settings_open {
             screen.min.y = (screen.top() + TOP_BAR_HEIGHT).min(screen.bottom());
             screen.max.y = (screen.bottom() - BOTTOM_CHROME_HEIGHT).max(screen.top());
         }
@@ -253,7 +259,11 @@ impl Viewer {
                     };
                 }
                 let mut base = canvas.shrink(6.);
-                if self.controls_visible && self.hide_controls && !self.settings_open {
+                if !crate::app::is_mobile()
+                    && self.controls_visible
+                    && self.hide_controls
+                    && !self.settings_open
+                {
                     base.min.y += TOP_BAR_HEIGHT;
                 }
                 let mut overlays = vec![Rect::from_min_max(
