@@ -6,10 +6,9 @@ const FILE_COMMANDS: &[&str] = &["trash", "move", "bookmark"];
 
 impl Viewer {
     pub(super) fn update_controls(&mut self, ctx: &egui::Context) {
-        // The library fills narrow windows and phone screens, covering the bars.
-        // On desktop, chrome revealed by hovering an edge would also land above
-        // it and cover its header icons, as with settings.
-        if self.library.open && overlay::compact(ctx) {
+        // Compact overlays fill the window. Edge hover must not bring the
+        // viewer bars back over their header or footer controls.
+        if self.overlay_open() && overlay::compact(ctx) {
             self.controls_visible = false;
             return;
         }

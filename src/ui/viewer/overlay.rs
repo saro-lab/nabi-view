@@ -63,6 +63,11 @@ pub(super) fn show<T>(
             ui.with_layout(crate::ui::direction::vertical(), content)
                 .inner
         });
+    // Hover-revealed viewer bars share Foreground order. Keep the modal above
+    // newly visible bars, also in wide windows too short to leave room for both.
+    if modal.is_top_modal && !modal.any_popup_open {
+        ctx.move_to_top(modal.response.layer_id);
+    }
     // The backdrop keeps its click-to-dismiss behavior; a drag only moves the window.
     if draggable
         && modal

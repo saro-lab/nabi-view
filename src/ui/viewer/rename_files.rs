@@ -214,8 +214,14 @@ impl Viewer {
             );
             // Reserve the bottom controls and warning area before laying out the list.
             let warning_height = if dialog.error.is_empty() { 0. } else { 78. };
+            let status_height = if busy || validating {
+                forms::height() + forms::GAP
+            } else {
+                0.
+            };
             let list_height =
-                (ui.available_height() - 2. * forms::height() - warning_height - 48.).max(36.);
+                (ui.available_height() - forms::height() - warning_height - status_height - 48.)
+                    .max(36.);
             egui::Frame::new()
                 .fill(Color32::from_rgb(13, 15, 17))
                 .stroke(egui::Stroke::new(1., Color32::from_gray(65)))
@@ -238,12 +244,22 @@ impl Viewer {
                                         .file_name()
                                         .unwrap_or_default()
                                         .to_string_lossy();
-                                    ui.add_sized(
-                                        [ui.available_width(), row_height],
-                                        egui::Label::new(name.as_ref())
-                                            .truncate()
-                                            .selectable(false),
+                                    // add_sized centers the label itself even with
+                                    // halign(Min); give each row an explicit LTR layout.
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(ui.available_width(), row_height),
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.set_min_height(row_height);
+                                            ui.add(
+                                                egui::Label::new(name.as_ref())
+                                                    .halign(egui::Align::Min)
+                                                    .truncate()
+                                                    .selectable(false),
+                                            )
+                                        },
                                     )
+                                    .inner
                                     .hover_text(name.as_ref());
                                 }
                             });
@@ -258,36 +274,39 @@ impl Viewer {
                     });
             }
             ui.add_space(6.);
-            ui.horizontal_wrapped(|ui| {
-                if busy || validating {
+            if busy || validating {
+                ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(tr(if busy {
                         "rename-working"
                     } else {
                         "rename-checking"
                     }));
-                } else {
-                    reset = ui
-                        .add_enabled(!dialog.failed, egui::Button::new(tr("reset")))
-                        .clicked();
-                    close |= ui.button(tr("cancel")).clicked();
-                }
-            });
-            submit = ui
-                .add_enabled_ui(
+                });
+            }
+            crate::ui::direction::horizontal(ui, |ui| {
+                let width = (ui.available_width() - 2. * ui.spacing().item_spacing.x) / 3.;
+                let mut button = |enabled, label| {
+                    ui.add_enabled_ui(enabled, |ui| {
+                        ui.add_sized(
+                            [width, forms::height()],
+                            egui::Button::new(tr(label)).truncate(),
+                        )
+                    })
+                    .inner
+                    .hover_text(tr(label))
+                    .clicked()
+                };
+                reset = button(editable, "reset");
+                close |= button(!busy, "cancel");
+                submit = button(
                     editable
                         && dialog.checked.is_some()
                         && dialog.error.is_empty()
                         && dialog.plan.changes() > 0,
-                    |ui| {
-                        ui.add_sized(
-                            [ui.available_width(), forms::height()],
-                            egui::Button::new(tr("rename-commit")),
-                        )
-                    },
-                )
-                .inner
-                .clicked();
+                    "rename-commit",
+                );
+            });
         });
         if (close || modal.should_close()) && !busy {
             ctx.memory_mut(|memory| {

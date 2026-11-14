@@ -40,6 +40,18 @@ fn ready(window: &mut TestWindow) {
 fn type_in(window: &mut TestWindow, id: &str, text: &str) {
     let response = window.ctx.read_response(egui::Id::unique(id)).unwrap();
     window.click(response.rect.center());
+    let modifiers = egui::Modifiers {
+        command: true,
+        mac_cmd: cfg!(target_os = "macos"),
+        ctrl: !cfg!(target_os = "macos"),
+        ..Default::default()
+    };
+    window.draw_events(
+        [true, false]
+            .map(|pressed| key_event(Key::A, pressed, false, modifiers))
+            .into(),
+        modifiers,
+    );
     window.draw_events(vec![Event::Text(text.into())], egui::Modifiers::NONE);
 }
 fn preview(window: &mut TestWindow) {
@@ -86,6 +98,10 @@ fn rename_files_preview_is_read_only_cumulative_and_commits_all_in_list_order() 
     type_in(&mut window, "rename-to", "Album");
     preview(&mut window);
     window.wait_for("Album_0005.png");
+    type_in(&mut window, "rename-from", "Album");
+    type_in(&mut window, "rename-to", "Final");
+    preview(&mut window);
+    window.wait_for("Final_0005.png");
     assert!(before.iter().all(|(name, _)| source.join(name).exists()));
     // Viewer shortcuts must not operate while editing names.
     window.draw(Some(Key::Delete));
@@ -94,11 +110,11 @@ fn rename_files_preview_is_read_only_cumulative_and_commits_all_in_list_order() 
     window.click(window.label_position("Apply changes"));
     window.wait_for("File names changed.");
     window.reveal_controls();
-    window.wait_for("Album_0002.png");
+    window.wait_for("Final_0002.png");
     for (i, (name, bytes)) in before.iter().enumerate() {
         assert!(!source.join(name).exists());
         assert_eq!(
-            &std::fs::read(source.join(format!("Album_{:04}.png", i + 1))).unwrap(),
+            &std::fs::read(source.join(format!("Final_{:04}.png", i + 1))).unwrap(),
             bytes
         );
     }
@@ -110,7 +126,7 @@ fn rename_files_preview_is_read_only_cumulative_and_commits_all_in_list_order() 
         .unwrap();
     assert_eq!(
         bookmark.image.unwrap().file_name().unwrap(),
-        "Album_0004.png"
+        "Final_0004.png"
     );
     // The old checked file remains the checked target after renaming.
     window.draw(Some(Key::M));
@@ -166,6 +182,34 @@ fn rename_files_controls_and_bottom_apply_fit_small_windows() {
                 "{label} outside {size:?}: {p:?}"
             );
         }
+        let buttons =
+            ["Reset", "Cancel", "Apply changes"].map(|label| window.label_position(label));
+        assert!(
+            buttons
+                .windows(2)
+                .all(|pair| (pair[0].y - pair[1].y).abs() < 3. && pair[0].x < pair[1].x),
+            "footer buttons are not on one row at {size:?}: {buttons:?}"
+        );
+        let lefts: Vec<_> = window
+            .paint
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                Shape::Text(text)
+                    if matches!(
+                        text.galley.job.text.as_str(),
+                        "02 Pelagic.png" | "03 Dune Forms.png" | "04 After Dark.png"
+                    ) =>
+                {
+                    Some(text.visual_bounding_rect().left())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lefts.len(), 3);
+        assert!(
+            lefts.windows(2).all(|pair| (pair[0] - pair[1]).abs() < 1.),
+            "names are not left-aligned: {lefts:?}"
+        );
         window.click(window.label_position("Replace"));
         for _ in 0..4 {
             window.draw(None);
@@ -203,4 +247,52 @@ fn rename_files_translated_buttons_fit_compact_windows() {
             );
         }
     }
+}
+
+#[test]
+fn rename_files_edge_hover_does_not_cover_modal_buttons() {
+    let mut window = sample();
+    window.draw(Some(Key::N));
+    ready(&mut window);
+    for size in [
+        egui::vec2(520., 360.),
+        egui::vec2(320., 568.),
+        egui::vec2(780., 360.),
+    ] {
+        window.screen_size = size;
+        for _ in 0..4 {
+            window.draw(None);
+        }
+        for y in [2., size.y - 2.] {
+            window.pointer(size.x / 2., y);
+            for _ in 0..4 {
+                window.draw(None);
+            }
+            for label in ["Use folder name", "Reset", "Cancel", "Apply changes"] {
+                let position = window.label_position(label);
+                assert_eq!(
+                    window.ctx.layer_id_at(position).unwrap().id,
+                    egui::Id::unique("normalize-names-window"),
+                    "{label} covered at {size:?} with hover y={y}"
+                );
+            }
+        }
+        preview(&mut window);
+        window.click(window.label_position("Reset"));
+        ready(&mut window);
+        window.wait_for("01 Alpine Light.png");
+    }
+    window.screen_size = egui::vec2(320., 568.);
+    for _ in 0..4 {
+        window.draw(None);
+    }
+    let back = window
+        .ctx
+        .read_response(egui::Id::unique(("titlebar", "normalize-names-close")))
+        .unwrap();
+    window.click(back.rect.center());
+    assert!(!window.draw(None).0.contains("Preview only."));
+    window.pointer(160., 2.);
+    window.draw(None);
+    assert!(window.titlebar_visible());
 }

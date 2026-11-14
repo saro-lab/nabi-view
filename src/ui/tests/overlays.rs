@@ -443,6 +443,7 @@ fn centered_icon_menu_scrolls_and_executes_without_background_input() {
     window.screen_size = egui::vec2(520., 360.);
     window.reveal_controls();
     window.wait_for("1 / 5");
+    let focused_texture = window.photo_texture();
     window.draw(Some(Key::H));
     window.click(window.titlebar_icon("menu").rect.center());
     for size in [
@@ -534,7 +535,7 @@ fn centered_icon_menu_scrolls_and_executes_without_background_input() {
         )));
     }
     assert!(!saved_viewer_settings(&window).flip_horizontal);
-    assert_eq!(focused_thumbnail_pages(&window), [1]);
+    assert_eq!(window.photo_texture(), focused_texture);
     let first_y = open.top();
     window.pointer(menu.center().x, menu.center().y);
     window.draw_events(
@@ -563,8 +564,8 @@ fn centered_icon_menu_scrolls_and_executes_without_background_input() {
         "Wheel did not scroll the icon grid"
     );
     assert_eq!(
-        focused_thumbnail_pages(&window),
-        [1],
+        window.photo_texture(),
+        focused_texture,
         "Menu wheel navigated the image"
     );
     let fullscreen = window
@@ -708,7 +709,12 @@ fn centered_icon_menu_applies_view_mode_and_dismisses_with_close_or_backdrop() {
             window.draw(None);
         }
         let position = if close_button {
-            window.titlebar_icon("menu-close").rect.center()
+            window
+                .ctx
+                .read_response(egui::Id::unique(("titlebar", "menu-close")))
+                .unwrap()
+                .rect
+                .center()
         } else {
             egui::pos2(24., 180.)
         };
@@ -717,6 +723,8 @@ fn centered_icon_menu_applies_view_mode_and_dismisses_with_close_or_backdrop() {
             !window.draw(None).0.contains("Open image"),
             "Dismiss failed (close_button={close_button})"
         );
+        // Compact menus hide the viewer bars; settle their fade-in on return.
+        window.reveal_controls();
         assert_eq!(focused_thumbnail_pages(&window), [1]);
         assert!(
             !window
