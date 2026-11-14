@@ -33,14 +33,22 @@ const GENERAL_SECTION: usize = 0;
 /// OS file associations, which phones manage outside the app.
 const CONNECTIONS_SECTION: usize = 1;
 const CACHE_SECTION: usize = 2;
-/// Phones have touch gestures instead of a mouse.
-const MOUSE_SECTION: usize = 3;
+/// The same position shows mouse controls on desktop and touch controls on mobile.
+const INPUT_SECTION: usize = 3;
 const SHORTCUTS_SECTION: usize = 4;
 const DATA_SECTION: usize = 5;
 pub(super) const ABOUT_SECTION: usize = 6;
 
 fn hidden_on_mobile(section: usize) -> bool {
-    matches!(section, CONNECTIONS_SECTION | MOUSE_SECTION)
+    section == CONNECTIONS_SECTION
+}
+
+fn section_title(section: usize, mobile: bool) -> &'static str {
+    if mobile && section == INPUT_SECTION {
+        "touch"
+    } else {
+        SECTIONS[section].0
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,7 +126,11 @@ impl Viewer {
                         if compact {
                             egui::ComboBox::from_id_salt("mobile-settings-category")
                                 .width(ui.available_width())
-                                .selected_text(tr(SECTIONS[section].0))
+                                .height(
+                                    (forms::height() + ui.spacing().item_spacing.y)
+                                        * SECTIONS.len() as f32,
+                                )
+                                .selected_text(tr(section_title(section, mobile)))
                                 .show_ui(ui, |ui| {
                                     for index in 0..SECTIONS.len() {
                                         if mobile && hidden_on_mobile(index) {
@@ -127,7 +139,7 @@ impl Viewer {
                                         ui.selectable_value(
                                             &mut section,
                                             index,
-                                            tr(SECTIONS[index].0),
+                                            tr(section_title(index, mobile)),
                                         );
                                     }
                                 });
@@ -173,16 +185,13 @@ impl Viewer {
                                 .scroll_source(scroll_source(crate::app::is_mobile()))
                                 .auto_shrink([false, false])
                                 .show(&mut sidebar_ui, |ui| {
-                                    for (index, &(title, _)) in SECTIONS.iter().enumerate() {
+                                    for index in 0..SECTIONS.len() {
                                         if mobile && hidden_on_mobile(index) {
                                             continue;
                                         }
                                         let selected = section == index;
-                                        let label = RichText::new(tr(title)).color(if selected {
-                                            ACCENT
-                                        } else {
-                                            MUTED
-                                        });
+                                        let label = RichText::new(tr(section_title(index, mobile)))
+                                            .color(if selected { ACCENT } else { MUTED });
                                         if ui
                                             .add_sized(
                                                 [ui.available_width(), forms::height().max(38.)],
@@ -223,7 +232,8 @@ impl Viewer {
                                         GENERAL_SECTION => self.general_settings(ui, ctx),
                                         CONNECTIONS_SECTION => self.connection_settings(ui),
                                         CACHE_SECTION => self.cache_settings(ui, ctx),
-                                        MOUSE_SECTION => self.mouse_settings(ui),
+                                        INPUT_SECTION if mobile => self.touch_settings(ui),
+                                        INPUT_SECTION => self.mouse_settings(ui),
                                         SHORTCUTS_SECTION => self.shortcut_settings(ui),
                                         DATA_SECTION => self.data_settings(ui, ctx),
                                         _ => {}
@@ -493,6 +503,7 @@ impl Viewer {
                             )
                             .clicked()
                         {
+                            self.check_navigation = None;
                             self.settings.spread = spread;
                             self.settings.rtl = rtl;
                         }
@@ -778,8 +789,8 @@ impl Viewer {
                 .map(|command| (command.0, tr(command_label(command.0)).to_owned())),
         );
         let mouse = &mut self.settings.mouse;
-        mouse_row(ui, tr("mouse-wheel"), "wheel", &mut mouse.wheel, &wheel);
-        mouse_row(
+        gesture_row(ui, tr("mouse-wheel"), "wheel", &mut mouse.wheel, &wheel);
+        gesture_row(
             ui,
             &modified("modified-mouse-wheel"),
             "primary-wheel",
@@ -801,10 +812,10 @@ impl Viewer {
                 &mut mouse.forward_button,
             ),
         ] {
-            mouse_row(ui, tr(label), salt, value, &click);
+            gesture_row(ui, tr(label), salt, value, &click);
         }
-        mouse_row(ui, tr("mouse-drag"), "drag", &mut mouse.drag, &drag);
-        mouse_row(
+        gesture_row(ui, tr("mouse-drag"), "drag", &mut mouse.drag, &drag);
+        gesture_row(
             ui,
             &modified("modified-mouse-drag"),
             "primary-drag",
@@ -823,6 +834,55 @@ impl Viewer {
         }
         if before != self.settings.mouse {
             self.canvas_drag = None;
+            self.save();
+        }
+    }
+
+    fn touch_settings(&mut self, ui: &mut egui::Ui) {
+        let before = self.settings.touch.clone();
+        settings_hint(ui, "touch-gestures-help");
+        ui.add_space(10.);
+        let touch = &mut self.settings.touch;
+        for (label, value) in [
+            ("swipe-navigation", &mut touch.swipe_navigation),
+            ("pinch-zoom", &mut touch.pinch_zoom),
+            ("one-finger-pan", &mut touch.one_finger_pan),
+            ("two-finger-pan", &mut touch.two_finger_pan),
+        ] {
+            settings_row(ui, tr(label), 32., |ui| {
+                ui.checkbox(value, "").on_hover_text(tr(label));
+            });
+        }
+        let mut actions = vec![
+            (limits::CLICK_MENU, tr("open-menu").to_owned()),
+            (limits::MOUSE_NONE, tr("no-action").to_owned()),
+        ];
+        actions.extend(
+            COMMANDS
+                .iter()
+                .filter(|command| command_supported(command.0))
+                .map(|command| (command.0, tr(command_label(command.0)).to_owned())),
+        );
+        for (label, value) in [
+            ("double-tap", &mut touch.double_tap),
+            ("long-press", &mut touch.long_press),
+        ] {
+            gesture_row(ui, tr(label), label, value, &actions);
+        }
+        ui.add_space(10.);
+        settings_hint(ui, "fullscreen-tap-exits");
+        ui.add_space(10.);
+        if ui
+            .push_id("touch-defaults", |ui| {
+                forms::button(ui, tr("restore-default"))
+            })
+            .inner
+            .clicked()
+        {
+            self.settings.touch = Default::default();
+        }
+        if before != self.settings.touch {
+            self.touch_gesture.cancel();
             self.save();
         }
     }
@@ -1340,7 +1400,7 @@ pub(super) fn settings_row(
 }
 
 /// One gesture row; an unknown stored value still shows as its raw ID.
-fn mouse_row(
+fn gesture_row(
     ui: &mut egui::Ui,
     label: &str,
     salt: &str,
@@ -1352,7 +1412,7 @@ fn mouse_row(
             .iter()
             .find(|option| option.0 == value.as_str())
             .map_or_else(|| value.clone(), |option| option.1.clone());
-        egui::ComboBox::from_id_salt(("mouse", salt))
+        egui::ComboBox::from_id_salt(("gesture", salt))
             .width(ui.available_width().min(250.))
             .truncate()
             .selected_text(selected)

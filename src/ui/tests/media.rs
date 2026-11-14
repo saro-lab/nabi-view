@@ -1,6 +1,112 @@
 use super::*;
 
 #[test]
+fn gif_reuses_texture_and_preserves_frames_across_fullscreen_resize() {
+    let folder = tempfile::tempdir().unwrap();
+    let path = folder.path().join("animated-alpha.gif");
+    let colors = [Color32::RED, Color32::GREEN, Color32::BLUE, Color32::YELLOW];
+    let expected: Vec<Vec<Color32>> = colors
+        .iter()
+        .map(|&color| {
+            (0..48 * 32)
+                .map(|pixel| {
+                    if pixel % 48 < 8 {
+                        Color32::TRANSPARENT
+                    } else {
+                        color
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    {
+        let mut encoder =
+            image::codecs::gif::GifEncoder::new(std::fs::File::create(&path).unwrap());
+        for color in colors {
+            let image = image::RgbaImage::from_fn(48, 32, |x, _| {
+                image::Rgba(if x < 8 { [0; 4] } else { color.to_array() })
+            });
+            encoder
+                .encode_frame(image::Frame::from_parts(
+                    image,
+                    0,
+                    0,
+                    image::Delay::from_numer_denom_ms(40, 1),
+                ))
+                .unwrap();
+        }
+    }
+    let original = std::fs::read(&path).unwrap();
+    let mut window = TestWindow::open(Some(path.clone()));
+    let mut texture = None;
+    let mut previous = None;
+    let mut changes = 0;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for stage in 0..3 {
+        window.screen_size = if stage == 1 {
+            egui::vec2(1920., 1080.)
+        } else {
+            egui::vec2(900., 600.)
+        };
+        let until = changes + 3;
+        let mut first_pass = true;
+        while changes < until {
+            let key = (stage > 0 && first_pass).then_some(Key::F);
+            let (text, drawn) = window.draw(key);
+            if key.is_some() {
+                assert!(
+                    window
+                        .viewport_commands
+                        .contains(&egui::ViewportCommand::Fullscreen(stage == 1))
+                );
+            }
+            first_pass = false;
+            assert!(!text.contains("ERROR"), "{text}");
+            if drawn {
+                let photo = window.photo_texture();
+                if let Some(texture) = texture {
+                    assert_eq!(photo, texture, "Resizing must preserve the playing texture");
+                }
+                for (_, delta) in window.texture_updates.iter().filter(|(id, _)| *id == photo) {
+                    let egui::ImageData::Color(image) = &delta.image;
+                    assert_eq!(image.size, [48, 32]);
+                    let index = expected
+                        .iter()
+                        .position(|pixels| *pixels == image.pixels)
+                        .expect(
+                            "Composited frame pixels and transparent columns must be preserved",
+                        );
+                    if texture.is_none() {
+                        assert_eq!(delta.pos, None, "The first frame allocates the texture");
+                        assert_eq!(index, 0);
+                        texture = Some(photo);
+                    } else {
+                        assert_eq!(
+                            delta.pos,
+                            Some([0, 0]),
+                            "Later frames must update the existing GPU texture"
+                        );
+                    }
+                    if let Some(previous) = previous
+                        && previous != index
+                    {
+                        assert_eq!(index, (previous + 1) % expected.len());
+                        changes += 1;
+                    }
+                    previous = Some(index);
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Animation stalled at stage {stage}: {text}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert_eq!(std::fs::read(path).unwrap(), original);
+}
+
+#[test]
 #[ignore = "Set NABI_TEST_GIF to the user-supplied local GIF"]
 fn supplied_gif_plays_in_viewer() {
     let source =

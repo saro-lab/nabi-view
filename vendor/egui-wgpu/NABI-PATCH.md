@@ -29,3 +29,17 @@ gamma-premultiplied Color32 representation. Native float pixel ownership, bounde
 display-specific tone mapping, and SDR fallback remain application code.
 
 Validation and technical investigation records are kept in private ai records.
+
+On macOS, defer surface reconfiguration for window-size and resize-state changes
+until the next paint. AppKit can report several such events together; the paint
+applies their final size and presentation mode once, avoiding redundant GPU-idle
+waits. Keep transaction presentation and the extra drawable during live resize.
+Other platforms retain the upstream immediate size-reconfiguration path.
+
+Use the owning viewport's weak Window reference to check AppKit inLiveResize
+before enabling the macOS resize workaround. Programmatic fullscreen resizing
+does not switch the Metal drawable count or transaction presentation. Preserve
+the reference on surface recovery; unsafe window handles and unavailable or
+off-main-thread queries retain the caller's resize heuristic. End notifications
+always clear the workaround. See Apple's [inLiveResize](https://developer.apple.com/documentation/appkit/nswindow/inliveresize)
+and [presentsWithTransaction](https://developer.apple.com/documentation/quartzcore/cametallayer/presentswithtransaction).

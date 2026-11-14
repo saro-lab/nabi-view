@@ -171,12 +171,13 @@ impl Viewer {
 
     /// A dialog that takes keyboard and pointer input from the viewer.
     pub(super) fn dialog_open(&self) -> bool {
-        self.move_dialog.is_some() || self.archives.prompt.is_some()
+        self.move_dialog.is_some() || self.rename_dialog.is_some() || self.archives.prompt.is_some()
     }
 
     /// Moving, deleting and restoring files does not apply inside an archive.
     pub(super) fn blocked_in_archive(&mut self, ctx: &egui::Context, id: &str) -> bool {
-        let blocked = matches!(id, "move" | "trash" | "undo-trash") && self.in_archive();
+        let blocked =
+            matches!(id, "move" | "normalize-names" | "trash" | "undo-trash") && self.in_archive();
         if blocked {
             self.show_toast(ctx, tr("not-available-in-archives"));
         }

@@ -12,6 +12,8 @@ use std::sync::Arc;
 
 struct SurfaceState {
     surface: wgpu::Surface<'static>,
+    #[cfg(target_os = "macos")]
+    window: Option<std::sync::Weak<winit::window::Window>>,
     alpha_mode: wgpu::CompositeAlphaMode,
     width: u32,
     height: u32,
@@ -177,6 +179,10 @@ impl Painter {
             old_state.height,
             old_state.resizing,
         );
+        #[cfg(target_os = "macos")]
+        if let Some(state) = self.surfaces.get_mut(&viewport_id) {
+            state.window = old_state.window;
+        }
         Ok(())
     }
 
@@ -213,6 +219,10 @@ impl Painter {
             if !self.surfaces.contains_key(&viewport_id) {
                 let surface = self.instance.create_surface(Arc::clone(&window))?;
                 self.add_surface(surface, viewport_id, size).await?;
+                #[cfg(target_os = "macos")]
+                if let Some(state) = self.surfaces.get_mut(&viewport_id) {
+                    state.window = Some(Arc::downgrade(&window));
+                }
                 if let Some(state) = &self.render_state {
                     *state.native_window.write() = Some(Arc::downgrade(&window));
                 }
@@ -310,6 +320,10 @@ impl Painter {
             viewport_id,
             SurfaceState {
                 surface,
+                // The safe set_window path fills this after installation. The
+                // unsafe path keeps the caller's existing resize notifications.
+                #[cfg(target_os = "macos")]
+                window: None,
                 width,
                 height,
                 alpha_mode,
@@ -357,6 +371,14 @@ impl Painter {
         surface_state.width = width;
         surface_state.height = height;
 
+        // AppKit can deliver several resize/state changes before the next paint.
+        // Configure once at that paint, using the final size and presentation mode,
+        // instead of repeatedly waiting for the GPU between native window events.
+        #[cfg(target_os = "macos")]
+        {
+            surface_state.needs_reconfigure = true;
+        }
+        #[cfg(not(target_os = "macos"))]
         Self::configure_surface(surface_state, render_state, &self.config.surface);
 
         if let Some(depth_format) = self.options.depth_stencil_format {
@@ -421,6 +443,16 @@ impl Painter {
         let Some(state) = self.surfaces.get_mut(&viewport_id) else {
             return;
         };
+        #[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+        let resizing = resizing
+            && state
+                .window
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .and_then(|window| crate::native_hdr::in_live_resize(&window))
+                // Unsafe handles and unavailable AppKit queries retain the
+                // caller's heuristic; an end notification always clears it.
+                .unwrap_or(true);
         if state.resizing == resizing {
             if resizing {
                 log::debug!(
@@ -434,7 +466,7 @@ impl Painter {
             return;
         }
 
-        // Set before reconfiguring so macOS live resize uses the temporary latency bump above.
+        // The next configuration uses the current macOS live-resize latency above.
         state.resizing = resizing;
 
         // Resizing is a bit tricky on macOS.
@@ -448,16 +480,15 @@ impl Painter {
             // SAFETY: `as_hal::<Metal>()` returns `None` unless this surface is backed by wgpu's
             // Metal backend.
             unsafe {
-                if let (Some(render_state), Some(hal_surface)) = (
-                    self.render_state.as_ref(),
-                    state.surface.as_hal::<wgpu::hal::api::Metal>(),
-                ) {
+                if let Some(hal_surface) = state.surface.as_hal::<wgpu::hal::api::Metal>() {
                     hal_surface
                         .render_layer()
                         .lock()
                         .setPresentsWithTransaction(resizing);
 
-                    Self::configure_surface(state, render_state, &self.config.surface);
+                    // A following resize supplies the new dimensions. Reconfiguring
+                    // here would first configure the old size and wait for GPU idle.
+                    state.needs_reconfigure = true;
                 }
             }
         }

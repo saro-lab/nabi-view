@@ -33,7 +33,6 @@ fn move_dialog_moves_checked_images_with_arrow_selection_and_enter() {
     store(&window).record_move(&destination_path, 10).unwrap();
     let source = window._images.as_ref().unwrap().path().to_owned();
     shift_navigation(&mut window, Key::ArrowRight);
-    window.draw(Some(Key::Space));
     window.draw(Some(Key::ArrowRight));
     window.wait_for("3 / 5");
     window.draw(Some(Key::M));
@@ -126,7 +125,7 @@ fn move_history_rows_delete_independently_and_clear_from_cache_settings() {
     window.click(window.titlebar_icon("settings").rect.center());
     window.wait_for("Settings");
     window.click(window.label_position("Cache"));
-    window.wait_for("Maximum recent move destinations");
+    window.wait_for("Maximum number of recent move destinations");
     let response = window
         .ctx
         .read_response(egui::Id::unique(("titlebar", "move-history-clear")))

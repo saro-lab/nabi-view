@@ -138,6 +138,9 @@ pub fn run_desktop() -> eframe::Result {
             )
             .with_app_id("dev.nabi.NabiView")
             .with_decorations(preview)
+            // macOS shadows are independent of decorations and also persist
+            // when our fullscreen bridge expands the existing window.
+            .with_has_shadow(preview)
             .with_inner_size(window_size)
             .with_min_inner_size(if preview {
                 [320., 480.]
@@ -154,6 +157,14 @@ pub fn run_desktop() -> eframe::Result {
         "NABI VIEW",
         options,
         Box::new(move |cc| {
+            #[cfg(target_os = "windows")]
+            if !preview && let Some(window) = cc.winit_window() {
+                use winit::platform::windows::WindowExtWindows as _;
+                // egui-winit enables this for undecorated windows. Winit reserves
+                // a 1px top edge for it, including after a fullscreen toggle.
+                // The root window is still hidden until the first painted frame.
+                window.set_undecorated_shadow(false);
+            }
             #[cfg(target_os = "macos")]
             mac_open::set_context(cc.egui_ctx.clone());
             #[cfg(target_os = "macos")]

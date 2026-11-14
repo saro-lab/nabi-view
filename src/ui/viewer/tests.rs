@@ -277,7 +277,7 @@ fn adaptive_spreads_follow_monitor_aspect_and_never_skip_pages() {
     // All possible standalone combinations in a seven-page folder.
     for mask in 0u32..128 {
         for cover in [false, true] {
-            let span = |i| adaptive_focus_span(i, 7, true, cover, |j| mask & (1 << j) != 0);
+            let span = |i| adaptive_focus_span(i, 7, true, cover, false, |j| mask & (1 << j) != 0);
             let mut i = 0;
             let mut visited = Vec::new();
             let mut groups = Vec::new();
@@ -608,6 +608,89 @@ fn slideshow_obeys_interval_pause_and_stop() {
     assert_eq!(app.focus_index, 2);
 }
 use super::*;
+
+#[test]
+fn retained_pages_and_detail_tiles_recenter_when_the_canvas_grows() {
+    let ctx = egui::Context::default();
+    let handle = ctx.load_texture(
+        "retained-center-test",
+        egui::ColorImage::filled([4, 4], Color32::WHITE),
+        egui::TextureOptions::LINEAR,
+    );
+    let canvas = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1080., 760.));
+    let enlarged = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1080., 1400.));
+    let pan = egui::vec2(64., -30.);
+    for pages in [1, 2] {
+        let width = canvas.width() / pages as f32;
+        let mut presentation = Presentation {
+            canvas: Some(canvas),
+            pan,
+            ..Default::default()
+        };
+        for page in 0..pages {
+            let slot = Rect::from_min_size(
+                egui::pos2(width * page as f32, 0.),
+                egui::vec2(width, canvas.height()),
+            );
+            let shown = egui::vec2(900. / pages as f32, 1180.);
+            let x = if pages == 1 {
+                slot.center().x
+            } else if page == 0 {
+                slot.right() - shown.x / 2.
+            } else {
+                slot.left() + shown.x / 2.
+            };
+            let rect = Rect::from_center_size(egui::pos2(x, slot.center().y) + pan, shown);
+            for layer in [
+                rect,
+                Rect::from_center_size(rect.center(), egui::vec2(80., 80.)),
+            ] {
+                presentation.images.push(PresentedImage {
+                    hdr: None,
+                    handle: handle.clone(),
+                    rect: layer,
+                    clip: slot,
+                    backdrop: rect,
+                });
+            }
+        }
+        let draw = |presentation: &mut Presentation, canvas| {
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
+                ctx.root_ui(|ui| {
+                    presentation.paint(
+                        ui,
+                        canvas,
+                        Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1., 1.)),
+                        Color32::BLACK,
+                        false,
+                    );
+                });
+            })
+            .shapes
+            .into_iter()
+            .filter_map(|shape| match shape.shape {
+                egui::Shape::Mesh(mesh) => Some(mesh.calc_bounds()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+        };
+        let original = draw(&mut presentation, canvas);
+        assert_eq!(presentation.pan, pan);
+        let centered = draw(&mut presentation, enlarged);
+        assert_eq!(centered.len(), pages * 2);
+        assert_eq!(presentation.pan, Vec2::ZERO);
+        for (before, after) in original.iter().zip(&centered) {
+            assert_eq!(
+                *after,
+                before.translate(enlarged.center() - canvas.center() - pan)
+            );
+        }
+        let restored = draw(&mut presentation, canvas);
+        for (before, after) in original.iter().zip(&restored) {
+            assert_eq!(*after, before.translate(-pan));
+        }
+    }
+}
 
 #[test]
 fn pending_navigation_keeps_the_last_painted_texture_and_geometry() {

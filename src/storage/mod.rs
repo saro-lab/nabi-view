@@ -473,6 +473,67 @@ impl Store {
         Ok(())
     }
 
+    /// Update recent/bookmark pages from one snapshot so name exchanges do not
+    /// apply the mapping twice. Folder identity and bookmark titles stay intact.
+    pub(crate) fn rename_library_images(
+        &self,
+        renamed: &[(PathBuf, PathBuf)],
+    ) -> Result<(), String> {
+        if renamed.is_empty() || !self.database.try_exists().map_err(|e| e.to_string())? {
+            return Ok(());
+        }
+        let mut folders = std::collections::HashMap::new();
+        let mut mapping = std::collections::HashMap::new();
+        for (source, target) in renamed {
+            let (Some(parent), Some(name), Some(new_name)) =
+                (source.parent(), source.file_name(), target.file_name())
+            else {
+                continue;
+            };
+            if Some(parent) != target.parent() {
+                continue;
+            }
+            let folder = match folders.entry(parent.to_owned()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(encode_path(&canonical_library_folder(parent)?))
+                }
+            };
+            mapping.insert(
+                (folder.clone(), encode_path(Path::new(name))),
+                encode_path(Path::new(new_name)),
+            );
+        }
+        let mut connection = self.connection()?;
+        let tx = connection.transaction().map_err(|e| e.to_string())?;
+        let rows = {
+            let mut statement = tx
+                .prepare("SELECT kind, path, image FROM library WHERE image IS NOT NULL")
+                .map_err(|e| e.to_string())?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        for (kind, folder, image) in rows {
+            if let Some(target) = mapping.get(&(folder.clone(), image)) {
+                tx.execute(
+                    "UPDATE library SET image = ?3 WHERE kind = ?1 AND path = ?2",
+                    params![kind, folder, target],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
     /// Bookmarks the folder of `image`, with that image as its thumbnail, and
     /// returns the stored image path. A bookmarked folder is updated in place.
     pub fn add_bookmark(&self, image: &Path, name: &str) -> Result<PathBuf, String> {

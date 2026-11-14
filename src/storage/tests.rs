@@ -1444,6 +1444,110 @@ fn mouse_gestures_round_trip_and_merge_across_windows() {
 }
 
 #[test]
+fn touch_gestures_default_for_old_files_and_repair_only_invalid_actions() {
+    use crate::core::settings::TouchSettings;
+    let defaults = TouchSettings::default();
+    assert!(defaults.swipe_navigation && defaults.pinch_zoom);
+    assert!(defaults.one_finger_pan && defaults.two_finger_pan);
+    assert_eq!(defaults.double_tap, "fit");
+    assert_eq!(defaults.long_press, "menu");
+
+    let root = tempfile::tempdir().unwrap();
+    let store = isolated(root.path());
+    let file = root.path().join("old-settings.json");
+    let mut old = serde_json::to_value(Settings::default()).unwrap();
+    old.as_object_mut().unwrap().remove("touch");
+    old["mouse"]["double_click"] = serde_json::json!("recent");
+    std::fs::write(&file, serde_json::to_vec(&old).unwrap()).unwrap();
+    let imported = store.import(&file).unwrap();
+    assert_eq!(imported.touch, defaults);
+    assert_eq!(imported.mouse.double_click, "recent");
+
+    // Partial files retain disabled gestures and the other valid action.
+    old["touch"] = serde_json::json!({
+        "swipe_navigation": false,
+        "one_finger_pan": false,
+        "double_tap": "share",
+        "long_press": "no-such-command"
+    });
+    std::fs::write(&file, serde_json::to_vec(&old).unwrap()).unwrap();
+    let imported = store.import(&file).unwrap();
+    assert_eq!(
+        imported.touch,
+        TouchSettings {
+            swipe_navigation: false,
+            one_finger_pan: false,
+            double_tap: "share".into(),
+            ..defaults.clone()
+        }
+    );
+
+    for action in ["bogus", "new-window", "move", "chrome"] {
+        let mut invalid = imported.clone();
+        invalid.touch.double_tap = action.into();
+        assert!(invalid.validate().is_err());
+        invalid.normalize();
+        invalid.validate().unwrap();
+        assert_eq!(invalid.touch.double_tap, defaults.double_tap);
+        assert!(!invalid.touch.swipe_navigation && !invalid.touch.one_finger_pan);
+    }
+    for action in ["none", "menu", "fit", "fullscreen", "share", "orientation"] {
+        let mut valid = imported.clone();
+        valid.touch.double_tap = action.into();
+        valid.touch.long_press = action.into();
+        valid.validate().unwrap();
+    }
+}
+
+#[test]
+fn touch_and_mouse_gestures_save_merge_export_and_reset_independently() {
+    use crate::core::settings::{MouseSettings, TouchSettings};
+    let root = tempfile::tempdir().unwrap();
+    let desktop = isolated(root.path());
+    let mobile = isolated(root.path());
+    let mut mouse_edit = desktop.load().unwrap();
+    let mut touch_edit = mobile.load().unwrap();
+    mouse_edit.mouse.double_click = "recent".into();
+    mouse_edit.mouse.wheel = "page".into();
+    touch_edit.touch = TouchSettings {
+        swipe_navigation: false,
+        pinch_zoom: false,
+        one_finger_pan: false,
+        two_finger_pan: false,
+        double_tap: "none".into(),
+        long_press: "share".into(),
+    };
+    desktop.save(&mouse_edit).unwrap();
+    mobile.save(&touch_edit).unwrap();
+    let merged = desktop.load().unwrap();
+    assert_eq!(merged.mouse, mouse_edit.mouse);
+    assert_eq!(merged.touch, touch_edit.touch);
+
+    let exported = root.path().join("export.json");
+    desktop.export(&exported, &merged).unwrap();
+    assert_eq!(desktop.import(&exported).unwrap(), merged);
+    let mut touch_reset = merged.clone();
+    touch_reset.touch = TouchSettings::default();
+    desktop.save(&touch_reset).unwrap();
+    assert_eq!(mobile.load().unwrap().touch, TouchSettings::default());
+    assert_eq!(mobile.load().unwrap().mouse, mouse_edit.mouse);
+
+    // Editing the touch group after a concurrent mouse reset keeps both changes.
+    let mut mouse_reset = mobile.load().unwrap();
+    let mut next_touch = desktop.load().unwrap();
+    mouse_reset.mouse = MouseSettings::default();
+    next_touch.touch.long_press = "none".into();
+    mobile.save(&mouse_reset).unwrap();
+    desktop.save(&next_touch).unwrap();
+    let merged = mobile.load().unwrap();
+    assert_eq!(merged.mouse, MouseSettings::default());
+    assert_eq!(merged.touch.long_press, "none");
+
+    desktop.replace_from_import(&Settings::default()).unwrap();
+    assert_eq!(desktop.load().unwrap(), Settings::default());
+}
+
+#[test]
 fn new_display_preferences_round_trip_default_old_files_and_merge_independently() {
     let root = tempfile::tempdir().unwrap();
     let first = isolated(root.path());
@@ -1584,4 +1688,98 @@ fn saved_mobile_source_history_and_bookmark_survive_released_import_pixels() {
             .title(),
         "Saved page"
     );
+}
+
+#[test]
+fn single_step_defaults_upgrade_free_keys_and_preserve_custom_or_deleted_assignments() {
+    let defaults = crate::core::commands::default_shortcut_rows();
+    let old: Vec<_> = defaults
+        .iter()
+        .filter(|row| !matches!(row.action.as_str(), "page-prev" | "page-next"))
+        .cloned()
+        .collect();
+    let mut json = serde_json::to_value(Settings {
+        keyboard_shortcuts: Some(old.clone()),
+        ..Default::default()
+    })
+    .unwrap();
+    json.as_object_mut()
+        .unwrap()
+        .remove("single_step_shortcuts_migrated");
+    let mut settings: Settings = serde_json::from_value(json).unwrap();
+    settings.normalize();
+    assert_eq!(settings.keyboard_shortcuts, Some(defaults));
+    settings.validate().unwrap();
+    settings.keyboard_shortcuts = Some(old);
+    let mut reloaded: Settings =
+        serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+    reloaded.normalize();
+    assert_eq!(reloaded.keyboard_shortcuts, settings.keyboard_shortcuts);
+
+    let row = |action: &str, key: &str| KeyboardShortcut {
+        action: action.into(),
+        key: key.into(),
+    };
+    for rows in [
+        vec![],
+        vec![row("metadata", "Alt+D")],
+        vec![row("page-next", "J")],
+    ] {
+        let mut settings = Settings {
+            keyboard_shortcuts: Some(rows.clone()),
+            single_step_shortcuts_migrated: false,
+            ..Default::default()
+        };
+        settings.normalize();
+        settings.validate().unwrap();
+        let upgraded = settings.keyboard_shortcuts.as_ref().unwrap();
+        for existing in &rows {
+            assert!(upgraded.contains(existing));
+        }
+        if rows.is_empty() {
+            assert!(upgraded.is_empty());
+        } else if rows[0].action == "metadata" {
+            assert!(!upgraded.contains(&row("page-next", "Alt+D")));
+            assert!(upgraded.contains(&row("page-next", "Alt+Right")));
+        } else {
+            assert!(!upgraded.contains(&row("page-next", "Alt+D")));
+            assert!(!upgraded.contains(&row("page-next", "Alt+Right")));
+        }
+    }
+}
+
+#[test]
+fn renamed_library_pages_follow_name_exchanges_once_and_keep_bookmark_title() {
+    let root = tempfile::tempdir_in(crate::test_support::root()).unwrap();
+    let folder = root.path().join("album");
+    std::fs::create_dir(&folder).unwrap();
+    let first = folder.join("one.png");
+    let second = folder.join("two.png");
+    std::fs::write(&first, b"one").unwrap();
+    std::fs::write(&second, b"two").unwrap();
+    let store = Store::in_directories(root.path().join("config"), root.path().join("state"));
+    store.record_folder(&folder, 10).unwrap();
+    store.remember_page(&first).unwrap();
+    store.add_bookmark(&second, "My album").unwrap();
+    store
+        .rename_library_images(&[(first.clone(), second.clone()), (second, first)])
+        .unwrap();
+    let entries = store.library().unwrap();
+    let recent = entries
+        .iter()
+        .find(|entry| entry.kind == Kind::Recent)
+        .unwrap();
+    let bookmark = entries
+        .iter()
+        .find(|entry| entry.kind == Kind::Bookmark)
+        .unwrap();
+    assert_eq!(
+        recent.image.as_ref().unwrap().file_name().unwrap(),
+        "two.png"
+    );
+    assert_eq!(
+        bookmark.image.as_ref().unwrap().file_name().unwrap(),
+        "one.png"
+    );
+    assert_eq!(bookmark.title(), "My album");
 }

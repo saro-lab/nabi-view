@@ -171,7 +171,7 @@ pub(super) fn paint(
                 stroke,
             ));
         }
-        "rename" => {
+        "rename" | "normalize-names" => {
             painter.add(egui::Shape::closed_line(
                 vec![
                     point(-8., 8.),

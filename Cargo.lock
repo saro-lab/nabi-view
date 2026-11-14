@@ -2160,6 +2160,7 @@ dependencies = [
  "wgpu",
  "windows",
  "windows-core",
+ "winit",
  "zbus",
  "zip",
 ]

@@ -651,7 +651,8 @@ impl Viewer {
             self.focus_navigation(ctx, focus_index);
         }
         if let Some(path) = wanted {
-            if !self.memory_policy.background_allowed() || self.details.pending() {
+            if !self.memory_policy.background_allowed() || self.details.pending() || self.renaming()
+            {
                 return;
             }
             if self.thumb_ticket.as_ref().is_none_or(|(_, p)| p != &path) {

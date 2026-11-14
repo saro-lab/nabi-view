@@ -20,6 +20,7 @@ mod mobile_sources;
 mod move_files;
 mod navigation;
 mod overlay;
+mod rename_files;
 mod settings;
 mod sorting;
 mod toasts;
@@ -117,11 +118,12 @@ struct PresentedImage {
 struct Presentation {
     images: Vec<PresentedImage>,
     canvas: Option<Rect>,
+    pan: Vec2,
 }
 
 impl Presentation {
     fn paint(
-        &self,
+        &mut self,
         ui: &egui::Ui,
         canvas: Rect,
         image_uv: Rect,
@@ -131,6 +133,21 @@ impl Presentation {
         let Some(previous) = self.canvas else { return };
         let transform = egui::emath::RectTransform::from_to(previous, canvas);
         let scale = (canvas.width() / previous.width()).min(canvas.height() / previous.height());
+        if self.pan != Vec2::ZERO
+            && self.images.iter().all(|image| {
+                let slot = transform.transform_rect(image.clip).size();
+                let shown = image.backdrop.size() * scale;
+                shown.x <= slot.x + 0.001 && shown.y <= slot.y + 0.001
+            })
+        {
+            // Loading the next page must not leave a now-fitted retained image
+            // off-center after a resize. Discard the offset permanently.
+            for image in &mut self.images {
+                image.rect = image.rect.translate(-self.pan);
+                image.backdrop = image.backdrop.translate(-self.pan);
+            }
+            self.pan = Vec2::ZERO;
+        }
         for image in &self.images {
             let clip = if previous == canvas {
                 image.clip
@@ -210,7 +227,10 @@ pub struct Viewer {
     // Current page anchoring the focused spread. This is navigation state,
     // independent of widget/keyboard focus and checked selection.
     focus_index: usize,
+    // Window-local pairing alignment selected by one-page navigation.
+    spread_shifted: bool,
     checked: HashSet<PathBuf>,
+    check_navigation: Option<checked_files::CheckNavigation>,
     random_prompt: bool,
     trash_history: Vec<Vec<crate::platform::trash::TrashEntry>>,
     file_job: Option<checked_files::FileJob>,
@@ -237,7 +257,7 @@ pub struct Viewer {
     span_cache: std::cell::RefCell<Option<SpanCache>>,
     presentation: Presentation,
     transition_waiting: bool,
-    pending_steps: Vec<(bool, bool)>,
+    pending_steps: Vec<(bool, NavigationStep)>,
     thumb_ticket: Option<(u64, PathBuf)>,
     thumbs: HashMap<PathBuf, egui::TextureHandle>,
     app_icon: egui::TextureHandle,
@@ -251,6 +271,7 @@ pub struct Viewer {
     archives: archive::Archives,
     recent_moves: Vec<PathBuf>,
     move_dialog: Option<move_files::MoveDialog>,
+    rename_dialog: Option<rename_files::RenameDialog>,
     zoom: f32,
     zoom_override: Option<f32>,
     zoom_input: Option<String>,
@@ -340,7 +361,9 @@ impl Viewer {
             #[cfg(all(target_os = "macos", not(test)))]
             mac_access: None,
             focus_index: 0,
+            spread_shifted: false,
             checked: HashSet::new(),
+            check_navigation: None,
             random_prompt: false,
             trash_history: Vec::new(),
             file_job: None,
@@ -384,6 +407,7 @@ impl Viewer {
             archives: archive::Archives::new(ctx.clone()),
             recent_moves: Vec::new(),
             move_dialog: None,
+            rename_dialog: None,
             zoom: 1.0,
             zoom_override: None,
             zoom_input: None,
@@ -503,6 +527,7 @@ impl Viewer {
         self.poll_library_thumbnails(ctx);
         self.library_window(ctx);
         self.move_window(ctx);
+        self.rename_window(ctx);
         self.bookmark_window(ctx);
         self.archive_window(ctx);
         self.clear_recent_window(ctx);
@@ -547,6 +572,10 @@ impl Viewer {
             self.library.dialog = None;
         } else if self.archives.prompt.is_some() {
             self.leave_archive();
+        } else if self.rename_dialog.is_some() {
+            if self.file_job.is_none() {
+                self.rename_dialog = None;
+            }
         } else if self.move_dialog.is_some() {
             // A running move keeps its dialog; the gesture is still used up.
             if self.file_job.is_none() {
@@ -1015,8 +1044,14 @@ fn thumbnail_range(len: usize, focus: usize, width: f32, spacing: f32) -> std::o
 }
 
 struct SpanCache {
-    key: (usize, usize, bool, bool, Vec2),
+    key: (usize, usize, bool, bool, bool, Vec2),
     span: (usize, usize),
+}
+
+enum NavigationStep {
+    Spread,
+    Page,
+    Check,
 }
 
 /// Commands that switch between single-page and two-page layouts.
@@ -1039,16 +1074,23 @@ fn adaptive_focus_span(
     len: usize,
     spread: bool,
     cover: bool,
+    shifted: bool,
     single: impl Fn(usize) -> bool,
 ) -> (usize, usize) {
     if len == 0 || !spread || (cover && focus == 0) || single(focus) {
         return (focus, focus);
     }
     // Pair only within the run after the nearest preceding standalone page.
-    let offset = (0..focus)
+    let mut offset = (0..focus)
         .rev()
         .find(|&i| (cover && i == 0) || single(i))
         .map_or(0, |i| i + 1);
+    if shifted {
+        if focus == offset {
+            return (focus, focus);
+        }
+        offset += 1;
+    }
     let first = offset + (focus - offset) / 2 * 2;
     let last = (first + 1).min(len - 1);
     (first, if single(last) { first } else { last })
@@ -1157,6 +1199,9 @@ fn effective_keys(s: &Settings, id: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod half_step_tests;
 
 fn scroll_source(drag: bool) -> egui::scroll_area::ScrollSource {
     egui::scroll_area::ScrollSource {

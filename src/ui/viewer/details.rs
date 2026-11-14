@@ -274,7 +274,9 @@ impl Details {
             hdr: hdr.clone(),
             handle: handle.clone(),
             rect: tile,
-            clip: clip.intersect(tile),
+            // Retain the page slot so a later canvas resize/recentering can
+            // move this tile together with the base image without clipping it.
+            clip,
             backdrop: rect,
         })
     }

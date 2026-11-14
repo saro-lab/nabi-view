@@ -67,6 +67,10 @@ impl Viewer {
     }
 
     pub(super) fn open(&mut self, path: PathBuf) {
+        if self.renaming() {
+            self.last_error = tr("a-file-operation-is-still-in-progress").into();
+            return;
+        }
         #[cfg(all(target_os = "macos", not(test)))]
         let access = match crate::platform::mac_access::resolve(&path) {
             Ok(access) => access,
@@ -155,6 +159,7 @@ impl Viewer {
         self.cancel_prefetch();
         self.prefetch_blocked.clear();
         self.pending_steps.clear();
+        self.check_navigation = None;
         self.inspector.invalidate();
         self.span_cache.get_mut().take();
         // Deletes the files extracted from the previous archive.
@@ -162,6 +167,7 @@ impl Viewer {
         self.files.clear();
         self.sorting.stamps.clear();
         self.focus_index = 0;
+        self.spread_shifted = false;
         self.pan = Vec2::ZERO;
         self.canvas_drag = None;
         self.touch_gesture.cancel();
@@ -180,6 +186,7 @@ impl Viewer {
         self.thumb_errors.clear();
         self.library.open = false;
         self.move_dialog = None;
+        self.rename_dialog = None;
     }
 
     /// The saved spread applies only while the display is in landscape.
@@ -193,6 +200,7 @@ impl Viewer {
             self.files.len(),
             self.spread_active(),
             self.settings.cover,
+            self.spread_shifted,
             self.layout_monitor,
         );
         if let Some(cache) = self
@@ -208,6 +216,7 @@ impl Viewer {
             self.files.len(),
             self.spread_active(),
             self.settings.cover,
+            self.spread_shifted,
             |index| {
                 self.page_sizes
                     .get(&self.files[index])
@@ -222,10 +231,11 @@ impl Viewer {
     pub(super) fn move_page(&mut self, ctx: &egui::Context, forward: bool) {
         if self.listing.is_some() {
             if self.pending_steps.len() < MAX_PENDING_STEPS {
-                self.pending_steps.push((forward, false));
+                self.pending_steps.push((forward, NavigationStep::Spread));
             }
             return;
         }
+        self.check_navigation = None;
         if !self.files.is_empty() {
             let (_, end) = self.focus_span();
             if self.random && forward && end + 1 == self.files.len() {
@@ -257,6 +267,10 @@ impl Viewer {
     pub(super) fn focus_navigation(&mut self, ctx: &egui::Context, focus_index: usize) {
         let previous = self.focus_span();
         self.focus(focus_index);
+        self.show_navigation_boundary(ctx, previous);
+    }
+
+    fn show_navigation_boundary(&mut self, ctx: &egui::Context, previous: (usize, usize)) {
         let (first, last) = self.focus_span();
         if self.random || self.files.is_empty() || previous == (first, last) {
             return;
@@ -268,7 +282,58 @@ impl Viewer {
         }
     }
 
+    pub(super) fn move_single_page(&mut self, ctx: &egui::Context, forward: bool) {
+        if self.listing.is_some() {
+            if self.pending_steps.len() < MAX_PENDING_STEPS {
+                self.pending_steps.push((forward, NavigationStep::Page));
+            }
+            return;
+        }
+        if !self.spread_active() {
+            self.move_page(ctx, forward);
+            return;
+        }
+        self.check_navigation = None;
+        if self.files.is_empty() {
+            return;
+        }
+        let previous = self.focus_span();
+        let (first, _) = previous;
+        // Finish a random cycle only after its last page has been the anchor.
+        if self.random && forward && first + 1 == self.files.len() {
+            self.spread_shifted = false;
+            self.move_page(ctx, true);
+            return;
+        }
+        let next = if forward {
+            (first + 1) % self.files.len()
+        } else if first == 0 {
+            self.files.len() - 1
+        } else {
+            first - 1
+        };
+        // Choose the pairing whose first page is the target. A standalone
+        // cover or wide image still occupies its own spread.
+        let span = adaptive_focus_span(
+            next,
+            self.files.len(),
+            true,
+            self.settings.cover,
+            false,
+            |index| {
+                self.page_sizes
+                    .get(&self.files[index])
+                    .or_else(|| self.pictures.get(&self.files[index]).map(|p| &p.original))
+                    .is_some_and(|size| width_limited(*size, self.layout_monitor))
+            },
+        );
+        self.spread_shifted = span.0 != next;
+        self.focus(next);
+        self.show_navigation_boundary(ctx, previous);
+    }
+
     pub(super) fn focus(&mut self, focus_index: usize) {
+        self.check_navigation = None;
         if self.focus_index != focus_index {
             self.toast = None;
             self.prefetch_blocked.clear();

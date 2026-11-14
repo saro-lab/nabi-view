@@ -51,6 +51,8 @@ epaint = { path = "vendor/epaint" }
 egui-wgpu = { path = "vendor/egui-wgpu" }
 
 [target.'cfg(windows)'.dependencies]
+# Use eframe's existing window backend to suppress its undecorated 1px shadow edge.
+winit = { version = "0.30.13", default-features = false }
 # The latest Windows SDK crate's COM macro requires its matching core ABI.
 windows-core = "=0.62.2"
 windows = { version = "0.62.2", features = ["Win32_Devices_Display", "Win32_Graphics_Imaging", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Com", "Win32_System_Power", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_UI_Shell_Common"] }

@@ -21,6 +21,7 @@ const ITEMS: &[&str] = &[
     "flip-vertical",
     "check",
     "move",
+    "normalize-names",
     "trash",
     "undo-trash",
     "fullscreen",

@@ -320,6 +320,8 @@ impl Viewer {
                     *id,
                     "prev"
                         | "next"
+                        | "page-prev"
+                        | "page-next"
                         | "check-prev"
                         | "check-next"
                         | "slideshow-decrease"

@@ -5,6 +5,7 @@ pub(crate) mod disk_cache;
 #[cfg(any(target_os = "ios", target_os = "android", test))]
 pub(crate) mod documents;
 pub(crate) mod file_move;
+pub(crate) mod file_rename;
 pub(crate) mod library;
 pub(crate) mod media;
 pub(crate) mod metadata;

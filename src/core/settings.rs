@@ -10,7 +10,7 @@ pub(crate) const RECENT_LIMIT: RangeInclusive<usize> = 1..=MAX_RECENT;
 /// Every duration setting is in milliseconds and moves in 0.1 s steps.
 pub(crate) const TIME_MS: RangeInclusive<u32> = 100..=100_000;
 pub(crate) const TIME_STEP_MS: u32 = 100;
-pub(crate) const SMALL_IMAGE_PERCENT: RangeInclusive<u32> = 50..=500;
+pub(crate) const SMALL_IMAGE_PERCENT: RangeInclusive<u32> = 50..=2000;
 pub(crate) const CACHE_IMAGE_LIMIT: RangeInclusive<usize> = 2..=10_000;
 pub(crate) const CACHE_MEMORY_MB: RangeInclusive<u32> = 32..=4096;
 pub(crate) const DISK_CACHE_MB: RangeInclusive<u32> = 32..=16_384;
@@ -174,6 +174,53 @@ impl MouseSettings {
     }
 }
 
+/// Mobile gestures are stored separately from desktop mouse bindings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TouchSettings {
+    pub swipe_navigation: bool,
+    pub pinch_zoom: bool,
+    pub one_finger_pan: bool,
+    pub two_finger_pan: bool,
+    pub double_tap: String,
+    pub long_press: String,
+}
+
+impl Default for TouchSettings {
+    fn default() -> Self {
+        Self {
+            swipe_navigation: true,
+            pinch_zoom: true,
+            one_finger_pan: true,
+            two_finger_pan: true,
+            double_tap: "fit".into(),
+            long_press: CLICK_MENU.into(),
+        }
+    }
+}
+
+pub(crate) fn valid_touch_action(action: &str) -> bool {
+    valid_click_action(action) && crate::core::commands::mobile_supported(action)
+}
+
+impl TouchSettings {
+    pub(crate) fn normalize(&mut self) {
+        let defaults = Self::default();
+        for (value, default) in [
+            (&mut self.double_tap, defaults.double_tap),
+            (&mut self.long_press, defaults.long_press),
+        ] {
+            if !valid_touch_action(value) {
+                *value = default;
+            }
+        }
+    }
+
+    pub(crate) fn is_valid(&self) -> bool {
+        valid_touch_action(&self.double_tap) && valid_touch_action(&self.long_press)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -235,6 +282,8 @@ pub struct Settings {
     pub recent_move_limit: usize,
     #[serde(default)]
     pub mouse: MouseSettings,
+    #[serde(default)]
+    pub touch: TouchSettings,
     pub shortcuts: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyboard_shortcuts: Option<Vec<KeyboardShortcut>>,
@@ -252,6 +301,8 @@ pub struct Settings {
     pub settings_shortcut_migrated: bool,
     #[serde(default)]
     pub bookmark_shortcut_migrated: bool,
+    #[serde(default)]
+    pub single_step_shortcuts_migrated: bool,
 }
 
 impl Default for Settings {
@@ -289,6 +340,7 @@ impl Default for Settings {
             recent_limit: 50,
             recent_move_limit: default_recent_moves(),
             mouse: MouseSettings::default(),
+            touch: TouchSettings::default(),
             shortcuts: BTreeMap::new(),
             keyboard_shortcuts: Some(crate::core::commands::default_shortcut_rows()),
             close_all_shortcut_migrated: true,
@@ -298,6 +350,7 @@ impl Default for Settings {
             move_shortcut_migrated: true,
             settings_shortcut_migrated: true,
             bookmark_shortcut_migrated: true,
+            single_step_shortcuts_migrated: true,
         }
     }
 }
@@ -312,6 +365,7 @@ impl Settings {
     pub(crate) fn normalize(&mut self) {
         // Every load, save and import path normalizes here first.
         self.mouse.normalize();
+        self.touch.normalize();
         if self.keyboard_shortcuts.is_none() {
             self.keyboard_shortcuts = Some(
                 self.shortcuts
@@ -335,6 +389,10 @@ impl Settings {
         }
         self.shortcuts.clear();
         let mut current_defaults = crate::core::commands::default_shortcut_rows();
+        if !self.single_step_shortcuts_migrated {
+            current_defaults
+                .retain(|row| !matches!(row.action.as_str(), "page-prev" | "page-next"));
+        }
         if !self.move_shortcut_migrated {
             current_defaults.retain(|row| row.action != "move");
         }
@@ -481,11 +539,47 @@ impl Settings {
             }
             self.bookmark_shortcut_migrated = true;
         }
+        if !self.single_step_shortcuts_migrated {
+            if let Some(rows) = &mut self.keyboard_shortcuts
+                && !rows.is_empty()
+            {
+                for action in ["page-prev", "page-next"] {
+                    // Preserve an existing assignment for the command, and add
+                    // only unclaimed chords. Empty/deleted lists stay empty.
+                    if rows.iter().any(|row| row.action == action) {
+                        continue;
+                    }
+                    for row in crate::core::commands::default_shortcut_rows()
+                        .into_iter()
+                        .filter(|row| row.action == action)
+                    {
+                        let chord = crate::core::commands::canonical_chord(&row.key);
+                        if rows.len() < MAX_SHORTCUTS
+                            && !rows.iter().any(|existing| {
+                                crate::core::commands::canonical_chord(&existing.key) == chord
+                            })
+                        {
+                            let at = rows
+                                .iter()
+                                .rposition(|row| {
+                                    matches!(
+                                        row.action.as_str(),
+                                        "next" | "page-prev" | "page-next"
+                                    )
+                                })
+                                .map_or(rows.len(), |index| index + 1);
+                            rows.insert(at, row);
+                        }
+                    }
+                }
+            }
+            self.single_step_shortcuts_migrated = true;
+        }
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
         if !SMALL_IMAGE_PERCENT.contains(&self.small_image_percent) {
-            return Err("Small image maximum size must be 50–500%.".into());
+            return Err("Small image maximum size must be 50–2000%.".into());
         }
         if !CACHE_IMAGE_LIMIT.contains(&self.cache_image_limit) {
             return Err("Cache image limit must be 2–10000.".into());
@@ -534,6 +628,9 @@ impl Settings {
         }
         if !self.mouse.is_valid() {
             return Err("Invalid mouse settings.".into());
+        }
+        if !self.touch.is_valid() {
+            return Err("Invalid touch settings.".into());
         }
         let text_ok =
             |text: &str| text.len() <= MAX_SHORTCUT_TEXT && !text.chars().any(char::is_control);
@@ -598,6 +695,7 @@ impl Settings {
             recent_limit,
             recent_move_limit,
             mouse,
+            touch,
             keyboard_shortcuts
         );
         for (command, chord) in &after.shortcuts {

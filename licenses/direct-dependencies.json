@@ -204,6 +204,12 @@
     "url": "https://github.com/microsoft/windows-rs"
   },
   {
+    "name": "winit",
+    "version": "0.30.13",
+    "license": "Apache-2.0",
+    "url": "https://github.com/rust-windowing/winit"
+  },
+  {
     "name": "zbus",
     "version": "6.2.1",
     "license": "MIT",

@@ -32,6 +32,36 @@ unsafe fn responds(object: Object, selector: &std::ffi::CStr) -> bool {
         )
     }
 }
+
+/// Whether this window is being resized by the user, rather than by `setFrame`.
+/// Missing handles and calls off the AppKit thread leave the caller's policy intact.
+#[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+pub(crate) fn in_live_resize(window: &winit::window::Window) -> Option<bool> {
+    // SAFETY: BOOL occupies one byte on supported macOS architectures. Check the
+    // thread before accessing the NSView/NSWindow, and keep the live WindowHandle
+    // for the query. No unretained AppKit pointer escapes this function.
+    unsafe {
+        let send_bool: unsafe extern "C" fn(Object, Object) -> u8 =
+            std::mem::transmute(objc_msgSend as *const ());
+        let thread = objc_getClass(c"NSThread".as_ptr());
+        if thread.is_null()
+            || !responds(thread, c"isMainThread")
+            || send_bool(thread, sel_registerName(c"isMainThread".as_ptr())) == 0
+        {
+            return None;
+        }
+        let handle = window.window_handle().ok()?;
+        let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+            return None;
+        };
+        let window = get(handle.ns_view.as_ptr(), c"window");
+        if window.is_null() || !responds(window, c"inLiveResize") {
+            return None;
+        }
+        Some(send_bool(window, sel_registerName(c"inLiveResize".as_ptr())) != 0)
+    }
+}
+
 /// Called on the UI thread after wgpu has attached its CAMetalLayer.
 pub fn configure(window: &winit::window::Window) {
     let Ok(handle) = window.window_handle() else {

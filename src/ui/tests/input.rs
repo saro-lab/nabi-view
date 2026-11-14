@@ -156,7 +156,7 @@ fn pinned_canvas_drives_zoom_and_preserves_manual_scale() {
 
     let original = image::image_dimensions(sample_path().unwrap()).unwrap();
     let expected_percent =
-        fitted.width() * window.ctx.pixels_per_point() / original.0 as f32 * 100.;
+        fitted.width() * window.ctx.pixels_per_point() / window.scale / original.0 as f32 * 100.;
     let label = window.draw(None).0;
     let shown_percent = label
         .split_whitespace()
@@ -226,6 +226,9 @@ fn modified_drag_moves_the_photo_without_moving_the_window() {
     ] {
         let mut window = TestWindow::sample_with_modifier_gestures();
         window.wait_for("");
+        // The 900×1180 sample exceeds the canvas at actual size and can pan.
+        window.draw(Some(Key::Num1));
+        window.draw(None);
         let before = window.photo_rects();
         let delta = egui::vec2(72., -38.);
         assert!(!window.drag_pointer_with_modifiers(before.1.center(), delta, modifiers));
@@ -251,6 +254,8 @@ fn modified_drag_moves_the_photo_without_moving_the_window() {
 fn image_drag_keeps_its_mode_when_the_modifier_is_released() {
     let mut window = TestWindow::sample_with_modifier_gestures();
     window.wait_for("");
+    window.draw(Some(Key::Num1));
+    window.draw(None);
     let before = window.photo_rects();
     let start = before.1.center();
     let modifiers = egui::Modifiers {
@@ -311,6 +316,8 @@ fn returning_to_window_cancels_an_interrupted_image_drag() {
     for lose_focus in [false, true] {
         let mut window = TestWindow::sample_with_modifier_gestures();
         window.wait_for("");
+        window.draw(Some(Key::Num1));
+        window.draw(None);
         let start = window.photo_rects().1.center();
         let modifiers = egui::Modifiers::CTRL;
         window.draw_events(

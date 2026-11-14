@@ -72,6 +72,7 @@ fn pressure_releases_neighbors_and_jobs_but_preserves_current_and_presented_imag
                 backdrop: rect,
             }],
             canvas: Some(rect),
+            pan: Vec2::ZERO,
         };
         app.thumbs.insert(
             app.files[3].clone(),

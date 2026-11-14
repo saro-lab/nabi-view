@@ -44,24 +44,9 @@ impl Viewer {
         }
         match id {
             "check" => self.toggle_focused_checks(ctx),
-            "check-prev" | "check-next" => {
-                if self.listing.is_some() {
-                    // Toggle only when this queued step is replayed. Applying it
-                    // now as well would undo it after the folder finishes loading.
-                    if self.pending_steps.len() < MAX_PENDING_STEPS {
-                        self.pending_steps.push((id == "check-next", !self.random));
-                    }
-                } else {
-                    if !self.random {
-                        self.toggle_focused_checks(ctx);
-                    }
-                    self.move_page(ctx, id == "check-next");
-                }
-                if self.random {
-                    self.show_toast(ctx, tr("checks-are-not-available-in-random-mode"));
-                }
-            }
+            "check-prev" | "check-next" => self.move_page_with_checks(ctx, id == "check-next"),
             "move" => self.open_move_dialog(ctx),
+            "normalize-names" => self.open_rename_dialog_for_files(ctx),
             "trash" => self.trash_files(ctx),
             "undo-trash" => self.undo_trash(ctx),
             "metadata" => {
@@ -186,9 +171,15 @@ impl Viewer {
             "bookmark" => self.open_bookmark_dialog(),
             "prev" => self.move_page(ctx, false),
             "next" => self.move_page(ctx, true),
+            "page-prev" => self.move_single_page(ctx, false),
+            "page-next" => self.move_single_page(ctx, true),
             "first" => self.focus_navigation(ctx, 0),
             "last" => self.focus_navigation(ctx, self.files.len().saturating_sub(1)),
             "single" | "spread-left" | "spread-right" => {
+                self.check_navigation = None;
+                if self.settings.spread != (id != "single") {
+                    self.spread_shifted = false;
+                }
                 self.settings.spread = id != "single";
                 self.settings.rtl = id == "spread-left";
                 self.pan = Vec2::ZERO;
@@ -203,6 +194,10 @@ impl Viewer {
                 self.save();
             }
             "spread" => {
+                self.check_navigation = None;
+                if !self.settings.spread || self.settings.rtl {
+                    self.spread_shifted = false;
+                }
                 if !self.settings.spread {
                     self.settings.spread = true;
                     self.settings.rtl = false;
@@ -216,10 +211,13 @@ impl Viewer {
                 self.save();
             }
             "rtl" => {
+                self.check_navigation = None;
                 self.settings.rtl = !self.settings.rtl;
                 self.save();
             }
             "cover" => {
+                self.check_navigation = None;
+                self.spread_shifted = false;
                 self.settings.cover = !self.settings.cover;
                 self.save();
             }

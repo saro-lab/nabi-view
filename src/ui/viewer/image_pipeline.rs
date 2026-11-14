@@ -2,6 +2,9 @@ use super::*;
 
 impl Viewer {
     pub(super) fn queue_images(&mut self) {
+        if self.renaming() {
+            return;
+        }
         if self.files.is_empty() {
             for slot in 0..2 {
                 if self.tickets[slot].take().is_some() {
@@ -263,6 +266,7 @@ impl Viewer {
             self.cancel_prefetch();
         }
         if !self.memory_policy.background_allowed()
+            || self.renaming()
             || self.files.is_empty()
             || self.listing.is_some()
             || self.details.pending()
@@ -320,6 +324,9 @@ impl Viewer {
         } else {
             files = self.sorted_files(files);
         }
+        if self.files != files || !changed.is_empty() {
+            self.check_navigation = None;
+        }
         let focused_path = self.files.get(self.focus_index).cloned();
         let focus_index = refreshed_focus_index(&self.files, self.focus_index, &files);
         let live: HashSet<_> = files.iter().collect();
@@ -363,6 +370,9 @@ impl Viewer {
             self.zoom_input = None;
         }
         self.focus_index = focus_index;
+        if self.files != files {
+            self.spread_shifted = false;
+        }
         self.span_cache.get_mut().take();
         self.files = files;
         if self.files.is_empty() {

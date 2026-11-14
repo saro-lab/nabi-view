@@ -18,10 +18,13 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
     ("reveal", "reveal-in-file-manager", "L"),
     ("prev", "previous-page-or-spread", "Left"),
     ("next", "next-page-or-spread", "Right"),
+    ("page-prev", "move-back-one-page", "Alt+Left"),
+    ("page-next", "move-forward-one-page", "Alt+Right"),
     ("check", "toggle-checks", "Space"),
     ("check-prev", "check-and-go-to-previous", "Shift+Left"),
     ("check-next", "check-and-go-to-next", "Shift+Right"),
     ("move", "move-images", "M"),
+    ("normalize-names", "normalize-names", ""),
     ("trash", "move-to-trash", "Delete"),
     ("undo-trash", "restore-from-trash", "Primary+Z"),
     ("first", "first-page", "Home"),
@@ -72,6 +75,8 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
 pub(crate) const DEFAULT_ALTERNATE_SHORTCUTS: &[(&str, &str)] = &[
     ("prev", "A"),
     ("next", "D"),
+    ("page-prev", "Alt+A"),
+    ("page-next", "Alt+D"),
     ("first", "W"),
     ("last", "S"),
     ("check-prev", "Shift+A"),
@@ -381,6 +386,7 @@ pub(crate) fn mobile_supported(command: &str) -> bool {
         "new-window"
             | "reveal"
             | "move"
+            | "normalize-names"
             | "close-window"
             | "close-all"
             | "minimize"

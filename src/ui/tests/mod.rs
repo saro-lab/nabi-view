@@ -1,5 +1,6 @@
 mod archive;
 mod chrome;
+mod dpi;
 mod input;
 mod library;
 mod localization;
@@ -10,8 +11,10 @@ mod mouse;
 mod move_files;
 mod navigation;
 mod overlays;
+mod rename_files;
 mod selection;
 mod settings;
+mod touch;
 
 use crate::{app::sample_path, storage::Store, ui::viewer::Viewer};
 use eframe::{App, CreationContext, Frame, egui};
@@ -669,7 +672,7 @@ fn replace_zoom_text(window: &mut TestWindow, text: &str) {
 fn assert_photo_scale(window: &TestWindow, expected: f32) {
     let original = image::image_dimensions(sample_path().unwrap()).unwrap();
     let (_, photo) = window.photo_rects();
-    let ratio = photo.width() * window.ctx.pixels_per_point() / original.0 as f32;
+    let ratio = photo.width() * window.ctx.pixels_per_point() / window.scale / original.0 as f32;
     assert!(
         (ratio - expected).abs() < 0.0001,
         "Expected scale {expected}, got {ratio}"
@@ -759,7 +762,7 @@ fn record_new_shortcut_row(window: &mut TestWindow, key: Key, action_title: &str
     window.click(window.label_position("+ Add"));
     window.wait_for("Add shortcut");
     choose_shortcut_action(window, "Open image", action_title);
-    window.click(window.label_position("Record shortcut"));
+    window.click(window.label_position("Record key combination"));
     window.draw(Some(key));
 }
 

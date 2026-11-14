@@ -41,29 +41,35 @@ impl Viewer {
         if !self.touch_gesture.active() {
             return;
         }
-        // Long press is the touch equivalent of the desktop right-click menu.
-        if response.long_touched() && !self.touch_gesture.was_multiple() {
-            self.touch_gesture.cancel();
-            self.menu_open = true;
-            self.release_held_input();
-            return;
-        }
         if let Some(touch) = ctx
             .input(|i| i.multi_touch())
             .filter(|touch| touch.num_touches >= 2)
         {
             self.touch_gesture.multiple();
-            if touch.zoom_delta.is_finite() && touch.zoom_delta > 0. {
+            if self.settings.touch.pinch_zoom
+                && touch.zoom_delta.is_finite()
+                && touch.zoom_delta > 0.
+            {
                 self.change_zoom(ctx, touch.zoom_delta);
+            }
+            if self.settings.touch.two_finger_pan
+                && touch.translation_delta.is_finite()
+                && self.images_can_pan(response.rect.size(), ctx)
+            {
                 self.pan += touch.translation_delta;
             }
             return;
         }
-        if response.dragged()
-            && self.presentation.images.iter().any(|image| {
-                image.rect.width() > image.clip.width() + 1.
-                    || image.rect.height() > image.clip.height() + 1.
-            })
+        if response.long_touched() && !self.touch_gesture.was_multiple() {
+            let action = self.settings.touch.long_press.clone();
+            self.touch_gesture.cancel();
+            self.mouse_click(ctx, &action);
+            return;
+        }
+        if self.settings.touch.one_finger_pan
+            && !self.touch_gesture.was_multiple()
+            && response.dragged()
+            && self.images_can_pan(response.rect.size(), ctx)
         {
             self.pan += ctx.input(|i| i.pointer.delta());
         }
@@ -73,9 +79,12 @@ impl Viewer {
             // interaction position survives it; latest_pos does not.
             if let Some(end) = ctx.pointer_interact_pos() {
                 if let Some(forward) = self.touch_gesture.finish(end, self.settings.rtl) {
-                    self.move_page(ctx, forward);
+                    if self.settings.touch.swipe_navigation {
+                        self.move_page(ctx, forward);
+                    }
                 } else if !multiple && response.double_clicked() {
-                    self.run("fit", ctx);
+                    let action = self.settings.touch.double_tap.clone();
+                    self.mouse_click(ctx, &action);
                 }
             }
             self.touch_gesture.cancel();

@@ -1,6 +1,77 @@
 use super::*;
 
 #[test]
+fn touch_settings_edit_and_reset_independently_on_phones_and_tablets() {
+    use crate::core::settings::{MouseSettings, Settings, TouchSettings};
+    use crate::i18n::{Language, tr};
+
+    let _phone = PhonePreview::enter();
+    for size in [egui::vec2(390., 844.), egui::vec2(1024., 768.)] {
+        let mouse = MouseSettings {
+            double_click: "next".into(),
+            ..Default::default()
+        };
+        let mut window = TestWindow::sample_with_settings(&Settings {
+            language: Language::English,
+            mouse: mouse.clone(),
+            ..Default::default()
+        });
+        window.screen_size = size;
+        window.wait_for("1 / 5");
+        window.click(window.titlebar_icon("settings").rect.center());
+        for _ in 0..3 {
+            window.draw(None);
+        }
+        if size.x <= 600. {
+            window.click(window.label_position(tr("general")));
+        }
+        window.click(window.label_position(tr("touch")));
+        for _ in 0..3 {
+            window.draw(None);
+        }
+        let text = window.draw(None).0;
+        for key in [
+            "swipe-navigation",
+            "pinch-zoom",
+            "one-finger-pan",
+            "two-finger-pan",
+            "double-tap",
+            "long-press",
+            "fullscreen-tap-exits",
+        ] {
+            assert!(text.contains(tr(key)), "Missing {key} at {size}: {text}");
+        }
+        assert!(!text.contains(tr("mouse-wheel")));
+        let label = window.label_position(tr("swipe-navigation"));
+        let toggle = window
+            .paint
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                Shape::Rect(rect)
+                    if (rect.rect.center().y - label.y).abs() < 2.
+                        && rect.rect.width() < 30.
+                        && rect.rect.height() < 30. =>
+                {
+                    Some(rect.rect.center())
+                }
+                _ => None,
+            })
+            .next()
+            .expect("Missing swipe toggle");
+        window.click(toggle);
+        assert!(!saved_viewer_settings(&window).touch.swipe_navigation);
+        choose_shortcut_action(&mut window, tr("open-menu"), tr("no-action"));
+        assert_eq!(saved_viewer_settings(&window).touch.long_press, "none");
+        assert_eq!(saved_viewer_settings(&window).mouse, mouse);
+
+        window.click(window.label_position(tr("restore-default")));
+        let saved = saved_viewer_settings(&window);
+        assert_eq!(saved.touch, TouchSettings::default());
+        assert_eq!(saved.mouse, mouse);
+    }
+}
+
+#[test]
 fn shortcut_toolbar_keeps_equal_heights_and_wraps_whole_controls() {
     for language in [
         crate::i18n::Language::English,
@@ -96,7 +167,7 @@ fn shortcut_changes_render_the_current_value_in_toasts() {
         (Key::OpenBracket, "배치: 양면 (오른쪽에서 왼쪽)"),
         (Key::CloseBracket, "배치: 양면 (왼쪽에서 오른쪽)"),
         (Key::P, "배치: 단면 보기"),
-        (Key::Num1, "이미지 표시: 실제 크기 (100%)"),
+        (Key::Num1, "이미지 표시: 실제 크기(100%)"),
         (Key::Equals, "배율: 125%"),
         (Key::Num0, "이미지 표시: 이미지 전체 맞춤"),
         (Key::Space, "체크한 이미지 수: 1"),
@@ -543,11 +614,11 @@ fn alternate_navigation_and_direct_layout_shortcuts_keep_the_current_page() {
     assert_eq!(focused_thumbnail_pages(&window), [1]);
     shift_navigation(&mut window, Key::D);
     settle_checks(&mut window);
-    assert_eq!(checked_sample_pages(&window), [1]);
+    assert_eq!(checked_sample_pages(&window), [1, 2]);
     assert_eq!(focused_thumbnail_pages(&window), [2]);
     shift_navigation(&mut window, Key::A);
     settle_checks(&mut window);
-    assert_eq!(checked_sample_pages(&window), [1, 2]);
+    assert_eq!(checked_sample_pages(&window), [1]);
     assert_eq!(focused_thumbnail_pages(&window), [1]);
 
     window.draw(Some(Key::OpenBracket));
@@ -618,7 +689,6 @@ fn trash_shortcuts_restore_batches_lifo_and_fall_back_to_the_focused_spread() {
     // Check two images, then leave their pages. Delete must prefer the checks
     // over the currently focused third image.
     shift_navigation(&mut window, Key::ArrowRight);
-    window.draw(Some(Key::Space));
     window.draw(Some(Key::ArrowRight));
     window.wait_for("3 / 4");
     window.draw(Some(Key::Delete));

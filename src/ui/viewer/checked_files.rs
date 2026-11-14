@@ -12,6 +12,19 @@ enum FileResult {
     Trashed(TrashBatchResult),
     Restored(RestoreBatchResult),
     Moved(crate::core::file_move::MoveResult),
+    Renamed(crate::core::file_rename::RenameResult),
+}
+
+/// Consecutive check-navigation commands share an anchor and selection intent,
+/// including when the commands are rebound to keys without Shift or to a mouse.
+pub(super) struct CheckNavigation {
+    anchor: (usize, usize),
+    focus: (usize, usize),
+    layout: (bool, bool, bool, Vec2),
+    range: std::ops::Range<usize>,
+    check: bool,
+    // Only visited paths are saved; shrinking restores their pre-gesture state.
+    before: HashMap<PathBuf, bool>,
 }
 
 impl Viewer {
@@ -43,15 +56,97 @@ impl Viewer {
         Some(scopes)
     }
     pub(super) fn replay_pending_navigation(&mut self, ctx: &egui::Context) {
-        for (forward, check) in std::mem::take(&mut self.pending_steps) {
-            if check {
-                self.toggle_focused_checks(ctx);
+        for (forward, step) in std::mem::take(&mut self.pending_steps) {
+            match step {
+                NavigationStep::Spread => self.move_page(ctx, forward),
+                NavigationStep::Page => self.move_single_page(ctx, forward),
+                NavigationStep::Check => self.move_page_with_checks(ctx, forward),
             }
-            self.move_page(ctx, forward);
         }
     }
 
+    pub(super) fn move_page_with_checks(&mut self, ctx: &egui::Context, forward: bool) {
+        if self.random {
+            self.move_page(ctx, forward);
+            self.show_toast(ctx, tr("checks-are-not-available-in-random-mode"));
+            return;
+        }
+        if self.listing.is_some() {
+            // Decide the intent only after the complete folder list is available.
+            if self.pending_steps.len() < MAX_PENDING_STEPS {
+                self.pending_steps.push((forward, NavigationStep::Check));
+            }
+            return;
+        }
+        if self.files.is_empty() {
+            self.check_navigation = None;
+            return;
+        }
+        let (first, last) = self.focus_span();
+        let layout = (
+            self.spread_active(),
+            self.settings.cover,
+            self.settings.rtl,
+            self.layout_monitor,
+        );
+        let mut selection = self
+            .check_navigation
+            .take()
+            .filter(|selection| selection.focus == (first, last) && selection.layout == layout)
+            .unwrap_or_else(|| CheckNavigation {
+                anchor: (first, last),
+                focus: (first, last),
+                layout,
+                range: first..first,
+                check: !self.files[first..=last]
+                    .iter()
+                    .all(|path| self.checked.contains(path)),
+                before: HashMap::new(),
+            });
+        // A selection is a linear range. Ordinary navigation can still wrap.
+        let next = if forward && last + 1 < self.files.len() {
+            last + 1
+        } else if !forward && first > 0 {
+            first - 1
+        } else {
+            self.focus_index
+        };
+        self.focus_navigation(ctx, next);
+        selection.focus = self.focus_span();
+        let range = selection.anchor.0.min(selection.focus.0)
+            ..selection.anchor.1.max(selection.focus.1) + 1;
+        let previous = &selection.range;
+        // Touch only the changed edges, not every page in an expanding range.
+        for index in (previous.start..previous.end.min(range.start))
+            .chain(previous.start.max(range.end)..previous.end)
+        {
+            let path = &self.files[index];
+            if selection.before.remove(path).unwrap_or(false) {
+                self.checked.insert(path.clone());
+            } else {
+                self.checked.remove(path);
+            }
+        }
+        for index in (range.start..range.end.min(previous.start))
+            .chain(range.start.max(previous.end)..range.end)
+        {
+            let path = &self.files[index];
+            selection
+                .before
+                .insert(path.clone(), self.checked.contains(path));
+            if selection.check {
+                self.checked.insert(path.clone());
+            } else {
+                self.checked.remove(path);
+            }
+        }
+        selection.range = range;
+        self.check_navigation = Some(selection);
+        ctx.request_repaint();
+    }
+
     pub(super) fn toggle_focused_checks(&mut self, ctx: &egui::Context) {
+        self.check_navigation = None;
         if self.random {
             self.show_toast(ctx, tr("checks-are-not-available-in-random-mode"));
             return;
@@ -73,6 +168,8 @@ impl Viewer {
     }
 
     pub(super) fn toggle_random(&mut self) {
+        self.check_navigation = None;
+        self.spread_shifted = false;
         self.toast = None;
         self.span_cache.get_mut().take();
         let focused_path = self.files.get(self.focus_index).cloned();
@@ -240,6 +337,57 @@ impl Viewer {
         }
     }
 
+    pub(super) fn start_rename(
+        &mut self,
+        checked: crate::core::file_rename::CheckedPlan,
+        ctx: &egui::Context,
+    ) {
+        if self.file_job.is_some() || checked.plan.changes() == 0 {
+            return;
+        }
+        let paths: Vec<_> = checked
+            .plan
+            .entries
+            .iter()
+            .map(|entry| entry.source.clone())
+            .collect();
+        if paths != self.files || self.in_archive() || crate::app::is_mobile() {
+            if let Some(dialog) = &mut self.rename_dialog {
+                dialog.error = tr("rename-source-changed").into();
+            }
+            return;
+        }
+        #[cfg(all(target_os = "macos", not(test)))]
+        let Some(scopes) = self.authorize_file_folders(&paths, None) else {
+            return;
+        };
+        match self.spawn_file_job(ctx, "rename-images", None, move || {
+            #[cfg(all(target_os = "macos", not(test)))]
+            let _scopes = scopes;
+            FileResult::Renamed(crate::core::file_rename::rename(checked))
+        }) {
+            Ok(()) => {
+                // Ignore snapshots and decode replies from before/during staging.
+                self.folder_watch = None;
+                self.listing = None;
+                for slot in 0..2 {
+                    self.media.clear_slot(slot);
+                    self.tickets[slot] = None;
+                }
+                self.cancel_prefetch();
+                self.media.clear_thumbnail();
+                self.thumb_ticket = None;
+                self.show_toast(ctx, tr("rename-working"));
+            }
+            Err(error) => {
+                if let Some(dialog) = &mut self.rename_dialog {
+                    dialog.error.clone_from(&error);
+                }
+                self.last_error = error;
+            }
+        }
+    }
+
     pub(super) fn undo_trash(&mut self, ctx: &egui::Context) {
         if self.file_job.is_some() {
             self.show_toast(ctx, tr("a-file-operation-is-still-in-progress"));
@@ -293,6 +441,10 @@ impl Viewer {
                 self.last_error = tr("the-file-operation-could-not-be-completed").into();
                 if let Some(dialog) = &mut self.move_dialog {
                     dialog.error.clone_from(&self.last_error);
+                }
+                if let Some(dialog) = &mut self.rename_dialog {
+                    dialog.error.clone_from(&self.last_error);
+                    dialog.failed = true;
                 }
                 self.show_toast(ctx, self.last_error.clone());
                 return;
@@ -350,6 +502,32 @@ impl Viewer {
                         .join("\n");
                 }
                 (result.failed, "images-moved")
+            }
+            FileResult::Renamed(result) => {
+                self.reflect_renamed_files(&result.renamed);
+                let failed: Vec<_> = result
+                    .errors
+                    .iter()
+                    .map(|error| (error.path.clone(), error.display()))
+                    .collect();
+                if failed.is_empty() {
+                    self.rename_dialog = None;
+                    ctx.memory_mut(|memory| {
+                        if let Some(id) = memory.focused() {
+                            memory.surrender_focus(id);
+                        }
+                    });
+                } else if let Some(dialog) = &mut self.rename_dialog {
+                    dialog.error = result
+                        .errors
+                        .iter()
+                        .map(|error| error.display())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    // Reopen from the refreshed list after any execution failure.
+                    dialog.failed = true;
+                }
+                (failed, "rename-complete")
             }
             FileResult::Restored(result) => {
                 let mut files = self.files.clone();
@@ -564,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn checks_before_deferred_navigation_keep_order_and_include_intermediate_pages() {
+    fn deferred_check_navigation_extends_and_shrinks_from_the_same_anchor() {
         let (mut app, ctx) = viewer();
         app.listing = Some(1);
         for command in ["check-next", "check-next", "check-prev"] {
@@ -574,7 +752,7 @@ mod tests {
         app.listing = None;
         app.replay_pending_navigation(&ctx);
         assert_eq!(app.focus_index, 1);
-        assert_eq!(app.checked.len(), 3);
+        assert_eq!(app.file_targets(), app.files[..2]);
     }
 
     #[test]
@@ -613,5 +791,107 @@ mod tests {
                 "queued input must run exactly once"
             );
         }
+    }
+
+    #[test]
+    fn queued_navigation_finishes_an_existing_range_only_when_replayed() {
+        let (mut immediate, ctx) = viewer();
+        let (mut deferred, _) = viewer();
+        for app in [&mut immediate, &mut deferred] {
+            app.files.push("4.png".into());
+            app.run("check-next", &ctx);
+        }
+        deferred.listing = Some(1);
+        for command in ["check-next", "next"] {
+            immediate.run(command, &ctx);
+            deferred.run(command, &ctx);
+        }
+        assert!(deferred.check_navigation.is_some());
+        deferred.listing = None;
+        deferred.replay_pending_navigation(&ctx);
+        assert_eq!(deferred.focus_index, immediate.focus_index);
+        assert_eq!(deferred.checked, immediate.checked);
+        assert_eq!(deferred.file_targets(), deferred.files[..3]);
+        assert!(deferred.check_navigation.is_none());
+    }
+
+    #[test]
+    fn range_updates_restore_existing_checks_and_stop_at_both_ends() {
+        let (mut app, ctx) = viewer();
+        app.checked.insert(app.files[2].clone());
+        app.run("check-prev", &ctx);
+        assert_eq!(app.focus_index, 0);
+        assert_eq!(
+            app.file_targets(),
+            vec![app.files[0].clone(), app.files[2].clone()]
+        );
+        app.run("check-next", &ctx);
+        assert_eq!(app.file_targets(), app.files);
+        app.run("check-next", &ctx);
+        app.run("check-next", &ctx);
+        assert_eq!(app.focus_index, 2);
+        assert_eq!(app.file_targets(), app.files);
+        app.run("check-prev", &ctx);
+        app.run("check-prev", &ctx);
+        assert_eq!(
+            app.file_targets(),
+            vec![app.files[0].clone(), app.files[2].clone()]
+        );
+
+        // Ordinary navigation ends the range and retains its wrapping behavior.
+        app.run("prev", &ctx);
+        assert_eq!(app.focus_index, 2);
+        app.run("check-prev", &ctx);
+        assert_eq!(app.file_targets(), app.files[..1]);
+        app.run("check-prev", &ctx);
+        assert!(app.checked.is_empty());
+        app.run("check-next", &ctx);
+        assert_eq!(app.file_targets(), app.files[..1]);
+    }
+
+    #[test]
+    fn folder_changes_discard_range_history_without_reviving_removed_checks() {
+        let (mut app, ctx) = viewer();
+        app.run("check-next", &ctx);
+        let removed = app.files[0].clone();
+        app.refresh_folder(app.files[1..].to_vec(), &[]);
+        assert!(app.check_navigation.is_none());
+        assert!(!app.checked.contains(&removed));
+        app.run("check-next", &ctx);
+        assert!(app.checked.is_empty());
+        assert_eq!(app.focus_index, 1);
+        let mut files = app.files.clone();
+        files.push(removed.clone());
+        app.refresh_folder(files, &[]);
+        app.run("check-prev", &ctx);
+        assert!(!app.checked.contains(&removed));
+    }
+
+    #[test]
+    fn layout_changes_finish_the_previous_check_range() {
+        for action in [
+            "single",
+            "spread-left",
+            "spread-right",
+            "spread",
+            "rtl",
+            "cover",
+        ] {
+            let (mut app, ctx) = viewer();
+            app.run("check-next", &ctx);
+            assert!(app.check_navigation.is_some());
+            app.run(action, &ctx);
+            assert!(app.check_navigation.is_none(), "{action}");
+            assert_eq!(app.file_targets(), app.files[..2], "{action}");
+        }
+        let (mut app, ctx) = viewer();
+        app.run("check-next", &ctx);
+        app.run("spread-left", &ctx);
+        assert!(app.check_navigation.is_none());
+        app.run("check-next", &ctx);
+        assert_eq!(app.focus_index, 2);
+        assert!(app.checked.is_empty());
+        app.run("check-prev", &ctx);
+        assert_eq!(app.checked, HashSet::new());
     }
 }
