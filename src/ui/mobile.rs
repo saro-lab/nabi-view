@@ -64,6 +64,14 @@ impl TouchGesture {
     pub fn was_multiple(&self) -> bool {
         self.multiple
     }
+    pub fn swipe_offset(&self, position: Pos2) -> Option<f32> {
+        let delta = position - self.start?;
+        (!self.multiple && delta.x.abs() >= 8. && delta.x.abs() >= delta.y.abs() * 1.5)
+            .then_some(delta.x)
+    }
+    pub fn horizontal_offset(&self, position: Pos2) -> Option<f32> {
+        (!self.multiple).then_some(position.x - self.start?.x)
+    }
 }
 
 #[cfg(test)]

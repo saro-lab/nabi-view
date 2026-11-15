@@ -38,7 +38,7 @@ fn active_sources() -> &'static Mutex<HashMap<PathBuf, PathBuf>> {
     ACTIVE.get_or_init(Default::default)
 }
 
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     (8..=64).contains(&id.len()) && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
 }
 
@@ -49,9 +49,81 @@ fn safe_relative(path: &Path) -> bool {
             .all(|part| matches!(part, Component::Normal(_)))
 }
 
-/// A marker describes permission to reopen, not an image file or a write target.
-/// Native hosts validate the saved grant on each reopen; a revoked grant stays
-/// in the library so the user can select the source again.
+/// Identifies an app-owned source without treating its marker as an OS grant.
+/// The host must additionally check that this root belongs to its current data directory.
+#[cfg(any(target_os = "ios", test))]
+pub(crate) fn source_identity(path: &Path) -> Option<(PathBuf, String)> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+    {
+        return None;
+    }
+    for root in path.ancestors() {
+        if root.parent().and_then(Path::file_name) != Some(std::ffi::OsStr::new("document-sources"))
+        {
+            continue;
+        }
+        let id = root.file_name()?.to_str()?;
+        if !valid_id(id) {
+            return None;
+        }
+        return Some((root.to_owned(), id.to_owned()));
+    }
+    None
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn read_source_record(root: &Path, id: &str) -> Option<SourceRecord> {
+    let metadata = std::fs::symlink_metadata(root).ok()?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    let marker = root.join(SOURCE_MARKER);
+    if !std::fs::symlink_metadata(&marker).ok()?.is_file() {
+        return None;
+    }
+    let file = File::open(marker).ok()?;
+    if file.metadata().ok()?.len() > SOURCE_LIMIT {
+        return None;
+    }
+    let mut record: SourceRecord = serde_json::from_reader(file.take(SOURCE_LIMIT)).ok()?;
+    if record.id != id
+        || record.pages.len() > FOLDER_COUNT_LIMIT
+        || record
+            .pages
+            .iter()
+            .any(|p| !safe_relative(p) || p.components().count() != 1)
+    {
+        return None;
+    }
+    record.root = root.to_owned();
+    Some(record)
+}
+
+/// Reads the local source description. Native hosts still validate OS access
+/// on every reopen; retaining a description never grants file or photo access.
+#[cfg(any(target_os = "ios", test))]
+pub(crate) fn source_record(path: &Path) -> Option<SourceRecord> {
+    let (root, id) = source_identity(path)?;
+    read_source_record(&root, &id).or_else(|| {
+        // Built-in collections can request permission even before any photos
+        // have been imported, or after their regenerable marker is lost.
+        let name = super::photo_library::label(&id)?.to_owned();
+        Some(SourceRecord {
+            id,
+            root,
+            name,
+            pages: Vec::new(),
+            folder: true,
+        })
+    })
+}
+
+// Preserve the existing Android and desktop marker interpretation. Container
+// relocation and marker-independent photo recovery apply only to iOS.
+#[cfg(not(any(target_os = "ios", test)))]
 pub(crate) fn source_record(path: &Path) -> Option<SourceRecord> {
     for root in path.ancestors() {
         if root.parent()?.file_name()? != "document-sources" {
@@ -91,7 +163,48 @@ pub(crate) fn source_first_page(path: &Path) -> Option<PathBuf> {
 }
 
 pub(crate) fn source_name(path: &Path) -> Option<String> {
-    Some(source_record(path)?.name)
+    let record = source_record(path)?;
+    Some(
+        super::photo_library::label(&record.id)
+            .map(str::to_owned)
+            .unwrap_or(record.name),
+    )
+}
+
+/// Register a native collection before the user has granted access or it has
+/// any images. Reopening always checks OS permission; no original path is saved.
+pub(crate) fn create_empty_source(sources: &Path, id: &str, name: &str) -> Result<PathBuf, String> {
+    if !valid_id(id) || !sources.is_absolute() {
+        return Err("Invalid saved document source.".into());
+    }
+    std::fs::create_dir_all(sources).map_err(|e| e.to_string())?;
+    let root = crate::core::paths::canonicalize(sources)
+        .map_err(|e| e.to_string())?
+        .join(id);
+    #[cfg(any(target_os = "ios", test))]
+    let registered = read_source_record(&root, id).is_some();
+    #[cfg(not(any(target_os = "ios", test)))]
+    let registered = source_record(&root).is_some();
+    if registered {
+        return Ok(root);
+    }
+    if std::fs::symlink_metadata(&root).is_ok_and(|m| !m.is_dir() || m.file_type().is_symlink()) {
+        return Err("Invalid saved document directory.".into());
+    }
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let record = SourceRecord {
+        id: id.into(),
+        root: root.clone(),
+        name: name.into(),
+        pages: Vec::new(),
+        folder: true,
+    };
+    let mut temp = tempfile::NamedTempFile::new_in(&root).map_err(|e| e.to_string())?;
+    serde_json::to_writer(&mut temp, &record).map_err(|e| e.to_string())?;
+    temp.as_file_mut().sync_all().map_err(|e| e.to_string())?;
+    temp.persist(root.join(SOURCE_MARKER))
+        .map_err(|e| e.to_string())?;
+    Ok(root)
 }
 
 pub(crate) fn source_page_exists(path: &Path) -> bool {
@@ -270,6 +383,11 @@ impl ImportBatch {
             .unwrap()
             .insert(source.root.clone(), self.canonical_directory.clone());
         Ok(())
+    }
+
+    /// Message for images left out of a folder import, if any.
+    pub(crate) fn mark_truncated(&mut self) {
+        self.truncated = true;
     }
 
     /// Message for images left out of a folder import, if any.

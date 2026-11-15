@@ -38,16 +38,35 @@ struct Paths {
 }
 static BACK: AtomicBool = AtomicBool::new(false);
 static PATHS: OnceLock<Paths> = OnceLock::new();
-static CONTEXT: OnceLock<egui::Context> = OnceLock::new();
+static CONTEXT: Mutex<Option<egui::Context>> = Mutex::new(None);
+#[cfg(target_os = "android")]
+static LOCALE_CHANGED: AtomicBool = AtomicBool::new(false);
 static IMPORT: Mutex<Option<Result<ImportBatch, String>>> = Mutex::new(None);
 static RESULT: Mutex<Option<Result<ImportBatch, String>>> = Mutex::new(None);
 static SETTINGS: Mutex<Option<Result<PathBuf, String>>> = Mutex::new(None);
 static EXPORT_FAILED: AtomicBool = AtomicBool::new(false);
 static REOPEN: Mutex<Option<PathBuf>> = Mutex::new(None);
-/// Orientation mode and immersive state last sent to the host.
-static DISPLAY: Mutex<Option<(i32, bool)>> = Mutex::new(None);
+#[cfg(target_os = "ios")]
+static IOS_IMPORT: Mutex<crate::core::ios_access::ImportGate> =
+    Mutex::new(crate::core::ios_access::ImportGate::new());
+#[cfg(target_os = "ios")]
+static IOS_COMPLETION: Mutex<
+    Option<(
+        Option<PathBuf>,
+        Option<crate::core::ios_access::AccessIssue>,
+    )>,
+> = Mutex::new(None);
+#[cfg(target_os = "ios")]
+static IOS_ACCESS_CHANGED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "ios")]
+static IOS_ACCESS_ACTIONS: Mutex<Vec<(i32, bool)>> = Mutex::new(Vec::new());
+static DISPLAY: Mutex<super::mobile_display::DisplayState> =
+    Mutex::new(super::mobile_display::DisplayState::new());
 
 fn init_paths() {
+    if PATHS.get().is_some() {
+        return;
+    }
     let path = |kind| {
         let p = unsafe { nabi_mobile_path(kind) };
         if p.is_null() {
@@ -107,13 +126,88 @@ pub fn init_android(app: &android_activity::AndroidApp) {
     init_paths();
 }
 
+/// Called after the event loop has saved and released the viewer. The native
+/// gate drains active callbacks and rejects callbacks from the old Activity.
+#[cfg(target_os = "android")]
+pub fn shutdown_android() {
+    unsafe extern "C" {
+        fn nabi_android_shutdown();
+    }
+    unsafe {
+        nabi_android_shutdown();
+    }
+    CONTEXT.lock().unwrap().take();
+    IMPORT.lock().unwrap().take();
+    RESULT.lock().unwrap().take();
+    SETTINGS.lock().unwrap().take();
+    REOPEN.lock().unwrap().take();
+    *DISPLAY.lock().unwrap() = super::mobile_display::DisplayState::new();
+    BACK.store(false, Ordering::Relaxed);
+    LOCALE_CHANGED.store(false, Ordering::Relaxed);
+    EXPORT_FAILED.store(false, Ordering::Relaxed);
+    crate::platform::locale::invalidate_cache();
+}
+
 pub fn set_context(ctx: egui::Context) {
-    let _ = CONTEXT.set(ctx);
+    *CONTEXT.lock().unwrap() = Some(ctx);
 }
 fn repaint() {
-    if let Some(ctx) = CONTEXT.get() {
+    let ctx = CONTEXT.lock().unwrap().clone();
+    if let Some(ctx) = ctx {
         ctx.request_repaint();
     }
+}
+
+/// Native hosts report the OS window mode, independently of immersive UI.
+/// -1 means the host has not attached a window yet.
+#[unsafe(no_mangle)]
+extern "C" fn nabi_mobile_window_mode_changed(state: i32) {
+    let windowed = match state {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    };
+    let changed = DISPLAY.lock().unwrap().set_windowed(windowed);
+    if changed {
+        repaint();
+    }
+}
+
+pub fn windowed() -> Option<bool> {
+    DISPLAY.lock().unwrap().windowed()
+}
+
+/// Native dialogs use the same active language as the Rust UI, including on
+/// Android versions without per-app LocaleManager support.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn nabi_mobile_text(
+    key: *const c_char,
+    output: *mut u16,
+    capacity: usize,
+) -> usize {
+    if key.is_null() {
+        return 0;
+    }
+    let key = unsafe { CStr::from_ptr(key) }.to_string_lossy();
+    let text: Vec<u16> = crate::i18n::native_tr(&key).encode_utf16().collect();
+    if !output.is_null() && capacity >= text.len() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(text.as_ptr(), output, text.len());
+        }
+    }
+    text.len()
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+extern "C" fn nabi_mobile_locale_changed() {
+    LOCALE_CHANGED.store(true, Ordering::Relaxed);
+    repaint();
+}
+
+#[cfg(target_os = "android")]
+pub fn take_locale_changed() -> bool {
+    LOCALE_CHANGED.swap(false, Ordering::Relaxed)
 }
 
 pub fn store() -> Result<Store, String> {
@@ -121,11 +215,17 @@ pub fn store() -> Result<Store, String> {
     if !paths.data.is_absolute() || !paths.cache.is_absolute() {
         return Err("App storage is unavailable".into());
     }
-    Ok(Store::in_directories_with_cache(
+    let store = Store::in_directories_with_cache(
         paths.data.join("config"),
         paths.data.join("state"),
         paths.cache.clone(),
-    ))
+    );
+    #[cfg(target_os = "android")]
+    let defaults = crate::core::photo_library::ANDROID;
+    #[cfg(target_os = "ios")]
+    let defaults = crate::core::photo_library::IOS_DEFAULTS;
+    store.initialize_photo_bookmarks(&paths.data.join("document-sources"), defaults)?;
+    Ok(store)
 }
 
 pub fn sample_path() -> Option<PathBuf> {
@@ -190,6 +290,133 @@ pub fn pick() {
 }
 pub fn take_result() -> Option<Result<ImportBatch, String>> {
     RESULT.lock().unwrap().take()
+}
+
+#[cfg(target_os = "ios")]
+pub fn photo_status() -> crate::core::ios_access::PhotoStatus {
+    unsafe extern "C" {
+        fn nabi_mobile_photo_status() -> i32;
+    }
+    crate::core::ios_access::PhotoStatus::from_native(unsafe { nabi_mobile_photo_status() })
+}
+
+/// Recovery may rebase an old container path only if it is already a saved
+/// library entry. Native code must still validate/reacquire the actual grant.
+#[cfg(target_os = "ios")]
+pub fn recovery_source(path: &Path) -> Option<PathBuf> {
+    let (root, id) = crate::core::documents::source_identity(path)?;
+    let sources = PATHS.get()?.data.join("document-sources");
+    let suffix = path.strip_prefix(&root).ok()?;
+    if !suffix
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    if root.parent() != Some(sources.as_path())
+        && !store()
+            .ok()?
+            .library()
+            .ok()?
+            .iter()
+            .any(|entry| entry.folder == root)
+    {
+        return None;
+    }
+    Some(sources.join(id).join(suffix))
+}
+
+#[cfg(target_os = "ios")]
+pub fn access_action(action: i32, source: Option<&Path>) -> bool {
+    unsafe extern "C" {
+        fn nabi_mobile_open_settings() -> bool;
+        fn nabi_mobile_manage_photos() -> bool;
+        fn nabi_mobile_reselect(id: *const u16, length: i32) -> bool;
+        fn nabi_mobile_request_photo_access() -> bool;
+    }
+    match action {
+        1 => unsafe { nabi_mobile_open_settings() },
+        2 => unsafe { nabi_mobile_manage_photos() },
+        4 => unsafe { nabi_mobile_request_photo_access() },
+        3 => {
+            let Some(path) = source else {
+                return false;
+            };
+            let Some((root, id)) = crate::core::documents::source_identity(path) else {
+                return false;
+            };
+            if PATHS.get().is_none_or(|paths| {
+                root.parent() != Some(paths.data.join("document-sources").as_path())
+            }) {
+                return false;
+            }
+            if !IOS_IMPORT.lock().unwrap().start(Some(path.to_owned())) {
+                return false;
+            }
+            *REOPEN.lock().unwrap() = Some(path.to_owned());
+            let text: Vec<u16> = id.encode_utf16().collect();
+            let accepted = unsafe { nabi_mobile_reselect(text.as_ptr(), text.len() as i32) };
+            if !accepted {
+                IOS_IMPORT.lock().unwrap().finish();
+                REOPEN.lock().unwrap().take();
+            }
+            accepted
+        }
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "ios")]
+pub fn cancel_access_import() {
+    IOS_IMPORT.lock().unwrap().cancel();
+    RESULT.lock().unwrap().take();
+    IOS_COMPLETION.lock().unwrap().take();
+    REOPEN.lock().unwrap().take();
+}
+
+#[cfg(target_os = "ios")]
+pub fn access_import_busy() -> bool {
+    IOS_IMPORT.lock().unwrap().busy()
+}
+#[cfg(target_os = "ios")]
+pub fn access_import_source() -> Option<PathBuf> {
+    IOS_IMPORT.lock().unwrap().source()
+}
+
+#[cfg(target_os = "ios")]
+pub fn take_access_completion() -> Option<(
+    Option<PathBuf>,
+    Option<crate::core::ios_access::AccessIssue>,
+)> {
+    IOS_COMPLETION.lock().unwrap().take()
+}
+
+#[cfg(target_os = "ios")]
+pub fn take_access_changed() -> bool {
+    IOS_ACCESS_CHANGED.swap(false, Ordering::Relaxed)
+}
+
+#[cfg(target_os = "ios")]
+pub fn take_access_actions() -> Vec<(i32, bool)> {
+    std::mem::take(&mut *IOS_ACCESS_ACTIONS.lock().unwrap())
+}
+
+#[cfg(target_os = "ios")]
+#[unsafe(no_mangle)]
+extern "C" fn nabi_mobile_access_changed() {
+    IOS_ACCESS_CHANGED.store(true, Ordering::Relaxed);
+    repaint();
+}
+
+#[cfg(target_os = "ios")]
+#[unsafe(no_mangle)]
+extern "C" fn nabi_mobile_access_action_result(action: i32, success: bool) {
+    if action == 3 && !success {
+        IOS_IMPORT.lock().unwrap().finish();
+        REOPEN.lock().unwrap().take();
+    }
+    IOS_ACCESS_ACTIONS.lock().unwrap().push((action, success));
+    repaint();
 }
 pub fn safe_area() -> [f32; 4] {
     let mut result = [0.; 4];
@@ -258,6 +485,10 @@ pub fn reopen(path: &Path) -> bool {
     if record.root.parent() != Some(paths.data.join("document-sources").as_path()) {
         return false;
     }
+    #[cfg(target_os = "ios")]
+    if !IOS_IMPORT.lock().unwrap().start(Some(path.to_owned())) {
+        return true;
+    }
     {
         let mut pending = REOPEN.lock().unwrap();
         // A second click can arrive before the native worker calls begin_import.
@@ -270,6 +501,10 @@ pub fn reopen(path: &Path) -> bool {
     }
     let id: Vec<u16> = record.id.encode_utf16().collect();
     if !unsafe { nabi_mobile_reopen(id.as_ptr(), id.len() as i32) } {
+        #[cfg(target_os = "ios")]
+        {
+            *IOS_COMPLETION.lock().unwrap() = IOS_IMPORT.lock().unwrap().finish();
+        }
         REOPEN.lock().unwrap().take();
         *RESULT.lock().unwrap() = Some(Err(
             "Another document operation is still in progress.".into()
@@ -291,18 +526,13 @@ pub fn source_available(path: &Path) -> bool {
 /// Applies the orientation lock (`auto`, `portrait`, `landscape`) and
 /// immersive full screen. Cheap to call every frame; only changes reach the host.
 pub fn sync_display(orientation: &str, immersive: bool) {
-    let mode = match orientation {
-        "portrait" => 1,
-        "landscape" => 2,
-        _ => 0,
-    };
-    let mut applied = DISPLAY.lock().unwrap();
-    let previous = applied.replace((mode, immersive));
+    // UIKit may call back synchronously. Never hold DISPLAY across native code.
+    let (orientation, immersive) = DISPLAY.lock().unwrap().requests(orientation, immersive);
     unsafe {
-        if previous.is_none_or(|(old, _)| old != mode) {
+        if let Some(mode) = orientation {
             nabi_mobile_set_orientation(mode);
         }
-        if previous.is_none_or(|(_, old)| old != immersive) {
+        if let Some(immersive) = immersive {
             nabi_mobile_set_immersive(immersive);
         }
     }
@@ -351,6 +581,16 @@ pub fn take_settings_import() -> Option<Result<PathBuf, String>> {
 }
 
 fn begin_import(folder: bool) -> bool {
+    #[cfg(target_os = "ios")]
+    {
+        let mut gate = IOS_IMPORT.lock().unwrap();
+        if !gate.busy() {
+            gate.start(None);
+        }
+        if !gate.current() {
+            return false;
+        }
+    }
     let requested = REOPEN.lock().unwrap().take();
     let mut batch = PATHS
         .get()
@@ -388,6 +628,11 @@ fn import_source(id: &str, name: &str) {
     if let (Some(Ok(batch)), Some(paths)) = (pending.as_mut(), PATHS.get()) {
         if let Err(error) = batch.set_source(&paths.data.join("document-sources"), id, name) {
             *pending = Some(Err(error));
+        } else {
+            #[cfg(target_os = "ios")]
+            if let Some(source) = batch.source() {
+                IOS_IMPORT.lock().unwrap().identify(source.root.clone());
+            }
         }
     }
 }
@@ -460,6 +705,10 @@ fn import_fd(fd: i32, name: &str) -> bool {
     }
     // The native picker transfers an owned descriptor. Close it on every path.
     let source = unsafe { File::from_raw_fd(fd) };
+    #[cfg(target_os = "ios")]
+    if !IOS_IMPORT.lock().unwrap().current() {
+        return false;
+    }
     let modified = source
         .metadata()
         .ok()
@@ -505,6 +754,32 @@ fn import_error(error: String) {
 }
 
 #[unsafe(no_mangle)]
+extern "C" fn nabi_mobile_photo_error(reason: i32) {
+    #[cfg(target_os = "ios")]
+    {
+        let issue = crate::core::ios_access::AccessIssue::from_native(reason);
+        IOS_IMPORT.lock().unwrap().issue = Some(issue);
+        import_error(issue.message().into());
+    }
+    #[cfg(not(target_os = "ios"))]
+    import_error(
+        match reason {
+            1 => "photo-access-denied",
+            2 => "photo-collection-empty",
+            _ => "folder-unavailable",
+        }
+        .into(),
+    );
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn nabi_mobile_import_truncated() {
+    if let Some(Ok(batch)) = IMPORT.lock().unwrap().as_mut() {
+        batch.mark_truncated();
+    }
+}
+
+#[unsafe(no_mangle)]
 unsafe extern "C" fn nabi_mobile_import_error(message: *const c_char) {
     let message = if message.is_null() {
         "Could not read the selected document.".into()
@@ -518,6 +793,18 @@ unsafe extern "C" fn nabi_mobile_import_error(message: *const c_char) {
 
 #[unsafe(no_mangle)]
 extern "C" fn nabi_mobile_import_finish() {
+    #[cfg(target_os = "ios")]
+    let mut gate = IOS_IMPORT.lock().unwrap();
+    #[cfg(target_os = "ios")]
+    {
+        if !gate.current() {
+            gate.finish();
+            IMPORT.lock().unwrap().take();
+            repaint();
+            return;
+        }
+        *IOS_COMPLETION.lock().unwrap() = gate.finish();
+    }
     if let Some(mut result) = IMPORT.lock().unwrap().take() {
         if result
             .as_ref()

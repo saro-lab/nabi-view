@@ -82,6 +82,9 @@ goto finish
 echo NABI VIEW mobile
 echo   mobile.bat preview               Check the phone/tablet layout on this PC
 echo   mobile.bat android               Build, install and run on a connected phone/tablet/emulator
+echo   mobile.bat android --list        List devices and USB authorization status
+echo   mobile.bat android --usb --debug --logs  USB debug build, run and app logs
+echo   mobile.bat android --debug --build-only  Build APK with Rust debug symbols
 echo   mobile.bat android --build-only  Build the shared phone/tablet APK
 echo   mobile.bat android --release --build-only  Build a release APK
 echo   mobile.bat android --release --bundle      Build a Play AAB

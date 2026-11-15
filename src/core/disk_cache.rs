@@ -172,6 +172,41 @@ impl Cache {
         self.prune_locked()
     }
 
+    /// Capture before thumbnail decoding, so clear-all also invalidates work
+    /// that is still preparing its pixels outside the cross-process lock.
+    pub fn thumbnail_generation(&self) -> io::Result<u64> {
+        let _lock = self.lock()?;
+        Ok(self.generation())
+    }
+
+    /// Publish a thumbnail only while its generation and current policy allow
+    /// it. Returning false leaves the decoded pixels usable without a cache key.
+    pub fn store_thumbnail(
+        &self,
+        generation: u64,
+        key: &str,
+        png: &[u8],
+        current_limit: impl FnOnce() -> u64,
+    ) -> io::Result<bool> {
+        if !crate::core::library::is_thumbnail_key(key) {
+            return Err(invalid());
+        }
+        let _lock = self.lock()?;
+        let limit = current_limit();
+        if generation != self.generation() || limit == 0 || png.len() as u64 > limit.min(MAX_FILE) {
+            return Ok(false);
+        }
+        let directory = self.root.join("thumbnails");
+        fs::create_dir_all(&directory)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+        temporary.write_all(png)?;
+        temporary
+            .persist(crate::core::library::thumbnail_file(&directory, key))
+            .map_err(|error| error.error)?;
+        Self::new(self.root.clone(), limit).prune_locked()?;
+        Ok(true)
+    }
+
     /// Includes display images and the migrated library thumbnail cache.
     pub fn stats(&self) -> io::Result<Stats> {
         let _lock = self.lock()?;
@@ -387,6 +422,38 @@ mod tests {
         cache
             .store(&cache.key(&source, 512).unwrap(), &pixels(), [2, 1])
             .unwrap();
+        assert_eq!(cache.stats().unwrap().files, 1);
+    }
+    #[test]
+    fn thumbnail_publish_obeys_clear_generation_and_latest_limit() {
+        let (_root, cache, _) = fixture();
+        let key = "a".repeat(32);
+        let before_clear = cache.thumbnail_generation().unwrap();
+        cache.clear().unwrap();
+        assert!(
+            !cache
+                .store_thumbnail(before_clear, &key, b"thumbnail", || 1024)
+                .unwrap()
+        );
+        assert_eq!(cache.stats().unwrap().files, 0);
+
+        let current = cache.thumbnail_generation().unwrap();
+        assert!(
+            !cache
+                .store_thumbnail(current, &key, b"thumbnail", || 0)
+                .unwrap()
+        );
+        assert!(
+            !cache
+                .store_thumbnail(current, &key, b"thumbnail", || 1)
+                .unwrap()
+        );
+        assert_eq!(cache.stats().unwrap().files, 0);
+        assert!(
+            cache
+                .store_thumbnail(current, &key, b"thumbnail", || 1024)
+                .unwrap()
+        );
         assert_eq!(cache.stats().unwrap().files, 1);
     }
     #[test]

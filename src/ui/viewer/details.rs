@@ -14,6 +14,82 @@ struct Slot {
     active: bool,
     failed: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotated_detail_requests_the_visible_source_crop_at_the_correct_density() {
+        let ctx = egui::Context::default();
+        let mut details = Details::new(ctx.clone());
+        details.begin(&ctx, None, 32 * 1024 * 1024);
+        let transform = ImageTransform {
+            quarter_turns: 1,
+            ..Default::default()
+        };
+        let rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024., 2048.));
+        let clip = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(256., 1024.));
+        let path = Path::new("rotation-detail-test.png");
+        // The display's upper-left quarter is the source's bottom-left
+        // quadrant after a clockwise rotation, with one texel per pixel.
+        let _ = ctx.run_pass(egui::RawInput::default(), |ctx| {
+            ctx.root_ui(|ui| {
+                details.paint(
+                    0,
+                    path,
+                    [2048, 1024],
+                    rect,
+                    clip,
+                    transform,
+                    ctx,
+                    ui,
+                    Color32::BLACK,
+                    false,
+                    0.125,
+                );
+            });
+        });
+        let requested = details.slots[0].requested.clone().unwrap();
+        assert_eq!(
+            requested.area,
+            Area {
+                x: 0,
+                y: 768,
+                width: 1024,
+                height: 256,
+            },
+        );
+        assert_eq!(requested.max_side, 1024);
+        let handle = ctx.load_texture(
+            "rotation-detail-ready",
+            egui::ColorImage::filled([1024, 256], Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        details.slots[0].ready = Some((requested, handle, None));
+        let mut painted = None;
+        let _ = ctx.run_pass(egui::RawInput::default(), |ctx| {
+            ctx.root_ui(|ui| {
+                painted = details.paint(
+                    0,
+                    path,
+                    [2048, 1024],
+                    rect,
+                    clip,
+                    transform,
+                    ctx,
+                    ui,
+                    Color32::BLACK,
+                    false,
+                    0.125,
+                );
+            });
+        });
+        let painted = painted.unwrap();
+        assert_eq!(painted.rect, clip);
+        assert_eq!(painted.backdrop, rect);
+    }
+}
 impl Slot {
     fn bytes(&self) -> usize {
         self.ready.as_ref().map_or(0, |(_, handle, hdr)| {
@@ -145,7 +221,7 @@ impl Details {
         original: [u32; 2],
         rect: Rect,
         clip: Rect,
-        flip: [bool; 2],
+        image_transform: ImageTransform,
         ctx: &egui::Context,
         ui: &egui::Ui,
         background: Color32,
@@ -157,14 +233,12 @@ impl Details {
             return None;
         }
         let size = egui::vec2(original[0] as f32, original[1] as f32);
-        let mut lo = (visible.min - rect.min) / rect.size();
-        let mut hi = (visible.max - rect.min) / rect.size();
-        if flip[0] {
-            (lo.x, hi.x) = (1. - hi.x, 1. - lo.x);
-        }
-        if flip[1] {
-            (lo.y, hi.y) = (1. - hi.y, 1. - lo.y);
-        }
+        let source = image_transform.display_rect_to_source(Rect::from_min_max(
+            ((visible.min - rect.min) / rect.size()).to_pos2(),
+            ((visible.max - rect.min) / rect.size()).to_pos2(),
+        ));
+        let lo = source.min;
+        let hi = source.max;
         // A surrounding 128-source-pixel band avoids restarting at every pointer pixel.
         let start = [
             ((lo.x * size.x).floor().max(0.) as u32 / 128) * 128,
@@ -189,7 +263,8 @@ impl Details {
         if area.width == 0 || area.height == 0 {
             return None;
         }
-        let physical = (rect.width() / size.x * ctx.pixels_per_point()).min(1.);
+        let physical =
+            (rect.width() / image_transform.size(size).x * ctx.pixels_per_point()).min(1.);
         let other_bytes = self
             .slots
             .iter()
@@ -243,38 +318,33 @@ impl Details {
         }
         let (ready, handle, hdr) = slot.ready.as_ref()?;
         let area = ready.area;
-        let x = if flip[0] {
-            original[0] - area.x - area.width
-        } else {
-            area.x
-        };
-        let y = if flip[1] {
-            original[1] - area.y - area.height
-        } else {
-            area.y
-        };
-        let tile = Rect::from_min_size(
-            rect.min + egui::vec2(x as f32, y as f32) / size * rect.size(),
-            egui::vec2(area.width as f32, area.height as f32) / size * rect.size(),
+        let display = image_transform.source_rect_to_display(Rect::from_min_size(
+            (egui::vec2(area.x as f32, area.y as f32) / size).to_pos2(),
+            egui::vec2(area.width as f32, area.height as f32) / size,
+        ));
+        let tile = Rect::from_min_max(
+            rect.min + display.min.to_vec2() * rect.size(),
+            rect.min + display.max.to_vec2() * rect.size(),
         );
         let painter = ui.painter().with_clip_rect(clip.intersect(tile));
         painter.rect_filled(tile, 0., background);
         if checker {
             crate::ui::transparency::paint(&painter, rect, 12.);
         }
-        painter.image(
+        image_transform.paint(
+            &painter,
             hdr.as_ref()
                 .filter(|hdr| hdr.active())
                 .map_or_else(|| handle.id(), |hdr| hdr.id()),
             tile,
-            image_uv(flip[0], flip[1]),
-            Color32::WHITE,
         );
         Some(PresentedImage {
             hdr: hdr.clone(),
             handle: handle.clone(),
             rect: tile,
-            clip: clip.intersect(tile),
+            // Retain the page slot so a later canvas resize/recentering can
+            // move this tile together with the base image without clipping it.
+            clip,
             backdrop: rect,
         })
     }

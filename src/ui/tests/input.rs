@@ -156,7 +156,7 @@ fn pinned_canvas_drives_zoom_and_preserves_manual_scale() {
 
     let original = image::image_dimensions(sample_path().unwrap()).unwrap();
     let expected_percent =
-        fitted.width() * window.ctx.pixels_per_point() / original.0 as f32 * 100.;
+        fitted.width() * window.ctx.pixels_per_point() / window.scale / original.0 as f32 * 100.;
     let label = window.draw(None).0;
     let shown_percent = label
         .split_whitespace()
@@ -226,6 +226,9 @@ fn modified_drag_moves_the_photo_without_moving_the_window() {
     ] {
         let mut window = TestWindow::sample_with_modifier_gestures();
         window.wait_for("");
+        // The 900×1180 sample exceeds the canvas at actual size and can pan.
+        window.draw(Some(Key::Num1));
+        window.draw(None);
         let before = window.photo_rects();
         let delta = egui::vec2(72., -38.);
         assert!(!window.drag_pointer_with_modifiers(before.1.center(), delta, modifiers));
@@ -251,6 +254,8 @@ fn modified_drag_moves_the_photo_without_moving_the_window() {
 fn image_drag_keeps_its_mode_when_the_modifier_is_released() {
     let mut window = TestWindow::sample_with_modifier_gestures();
     window.wait_for("");
+    window.draw(Some(Key::Num1));
+    window.draw(None);
     let before = window.photo_rects();
     let start = before.1.center();
     let modifiers = egui::Modifiers {
@@ -293,16 +298,21 @@ fn image_drag_keeps_its_mode_when_the_modifier_is_released() {
 }
 
 #[test]
-fn dragging_an_empty_black_canvas_moves_the_window() {
+fn dragging_the_empty_menu_backdrop_moves_the_window() {
     let mut window = TestWindow::open(None);
     window.draw(Some(Key::Escape));
     window.draw(None);
     assert!(
-        window.drag_pointer(egui::pos2(540., 380.), egui::vec2(40., 20.)),
-        "Empty canvas did not request window movement"
+        window.drag_pointer(egui::pos2(24., 180.), egui::vec2(40., 20.)),
+        "Empty menu backdrop did not request window movement"
     );
-    let (text, image) = window.draw(None);
-    assert!(text.is_empty());
+    let (_, image) = window.draw(None);
+    assert!(
+        window
+            .ctx
+            .read_response(egui::Id::unique(("menu-command", "open")))
+            .is_some()
+    );
     assert!(!image);
 }
 
@@ -311,6 +321,8 @@ fn returning_to_window_cancels_an_interrupted_image_drag() {
     for lose_focus in [false, true] {
         let mut window = TestWindow::sample_with_modifier_gestures();
         window.wait_for("");
+        window.draw(Some(Key::Num1));
+        window.draw(None);
         let start = window.photo_rects().1.center();
         let modifiers = egui::Modifiers::CTRL;
         window.draw_events(
@@ -609,7 +621,15 @@ fn escape_closes_only_the_active_dialog_or_the_unblocked_viewer() {
     window.wait_for("1 / 5");
     window.draw(Some(Key::H));
     window.click(window.titlebar_icon("settings").rect.center());
-    for key in [Key::R, Key::T, Key::OpenBracket, Key::D, Key::Q, Key::F] {
+    for key in [
+        Key::T,
+        Key::Y,
+        Key::R,
+        Key::OpenBracket,
+        Key::D,
+        Key::Q,
+        Key::F,
+    ] {
         window.draw(Some(key));
         assert!(!window.viewport_commands.iter().any(|command| {
             matches!(
@@ -620,6 +640,7 @@ fn escape_closes_only_the_active_dialog_or_the_unblocked_viewer() {
     }
     let settings = saved_viewer_settings(&window);
     assert!(!settings.flip_horizontal && !settings.flip_vertical && !settings.spread);
+    assert_eq!(settings.rotation_quarter_turns, 0);
     window.draw(Some(Key::Escape));
     assert!(
         !window
@@ -636,7 +657,7 @@ fn escape_closes_only_the_active_dialog_or_the_unblocked_viewer() {
     window.draw(Some(Key::Space));
     window.click(window.titlebar_icon("random").rect.center());
     window.wait_for("Clear checks and enable random order?");
-    window.draw(Some(Key::R));
+    window.draw(Some(Key::T));
     window.draw(Some(Key::D));
     assert!(!saved_viewer_settings(&window).flip_horizontal);
     assert_eq!(focused_thumbnail_pages(&window), [1]);

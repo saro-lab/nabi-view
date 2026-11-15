@@ -131,10 +131,18 @@ impl Animation {
             Ok(Ok(frame)) => {
                 // A late decoder holds the last good frame. Do not skip frames
                 // or race through a backlog after a stalled/hidden window.
+                // Match browser playback for unspecified/very short delays.
+                // Treating 0–10 ms as 10 ms makes these images play up to ten
+                // times faster than their usual GIF/APNG/WebP/AVIF presentation.
+                let delay = if frame.delay <= Duration::from_millis(10) {
+                    Duration::from_millis(100)
+                } else {
+                    frame.delay
+                };
                 playback.deadline = now
-                    .checked_add(frame.delay)
+                    .checked_add(delay)
                     .ok_or("Invalid animation frame delay")?;
-                ctx.request_repaint_after(frame.delay);
+                ctx.request_repaint_after(delay);
                 Ok(Some(frame))
             }
             Ok(Err(error)) => {
@@ -359,6 +367,105 @@ mod tests {
     use super::*;
 
     use super::super::animation_fixtures::gif;
+
+    fn queued_animation(now: Instant) -> (Animation, mpsc::Sender<Result<AnimationFrame, String>>) {
+        let image = egui::ColorImage::filled([1, 1], egui::Color32::RED);
+        let mut animation =
+            Animation::new(Path::new("unused.gif"), ImageFormat::Gif, 1, [1, 1], &image);
+        let (send, frames) = mpsc::channel();
+        animation.playback = Some(Playback {
+            frames,
+            live: Arc::new(AtomicBool::new(true)),
+            deadline: now,
+            finished: false,
+        });
+        (animation, send)
+    }
+
+    fn timed_frame(delay: Duration) -> AnimationFrame {
+        AnimationFrame {
+            image: egui::ColorImage::filled([1, 1], egui::Color32::RED),
+            hdr: None,
+            delay,
+        }
+    }
+
+    #[test]
+    fn playback_matches_browser_short_delay_timing() {
+        let ctx = egui::Context::default();
+        let start = Instant::now();
+        for (encoded, expected) in [
+            (Duration::ZERO, Duration::from_millis(100)),
+            (Duration::from_millis(1), Duration::from_millis(100)),
+            (Duration::from_millis(10), Duration::from_millis(100)),
+            (Duration::from_micros(10_001), Duration::from_micros(10_001)),
+            (
+                Duration::from_nanos(16_666_667),
+                Duration::from_nanos(16_666_667),
+            ),
+            (Duration::from_millis(20), Duration::from_millis(20)),
+            (Duration::from_millis(60), Duration::from_millis(60)),
+            (Duration::from_millis(70), Duration::from_millis(70)),
+            (Duration::from_millis(140), Duration::from_millis(140)),
+            (Duration::from_secs(2), Duration::from_secs(2)),
+        ] {
+            let (mut animation, send) = queued_animation(start);
+            for _ in 0..3 {
+                send.send(Ok(timed_frame(encoded))).unwrap();
+            }
+            assert!(animation.advance(&ctx, start).unwrap().is_some());
+            // Input, worker notifications, and egui's extra passes must never
+            // consume another frame before the displayed frame expires.
+            for offset in [
+                Duration::ZERO,
+                expected / 2,
+                expected - Duration::from_nanos(1),
+            ] {
+                assert!(
+                    animation.advance(&ctx, start + offset).unwrap().is_none(),
+                    "advanced early for encoded delay {encoded:?} at {offset:?}"
+                );
+            }
+            assert!(animation.advance(&ctx, start + expected).unwrap().is_some());
+            assert!(animation.advance(&ctx, start + expected).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn playback_keeps_full_delays_after_ui_or_decoder_stalls() {
+        let ctx = egui::Context::default();
+        let start = Instant::now();
+        let (mut animation, send) = queued_animation(start);
+        send.send(Ok(timed_frame(Duration::from_millis(60))))
+            .unwrap();
+        send.send(Ok(timed_frame(Duration::from_millis(70))))
+            .unwrap();
+        assert!(animation.advance(&ctx, start).unwrap().is_some());
+        let resumed = start + Duration::from_secs(5);
+        assert!(animation.advance(&ctx, resumed).unwrap().is_some());
+        assert!(animation.advance(&ctx, resumed).unwrap().is_none());
+        // The next decode arrives after its deadline. It must get its own full
+        // duration, rather than racing to catch up with the old deadline.
+        let late = resumed + Duration::from_secs(1);
+        assert!(animation.advance(&ctx, late).unwrap().is_none());
+        send.send(Ok(timed_frame(Duration::from_millis(140))))
+            .unwrap();
+        send.send(Ok(timed_frame(Duration::from_millis(60))))
+            .unwrap();
+        assert!(animation.advance(&ctx, late).unwrap().is_some());
+        assert!(
+            animation
+                .advance(&ctx, late + Duration::from_millis(139))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            animation
+                .advance(&ctx, late + Duration::from_millis(140))
+                .unwrap()
+                .is_some()
+        );
+    }
 
     fn receive(playback: &Playback) -> AnimationFrame {
         playback

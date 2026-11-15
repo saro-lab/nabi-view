@@ -55,6 +55,10 @@ impl Viewer {
                 "zoom",
                 &format!("{}%", format_zoom_percent(self.zoom_percent(ctx))),
             ),
+            "rotate-right" | "rotate-left" => crate::i18n::value_label(
+                "image-rotation",
+                &format!("{}°", self.settings.rotation_quarter_turns as u16 * 90),
+            ),
             "flip-horizontal" => toggle("flip-horizontally", self.settings.flip_horizontal),
             "flip-vertical" => toggle("flip-vertically", self.settings.flip_vertical),
             "rtl" => crate::i18n::value_label(

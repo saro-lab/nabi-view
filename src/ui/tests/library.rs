@@ -158,7 +158,13 @@ fn bottom_bar_bookmark_sits_left_of_move_and_needs_an_image() {
     }
     empty.draw(Some(Key::Escape));
     empty.draw(Some(Key::B));
-    assert!(!empty.draw(None).0.contains(tr("add-bookmark")));
+    empty.draw(None);
+    assert!(
+        empty
+            .ctx
+            .read_response(egui::Id::unique("bookmark-name"))
+            .is_none()
+    );
 }
 
 #[test]
@@ -219,4 +225,34 @@ fn narrow_library_switches_lists_with_tabs_and_edits_bookmarks() {
     assert_eq!(bookmarks(&state).len(), 1);
     assert!(marked.join("1.png").is_file());
     assert!(row(&window, "bookmark", &gone).is_none());
+}
+
+#[test]
+fn narrow_empty_recent_starts_on_bookmarks_but_explicit_recent_stays_selected() {
+    let mut window = TestWindow::open(None);
+    let state = store(&window);
+    let root = tempfile::tempdir().unwrap();
+    let marked = image_folder(root.path(), "marked");
+    state.add_bookmark(&marked.join("1.png"), "Marked").unwrap();
+    window.screen_size = egui::vec2(390., 844.);
+    window.app = Viewer::new(
+        &CreationContext::_new_kittest(window.ctx.clone()),
+        None,
+        Ok(state),
+    );
+    for _ in 0..5 {
+        window.draw(None);
+    }
+    assert!(row(&window, "bookmark", &marked).is_some());
+    window.click(window.label_position(tr("recent")));
+    for _ in 0..3 {
+        window.draw(None);
+    }
+    assert!(row(&window, "bookmark", &marked).is_none());
+    window.click(window.label_position(tr("bookmarks")));
+    window.draw(None);
+    assert!(row(&window, "bookmark", &marked).is_some());
+    window.screen_size = egui::vec2(1100., 800.);
+    window.draw(None);
+    assert!(row(&window, "bookmark", &marked).is_some());
 }

@@ -123,6 +123,52 @@ mod tests {
     }
 
     #[test]
+    fn selected_mobile_image_stays_current_when_its_folder_is_added_and_sorted() {
+        let root = tempfile::tempdir_in(crate::test_support::root()).unwrap();
+        let image = std::fs::read(crate::app::sample_path().unwrap()).unwrap();
+        let sources = root.path().join("document-sources");
+        let mut selection = ImportBatch::new_folder(root.path()).unwrap();
+        // The selected image arrives first, then its accessible neighbors.
+        for name in ["page10.png", "page2.png", "page20.png"] {
+            selection.add(name, image.as_slice()).unwrap();
+        }
+        selection
+            .set_source(&sources, "12345678-photo-folder", "Download/Book/")
+            .unwrap();
+        selection.commit_source().unwrap();
+        let source = selection.source().unwrap().root.clone();
+        let (mut app, ctx) = window(root.path());
+        app.accept_mobile_selection(selection);
+        wait(&mut app, &ctx);
+        assert_eq!(app.files.len(), 3);
+        assert_eq!(app.focus_index, 1);
+        assert_eq!(
+            app.page_location(&app.files[app.focus_index]),
+            source.join("page10.png")
+        );
+        assert_eq!(app.files[0].file_name().unwrap(), "page2.png");
+        assert_eq!(app.files[2].file_name().unwrap(), "page20.png");
+        // A later reopen still starts at the saved page rather than the first
+        // item returned by MediaStore's new query order.
+        let mut reopened = ImportBatch::new_folder(root.path()).unwrap();
+        for name in ["page2.png", "page10.png", "page20.png"] {
+            reopened.add(name, image.as_slice()).unwrap();
+        }
+        reopened
+            .set_source(&sources, "12345678-photo-folder", "Download/Book/")
+            .unwrap();
+        reopened.request_page(Some(source.join("page10.png")));
+        reopened.commit_source().unwrap();
+        app.accept_mobile_selection(reopened);
+        wait(&mut app, &ctx);
+        assert_eq!(app.focus_index, 1);
+        assert_eq!(
+            app.page_location(&app.files[app.focus_index]),
+            source.join("page10.png")
+        );
+    }
+
+    #[test]
     fn imported_images_record_stable_sources_and_keep_bookmarks_after_copy_cleanup() {
         let root = tempfile::tempdir_in(crate::test_support::root()).unwrap();
         let image = std::fs::read(crate::app::sample_path().unwrap()).unwrap();

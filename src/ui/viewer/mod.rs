@@ -10,16 +10,21 @@ mod chrome_icons;
 mod details;
 mod forms;
 mod image_pipeline;
+mod image_transform;
 mod input;
+#[cfg(any(target_os = "ios", test))]
+mod ios_access;
 mod library;
 mod menu;
 mod metadata;
 mod mobile_chrome;
 #[cfg(any(target_os = "ios", target_os = "android", test))]
 mod mobile_sources;
+mod mobile_swipe;
 mod move_files;
 mod navigation;
 mod overlay;
+mod rename_files;
 mod settings;
 mod sorting;
 mod toasts;
@@ -33,6 +38,7 @@ use crate::i18n::{Language, tr};
 use crate::storage::Store;
 use chrome_icons::HoverText;
 use eframe::egui::{self, Color32, FontId, Key, Rect, RichText, Vec2};
+use image_transform::ImageTransform;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -117,20 +123,49 @@ struct PresentedImage {
 struct Presentation {
     images: Vec<PresentedImage>,
     canvas: Option<Rect>,
+    pan: Vec2,
+    image_transform: ImageTransform,
 }
 
 impl Presentation {
     fn paint(
-        &self,
+        &mut self,
         ui: &egui::Ui,
         canvas: Rect,
-        image_uv: Rect,
+        image_transform: ImageTransform,
+        background: Color32,
+        checker: bool,
+    ) {
+        self.paint_clipped(ui.painter(), canvas, image_transform, background, checker);
+    }
+
+    fn paint_clipped(
+        &mut self,
+        painter: &egui::Painter,
+        canvas: Rect,
+        image_transform: ImageTransform,
         background: Color32,
         checker: bool,
     ) {
         let Some(previous) = self.canvas else { return };
+        self.reorient(image_transform);
         let transform = egui::emath::RectTransform::from_to(previous, canvas);
         let scale = (canvas.width() / previous.width()).min(canvas.height() / previous.height());
+        if self.pan != Vec2::ZERO
+            && self.images.iter().all(|image| {
+                let slot = transform.transform_rect(image.clip).size();
+                let shown = image.backdrop.size() * scale;
+                shown.x <= slot.x + 0.001 && shown.y <= slot.y + 0.001
+            })
+        {
+            // Loading the next page must not leave a now-fitted retained image
+            // off-center after a resize. Discard the offset permanently.
+            for image in &mut self.images {
+                image.rect = image.rect.translate(-self.pan);
+                image.backdrop = image.backdrop.translate(-self.pan);
+            }
+            self.pan = Vec2::ZERO;
+        }
         for image in &self.images {
             let clip = if previous == canvas {
                 image.clip
@@ -145,7 +180,7 @@ impl Presentation {
                     image.rect.size() * scale,
                 )
             };
-            let painter = ui.painter().with_clip_rect(clip);
+            let painter = painter.with_clip_rect(clip);
             painter.rect_filled(rect, 0., background);
             let backdrop = if previous == canvas {
                 image.backdrop
@@ -162,17 +197,59 @@ impl Presentation {
                     12.,
                 );
             }
-            painter.image(
+            image_transform.paint(
+                &painter,
                 image
                     .hdr
                     .as_ref()
                     .filter(|hdr| hdr.active())
                     .map_or_else(|| image.handle.id(), |hdr| hdr.id()),
                 rect,
-                image_uv,
-                Color32::WHITE,
             );
         }
+    }
+
+    fn reorient(&mut self, next: ImageTransform) {
+        if self.image_transform == next {
+            return;
+        }
+        let Some(canvas) = self.canvas else { return };
+        let rotation_changed = self.image_transform.quarter_turns != next.quarter_turns;
+        let pan = if rotation_changed {
+            Vec2::ZERO
+        } else {
+            self.pan
+        };
+        for image in &mut self.images {
+            let normalized = Rect::from_min_max(
+                ((image.rect.min - image.backdrop.min) / image.backdrop.size()).to_pos2(),
+                ((image.rect.max - image.backdrop.min) / image.backdrop.size()).to_pos2(),
+            );
+            let source = self.image_transform.display_rect_to_source(normalized);
+            let display = next.source_rect_to_display(source);
+            let size = next.size(self.image_transform.size(image.backdrop.size()));
+            let backdrop = if rotation_changed {
+                // Keep the retained frame's pixel scale while the next page is
+                // decoding, and keep two pages joined at their central seam.
+                let x = if (image.clip.width() - canvas.width()).abs() < 0.001 {
+                    image.clip.center().x
+                } else if image.clip.center().x < canvas.center().x {
+                    image.clip.right() - size.x / 2.
+                } else {
+                    image.clip.left() + size.x / 2.
+                };
+                Rect::from_center_size(egui::pos2(x, image.clip.center().y) + pan, size)
+            } else {
+                image.backdrop
+            };
+            image.rect = Rect::from_min_max(
+                backdrop.min + display.min.to_vec2() * backdrop.size(),
+                backdrop.min + display.max.to_vec2() * backdrop.size(),
+            );
+            image.backdrop = backdrop;
+        }
+        self.pan = pan;
+        self.image_transform = next;
     }
 }
 
@@ -210,7 +287,10 @@ pub struct Viewer {
     // Current page anchoring the focused spread. This is navigation state,
     // independent of widget/keyboard focus and checked selection.
     focus_index: usize,
+    // Window-local pairing alignment selected by one-page navigation.
+    spread_shifted: bool,
     checked: HashSet<PathBuf>,
+    check_navigation: Option<checked_files::CheckNavigation>,
     random_prompt: bool,
     trash_history: Vec<Vec<crate::platform::trash::TrashEntry>>,
     file_job: Option<checked_files::FileJob>,
@@ -234,10 +314,12 @@ pub struct Viewer {
     layout_monitor: Vec2,
     // Two-page spreads are offered only when the display is wider than tall.
     landscape: bool,
+    /// Native OS window mode, independent of the viewer's immersive controls.
+    mobile_windowed: Option<bool>,
     span_cache: std::cell::RefCell<Option<SpanCache>>,
     presentation: Presentation,
     transition_waiting: bool,
-    pending_steps: Vec<(bool, bool)>,
+    pending_steps: Vec<(bool, NavigationStep)>,
     thumb_ticket: Option<(u64, PathBuf)>,
     thumbs: HashMap<PathBuf, egui::TextureHandle>,
     app_icon: egui::TextureHandle,
@@ -251,6 +333,7 @@ pub struct Viewer {
     archives: archive::Archives,
     recent_moves: Vec<PathBuf>,
     move_dialog: Option<move_files::MoveDialog>,
+    rename_dialog: Option<rename_files::RenameDialog>,
     zoom: f32,
     zoom_override: Option<f32>,
     zoom_input: Option<String>,
@@ -280,8 +363,11 @@ pub struct Viewer {
     held_button: Option<(bool, f64)>,
     canvas_drag: Option<CanvasDrag>,
     touch_gesture: crate::ui::mobile::TouchGesture,
+    mobile_swipe: Option<mobile_swipe::Swipe>,
     #[cfg(any(target_os = "ios", target_os = "android", test))]
     mobile_selection: Option<crate::core::documents::ImportBatch>,
+    #[cfg(any(target_os = "ios", test))]
+    ios_access: ios_access::AccessUi,
     window_size_state: window_frame::WindowSizeState,
     fullscreen: bool,
     random: bool,
@@ -290,6 +376,27 @@ pub struct Viewer {
 }
 
 impl Viewer {
+    fn orientation_available(&self) -> bool {
+        crate::app::is_mobile() && self.mobile_windowed == Some(false)
+    }
+
+    /// Runtime visibility/execution only; saved shortcuts keep static support.
+    fn command_available(&self, id: &str) -> bool {
+        command_supported(id)
+            && (!matches!(
+                id,
+                "orientation"
+                    | "orientation-auto"
+                    | "orientation-portrait"
+                    | "orientation-landscape"
+            ) || self.orientation_available())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_mobile_windowed_for_test(&mut self, windowed: Option<bool>) {
+        self.mobile_windowed = windowed;
+    }
+
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         initial: Option<PathBuf>,
@@ -340,7 +447,9 @@ impl Viewer {
             #[cfg(all(target_os = "macos", not(test)))]
             mac_access: None,
             focus_index: 0,
+            spread_shifted: false,
             checked: HashSet::new(),
+            check_navigation: None,
             random_prompt: false,
             trash_history: Vec::new(),
             file_job: None,
@@ -370,6 +479,7 @@ impl Viewer {
             page_sizes: HashMap::new(),
             layout_monitor: Vec2::ZERO,
             landscape: true,
+            mobile_windowed: (!crate::core::NATIVE_MOBILE).then_some(false),
             span_cache: Default::default(),
             presentation: Presentation::default(),
             transition_waiting: false,
@@ -384,6 +494,7 @@ impl Viewer {
             archives: archive::Archives::new(ctx.clone()),
             recent_moves: Vec::new(),
             move_dialog: None,
+            rename_dialog: None,
             zoom: 1.0,
             zoom_override: None,
             zoom_input: None,
@@ -413,8 +524,11 @@ impl Viewer {
             held_button: None,
             canvas_drag: None,
             touch_gesture: Default::default(),
+            mobile_swipe: None,
             #[cfg(any(target_os = "ios", target_os = "android", test))]
             mobile_selection: None,
+            #[cfg(any(target_os = "ios", test))]
+            ios_access: Default::default(),
             window_size_state: window_frame::WindowSizeState::default(),
             fullscreen: false,
             random: false,
@@ -473,6 +587,7 @@ impl Viewer {
             )
         });
         if cache_config != self.disk_cache_config {
+            self.sync_library_cache_policy();
             self.media.configure_cache(
                 cache_config
                     .as_ref()
@@ -489,6 +604,8 @@ impl Viewer {
     }
 
     fn save(&mut self) {
+        // Notify queued workers before settings persistence can block the UI.
+        self.sync_disk_cache();
         if let Some(store) = &self.store
             && let Err(e) = store.save(&self.settings)
         {
@@ -503,9 +620,12 @@ impl Viewer {
         self.poll_library_thumbnails(ctx);
         self.library_window(ctx);
         self.move_window(ctx);
+        self.rename_window(ctx);
         self.bookmark_window(ctx);
         self.archive_window(ctx);
         self.clear_recent_window(ctx);
+        #[cfg(any(target_os = "ios", test))]
+        self.ios_access_window(ctx);
     }
 
     /// Stops key and button auto-repeat, e.g. when a dialog takes the input.
@@ -525,13 +645,21 @@ impl Viewer {
 
     /// A menu, list or dialog above the canvas that takes its input.
     fn overlay_open(&self) -> bool {
-        self.menu_open || self.library.modal() || self.dialog_open() || self.random_prompt
+        self.menu_visible() || self.library.modal() || self.dialog_open() || self.random_prompt
     }
 
     /// The phone's back gesture closes the topmost layer. Returns false when
     /// nothing is open, so the platform host can leave the app.
     #[cfg(any(target_os = "ios", target_os = "android", test))]
     fn handle_back(&mut self, ctx: &egui::Context) -> bool {
+        #[cfg(any(target_os = "ios", test))]
+        if self.ios_access.dialog.is_some() {
+            self.ios_access = Default::default();
+            #[cfg(target_os = "ios")]
+            crate::platform::mobile::cancel_access_import();
+            self.release_held_input();
+            return true;
+        }
         if ctx.any_popup_open() {
             egui::Popup::close_all(ctx);
         } else if self.shortcut_reset_prompt || self.reset_prompt.is_some() {
@@ -547,6 +675,10 @@ impl Viewer {
             self.library.dialog = None;
         } else if self.archives.prompt.is_some() {
             self.leave_archive();
+        } else if self.rename_dialog.is_some() {
+            if self.file_job.is_none() {
+                self.rename_dialog = None;
+            }
         } else if self.move_dialog.is_some() {
             // A running move keeps its dialog; the gesture is still used up.
             if self.file_job.is_none() {
@@ -557,8 +689,7 @@ impl Viewer {
         } else if self.settings_open {
             self.settings_open = false;
             self.close_shortcut_editing();
-        } else if self.library.open && (!self.files.is_empty() || self.listing.is_some()) {
-            // Without images the list is the start screen; nothing is behind it.
+        } else if self.library.open {
             self.library.open = false;
         } else if self.inspector.open {
             self.inspector.close();
@@ -580,6 +711,17 @@ impl Viewer {
 
 impl eframe::App for Viewer {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "android")]
+        if crate::platform::mobile::take_locale_changed() {
+            crate::platform::locale::invalidate_cache();
+            let language = crate::platform::locale::restore_preference(&self.settings.language);
+            if language != self.settings.language {
+                self.settings.language = language;
+                self.save();
+            }
+            crate::i18n::set_language(self.settings.language.clone());
+            ctx.request_repaint();
+        }
         // eframe 0.37 skips ui for minimized/occluded windows. Shutdown and
         // file-operation completion must still run there, without painting.
         self.close_request_accepted = false;
@@ -697,7 +839,7 @@ impl eframe::App for Viewer {
         }
         self.sync_sort_settings();
         if !crate::app::is_mobile() {
-            self.cursor_idle.observe(ctx);
+            self.cursor_idle.observe(ctx, self.fullscreen);
         }
         // Widgets may replace this with resize/grab/text cursors below.
         ctx.set_cursor_icon(egui::CursorIcon::Default);
@@ -720,6 +862,8 @@ impl eframe::App for Viewer {
                 crate::platform::mac_open::fullscreen(true, self.settings.blackout_other_monitors);
         }
         self.frame += 1;
+        #[cfg(target_os = "ios")]
+        self.poll_ios_access();
         #[cfg(any(target_os = "ios", target_os = "android"))]
         if crate::platform::mobile::take_back() && !self.handle_back(ctx) {
             #[cfg(target_os = "android")]
@@ -727,11 +871,30 @@ impl eframe::App for Viewer {
         }
         #[cfg(any(target_os = "ios", target_os = "android"))]
         if let Some(result) = crate::platform::mobile::take_result() {
+            #[cfg(target_os = "ios")]
+            let completion = crate::platform::mobile::take_access_completion();
             match result {
                 Ok(selection) => {
+                    #[cfg(target_os = "ios")]
+                    {
+                        self.ios_access.dialog = None;
+                    }
                     self.accept_mobile_selection(selection);
                 }
-                Err(error) => self.last_error = error,
+                Err(error) => {
+                    #[cfg(target_os = "ios")]
+                    {
+                        let (source, issue) = completion.unwrap_or_default();
+                        self.ios_import_error(source, issue, &error);
+                    }
+                    #[cfg(not(target_os = "ios"))]
+                    {
+                        self.last_error = crate::i18n::tr(&error).into();
+                        if self.files.is_empty() && self.listing.is_none() {
+                            self.library.open = true;
+                        }
+                    }
+                }
             }
         }
         #[cfg(any(target_os = "ios", target_os = "android"))]
@@ -744,6 +907,7 @@ impl eframe::App for Viewer {
             if crate::platform::mobile::take_export_failed() {
                 self.last_error = "Could not save the settings file.".into();
             }
+            self.mobile_windowed = crate::platform::mobile::windowed();
             crate::platform::mobile::sync_display(&self.settings.orientation, self.fullscreen);
         }
         #[cfg(target_os = "macos")]
@@ -872,7 +1036,8 @@ impl eframe::App for Viewer {
             ctx.request_repaint();
         }
         if !crate::app::is_mobile() {
-            self.cursor_idle.apply(ctx, self.settings.cursor_hide_ms);
+            self.cursor_idle
+                .apply(ctx, self.settings.cursor_hide_ms, self.fullscreen);
         }
         #[cfg(any(target_os = "ios", target_os = "android"))]
         crate::platform::mobile::clipboard(ctx);
@@ -974,20 +1139,6 @@ fn uv() -> Rect {
     Rect::from_min_max(egui::pos2(0., 0.), egui::pos2(1., 1.))
 }
 
-fn image_uv(horizontal: bool, vertical: bool) -> Rect {
-    // Reversed UV axes mirror the sampled pixels without modifying the texture or source.
-    Rect {
-        min: egui::pos2(
-            if horizontal { 1. } else { 0. },
-            if vertical { 1. } else { 0. },
-        ),
-        max: egui::pos2(
-            if horizontal { 0. } else { 1. },
-            if vertical { 0. } else { 1. },
-        ),
-    }
-}
-
 fn key_chord(key: Key, m: egui::Modifiers) -> String {
     let mut parts = Vec::new();
     if m.command {
@@ -1015,8 +1166,14 @@ fn thumbnail_range(len: usize, focus: usize, width: f32, spacing: f32) -> std::o
 }
 
 struct SpanCache {
-    key: (usize, usize, bool, bool, Vec2),
+    key: (usize, usize, bool, bool, bool, Vec2),
     span: (usize, usize),
+}
+
+enum NavigationStep {
+    Spread,
+    Page,
+    Check,
 }
 
 /// Commands that switch between single-page and two-page layouts.
@@ -1039,16 +1196,23 @@ fn adaptive_focus_span(
     len: usize,
     spread: bool,
     cover: bool,
+    shifted: bool,
     single: impl Fn(usize) -> bool,
 ) -> (usize, usize) {
     if len == 0 || !spread || (cover && focus == 0) || single(focus) {
         return (focus, focus);
     }
     // Pair only within the run after the nearest preceding standalone page.
-    let offset = (0..focus)
+    let mut offset = (0..focus)
         .rev()
         .find(|&i| (cover && i == 0) || single(i))
         .map_or(0, |i| i + 1);
+    if shifted {
+        if focus == offset {
+            return (focus, focus);
+        }
+        offset += 1;
+    }
     let first = offset + (focus - offset) / 2 * 2;
     let last = (first + 1).min(len - 1);
     (first, if single(last) { first } else { last })
@@ -1157,6 +1321,9 @@ fn effective_keys(s: &Settings, id: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod half_step_tests;
 
 fn scroll_source(drag: bool) -> egui::scroll_area::ScrollSource {
     egui::scroll_area::ScrollSource {

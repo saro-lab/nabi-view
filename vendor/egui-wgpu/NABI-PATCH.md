@@ -12,6 +12,12 @@ Metal layer's EDR flag and color space itself; the application no longer invokes
 the legacy layer setter during window creation. The guarded setter and nested
 CALayer/CAMetalLayer regression remain to preserve the startup-crash test.
 
+Expose `WgpuConfiguration::prefer_hdr` (default true) so hosts can opt out of
+whole-window HDR composition before creating the surface. Nabi View's Android
+and iOS hosts disable it: ordinary mobile UI and photos retain SDR composition,
+and HDR sources use the application's existing SDR tone mapping. Desktop hosts
+retain the capability-gated HDR path. This does not override system brightness.
+
 Keep a weak native-window reference for per-window Apple EDR headroom queries,
 including iOS UIWindowScene screens. Add an output-white-scale uniform, select
 linear shader output for FP16 surfaces, and disable eight-bit dithering there.
@@ -29,3 +35,17 @@ gamma-premultiplied Color32 representation. Native float pixel ownership, bounde
 display-specific tone mapping, and SDR fallback remain application code.
 
 Validation and technical investigation records are kept in private ai records.
+
+On macOS, defer surface reconfiguration for window-size and resize-state changes
+until the next paint. AppKit can report several such events together; the paint
+applies their final size and presentation mode once, avoiding redundant GPU-idle
+waits. Keep transaction presentation and the extra drawable during live resize.
+Other platforms retain the upstream immediate size-reconfiguration path.
+
+Use the owning viewport's weak Window reference to check AppKit inLiveResize
+before enabling the macOS resize workaround. Programmatic fullscreen resizing
+does not switch the Metal drawable count or transaction presentation. Preserve
+the reference on surface recovery; unsafe window handles and unavailable or
+off-main-thread queries retain the caller's resize heuristic. End notifications
+always clear the workaround. See Apple's [inLiveResize](https://developer.apple.com/documentation/appkit/nswindow/inliveresize)
+and [presentsWithTransaction](https://developer.apple.com/documentation/quartzcore/cametallayer/presentswithtransaction).

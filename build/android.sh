@@ -14,17 +14,28 @@ variant=debug
 format=apk
 require_signing=false
 serial=
+usb=false
+native_debug=false
+logs=false
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --build-only) mode=build ;;
         --native-only) mode=native ;;
+        --debug) native_debug=true ;;
+        --usb) usb=true ;;
+        --list) mode=list ;;
+        --logs) logs=true ;;
         --release) variant=release; mode=build ;;
         --bundle) variant=release; format=bundle; mode=build ;;
         --signed) variant=release; require_signing=true; mode=build ;;
         --help|-h)
             printf '%s\n' 'Usage: build/android.sh [--build-only | --native-only] [--abi arm64-v8a|x86_64|all]' \
-                '       [--release] [--bundle] [--signed] [--serial DEVICE]' \
-                'Default: build and run a debug APK. --release/--bundle only build; --signed requires release credentials.'
+                '       [--debug] [--usb | --serial DEVICE] [--logs] [--list]' \
+                '       [--release] [--bundle] [--signed]' \
+                'Default: debug APK with optimized Rust. --debug enables Rust source/variable debugging.' \
+                '--usb selects the single USB device, ignoring emulators. --list lists adb devices.' \
+                '--logs streams only the launched app process; Ctrl-C stops log viewing.' \
+                '--release/--bundle only build; --signed requires release credentials.'
             exit 0 ;;
         --abi) [ "$#" -ge 2 ] || fail '--abi requires a value'; abi=$2; shift ;;
         --serial) [ "$#" -ge 2 ] || fail '--serial requires an adb serial'; serial=$2; shift ;;
@@ -32,14 +43,23 @@ while [ "$#" -gt 0 ]; do
     esac
     shift
 done
+! $usb || [ -z "$serial" ] || fail 'Use either --usb or --serial, not both.'
+! $native_debug || [ "$variant" = debug ] || fail '--debug cannot be combined with --release, --bundle or --signed.'
+! $logs || [ "$mode" = run ] || fail '--logs requires an install/run operation.'
+profile=release
+native_dir=target/android/jniLibs
+if $native_debug; then
+    profile=mobile-debug
+    native_dir=target/android/debug/jniLibs
+fi
 if $require_signing; then
     [ -n "${NABI_ANDROID_KEYSTORE:-}" ] && [ -n "${NABI_ANDROID_KEYSTORE_PASSWORD:-}" ] && \
         [ -n "${NABI_ANDROID_KEY_ALIAS:-}" ] && [ -n "${NABI_ANDROID_KEY_PASSWORD:-}" ] || \
         fail '--signed requires NABI_ANDROID_KEYSTORE, NABI_ANDROID_KEYSTORE_PASSWORD, NABI_ANDROID_KEY_ALIAS and NABI_ANDROID_KEY_PASSWORD.'
 fi
 case "$abi" in
-    arm64-v8a) target=aarch64-linux-android; compiler=aarch64-linux-android30 ;;
-    x86_64) target=x86_64-linux-android; compiler=x86_64-linux-android30 ;;
+    arm64-v8a) target=aarch64-linux-android; compiler=aarch64-linux-android31 ;;
+    x86_64) target=x86_64-linux-android; compiler=x86_64-linux-android31 ;;
     all) target=; compiler= ;;
     *) fail 'Supported Android ABIs: arm64-v8a, x86_64, all' ;;
 esac
@@ -49,6 +69,33 @@ if [ -z "$sdk" ]; then
     elif [ "$(uname -s)" = Darwin ]; then sdk=$HOME/Library/Android/sdk
     else sdk=$HOME/Android/Sdk
     fi
+fi
+# Device queries and selection do not need an NDK, Gradle or a Rust rebuild.
+if $windows; then sdk=$(cygpath -u "$sdk"); adb="$sdk/platform-tools/adb.exe"
+else adb="$sdk/platform-tools/adb"
+fi
+if [ "$mode" = list ]; then
+    [ -x "$adb" ] || fail 'Install Android SDK Platform Tools.'
+    exec "$adb" devices -l
+fi
+if [ "$mode" = run ]; then
+    [ -x "$adb" ] || fail 'Install Android SDK Platform Tools.'
+    if $usb; then
+        serial=$("$adb" -d get-serialno) || fail 'Connect one USB device and approve USB debugging on its unlocked screen.'
+    elif [ -z "$serial" ]; then
+        serial=$("$adb" get-serialno) || fail 'Select one connected device with --usb or --serial ID.'
+    fi
+    [ -n "$serial" ] && [ "$serial" != unknown ] || fail 'No authorized Android device. Enable USB debugging and accept its authorization prompt.'
+    [ "$("$adb" -s "$serial" get-state)" = device ] || fail 'Device is offline or unauthorized; unlock it and allow USB debugging.'
+    device_abis=$("$adb" -s "$serial" shell getprop ro.product.cpu.abilist | tr -d '\r')
+    if [ "$abi" = all ]; then
+        case ",$device_abis," in *",arm64-v8a,"*|*",x86_64,"*) ;; *) fail "No supported 64-bit ABI on device: $device_abis" ;; esac
+    else
+        case ",$device_abis," in *",$abi,"*) ;; *) fail "Device ABIs: $device_abis. Choose a supported --abi before building." ;; esac
+    fi
+    device_api=$("$adb" -s "$serial" shell getprop ro.build.version.sdk | tr -d '\r')
+    case "$device_api" in ''|*[!0-9]*) fail 'Could not read the Android API level.' ;; esac
+    [ "$device_api" -ge 31 ] || fail 'NABI VIEW requires Android 12 (API 31) or newer.'
 fi
 ndk=${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}
 if $windows; then
@@ -82,8 +129,9 @@ if ! command -v cmake >/dev/null 2>&1; then PATH="$project_dir/ai/runtime/cmake/
 command -v cmake >/dev/null || fail 'CMake is required.'
 # Keep per-ABI builds sequential: they share generated notices and resources.
 if [ "$abi" = all ]; then
-    sh "$project_dir/build/android.sh" --native-only --abi arm64-v8a
-    sh "$project_dir/build/android.sh" --native-only --abi x86_64
+    if $native_debug; then set -- --debug; else set --; fi
+    sh "$project_dir/build/android.sh" --native-only --abi arm64-v8a "$@"
+    sh "$project_dir/build/android.sh" --native-only --abi x86_64 "$@"
 else
     prebuilt=
     for directory in "$ndk"/toolchains/llvm/prebuilt/*; do
@@ -131,10 +179,10 @@ else
         "CARGO_TARGET_${target_upper}_LINKER=$cc" \
         "CARGO_TARGET_${target_upper}_RUSTFLAGS=$link_flags" \
         "CMAKE_TOOLCHAIN_FILE=$(native_path "$project_dir/build/android-toolchain.cmake")" "NABI_ANDROID_ABI=$abi" \
-        cargo build --locked --release -p nabi-view-android --target "$target"
-    mkdir -p "target/android/jniLibs/$abi" target/android/assets target/android/res/drawable-nodpi
-    $python build/check-android-elf.py "$target_dir/$target/release/libnabi_view_android.so"
-    cp "$target_dir/$target/release/libnabi_view_android.so" "target/android/jniLibs/$abi/"
+        cargo build --locked --profile "$profile" -p nabi-view-android --target "$target"
+    mkdir -p "$native_dir/$abi" target/android/assets target/android/res/drawable-nodpi
+    $python build/check-android-elf.py "$target_dir/$target/$profile/libnabi_view_android.so"
+    cp "$target_dir/$target/$profile/libnabi_view_android.so" "$native_dir/$abi/"
     $python build/notices.py
     cp target/notices/THIRD_PARTY_NOTICES.txt target/android/assets/
     cp LICENSE THIRD_PARTY.md target/android/assets/
@@ -154,7 +202,7 @@ case "$variant:$format" in
 esac
 # Keep Gradle's local output and cache inside the ignored target directory.
 gradle -p platforms/android --project-cache-dir "$(native_path "$project_dir/target/android/gradle-cache")" \
-    "-PnabiAbi=$abi" -PnabiNativePrepared=true ":app:$task"
+    "-PnabiAbi=$abi" "-PnabiRustDebug=$native_debug" -PnabiNativePrepared=true ":app:$task"
 apk="$project_dir/target/android/gradle/app/outputs/$output"
 [ -f "$apk" ] || fail 'Gradle did not produce the expected package.'
 if [ "$abi" = all ]; then package_abis=arm64-v8a,x86_64; else package_abis=$abi; fi
@@ -166,12 +214,14 @@ if [ "$variant" = release ]; then
     fi
 fi
 [ "$mode" = run ] || exit 0
-if $windows; then adb="$sdk/platform-tools/adb.exe"; else adb="$sdk/platform-tools/adb"; fi
-[ -x "$adb" ] || fail 'Install Android SDK Platform Tools.'
-if [ -n "$serial" ]; then
-    "$adb" -s "$serial" install -r "$(native_path "$apk")"
-    "$adb" -s "$serial" shell am start -n "${NABI_ANDROID_APPLICATION_ID:-dev.nabi.view}/dev.nabi.view.MainActivity"
-else
-    "$adb" install -r "$(native_path "$apk")"
-    "$adb" shell am start -n "${NABI_ANDROID_APPLICATION_ID:-dev.nabi.view}/dev.nabi.view.MainActivity"
+application_id=${NABI_ANDROID_APPLICATION_ID:-saro.nabi.view}
+"$adb" -s "$serial" install -r "$(native_path "$apk")"
+# Restart only this app so it runs the freshly installed binary.
+"$adb" -s "$serial" shell am force-stop "$application_id"
+"$adb" -s "$serial" shell am start -W -n "$application_id/dev.nabi.view.MainActivity"
+if $logs; then
+    app_pid=$("$adb" -s "$serial" shell pidof -s "$application_id" | tr -d '\r') || fail 'App exited before log attachment. Inspect: adb logcat -b crash -d'
+    [ -n "$app_pid" ] || fail 'App process was not found; inspect the crash buffer.'
+    printf 'App log (PID %s). Ctrl-C stops viewing.\n' "$app_pid"
+    exec "$adb" -s "$serial" logcat --pid="$app_pid" -v threadtime
 fi

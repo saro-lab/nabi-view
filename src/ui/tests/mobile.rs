@@ -43,6 +43,153 @@ fn drag_touch(window: &mut TestWindow, start: egui::Pos2, delta: egui::Vec2) {
     assert!(!window.started_window_drag());
 }
 
+fn tap_thumbnail(window: &mut TestWindow, page: usize) {
+    let position = window.label_position(&page.to_string());
+    drag_touch(window, position, egui::Vec2::ZERO);
+    settle_checks(window);
+}
+
+#[test]
+fn phone_current_thumbnail_taps_toggle_checks_without_moving_or_zooming() {
+    let _phone = PhonePreview::enter();
+    let mut window = TestWindow::sample_with_settings(&crate::core::settings::Settings {
+        touch: crate::core::settings::TouchSettings {
+            double_tap: "next".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    window.screen_size = egui::vec2(390., 844.);
+    window.wait_for("1 / 5");
+    for _ in 0..4 {
+        window.draw(Some(Key::Equals));
+    }
+    let zoomed = window.photo_rects().1;
+    assert!(zoomed.width() > window.photo_rects().0.width());
+
+    // Consecutive taps remain thumbnail actions even within the double-tap delay.
+    tap_thumbnail(&mut window, 1);
+    assert_eq!(checked_sample_pages(&window), [1]);
+    tap_thumbnail(&mut window, 1);
+    assert!(checked_sample_pages(&window).is_empty());
+    assert_eq!(focused_thumbnail_pages(&window), [1]);
+    assert_eq!(window.photo_rects().1, zoomed);
+
+    tap_thumbnail(&mut window, 1);
+    let path = window
+        ._images
+        .as_ref()
+        .unwrap()
+        .path()
+        .join("01 Alpine Light.png");
+    let badge = window
+        .ctx
+        .read_response(egui::Id::unique(("thumbnail-check", path)))
+        .unwrap()
+        .rect;
+    drag_touch(&mut window, badge.center(), egui::Vec2::ZERO);
+    settle_checks(&mut window);
+    assert!(checked_sample_pages(&window).is_empty());
+    assert_eq!(window.photo_rects().1, zoomed);
+
+    tap_thumbnail(&mut window, 1);
+    tap_thumbnail(&mut window, 2);
+    assert_eq!(focused_thumbnail_pages(&window), [2]);
+    assert_eq!(checked_sample_pages(&window), [1]);
+    tap_thumbnail(&mut window, 2);
+    assert_eq!(checked_sample_pages(&window), [1, 2]);
+    tap_thumbnail(&mut window, 2);
+    assert_eq!(checked_sample_pages(&window), [1]);
+
+    // Returning to a checked page first navigates, then a further tap unchecks it.
+    tap_thumbnail(&mut window, 1);
+    assert_eq!(focused_thumbnail_pages(&window), [1]);
+    assert_eq!(checked_sample_pages(&window), [1]);
+    tap_thumbnail(&mut window, 1);
+    assert!(checked_sample_pages(&window).is_empty());
+}
+
+#[test]
+fn tablet_current_spread_thumbnails_toggle_independently_in_both_directions() {
+    let _tablet = PhonePreview::enter();
+    let mut window = TestWindow::sample();
+    window.screen_size = egui::vec2(1280., 760.);
+    window.wait_for("1 / 5");
+    window.time += 0.25;
+    settle_checks(&mut window);
+    window.draw(Some(Key::CloseBracket));
+    settle_checks(&mut window);
+    assert_eq!(focused_thumbnail_pages(&window), [1, 2]);
+
+    tap_thumbnail(&mut window, 2);
+    assert_eq!(checked_sample_pages(&window), [2]);
+    assert_eq!(focused_thumbnail_pages(&window), [1, 2]);
+    tap_thumbnail(&mut window, 1);
+    assert_eq!(checked_sample_pages(&window), [1, 2]);
+    tap_thumbnail(&mut window, 2);
+    assert_eq!(checked_sample_pages(&window), [1]);
+
+    window.draw(Some(Key::OpenBracket));
+    tap_thumbnail(&mut window, 1);
+    assert!(checked_sample_pages(&window).is_empty());
+    assert_eq!(focused_thumbnail_pages(&window), [1, 2]);
+    tap_thumbnail(&mut window, 2);
+    assert_eq!(checked_sample_pages(&window), [2]);
+
+    // The keyboard check command keeps its existing whole-spread behavior.
+    window.draw(Some(Key::Space));
+    settle_checks(&mut window);
+    assert_eq!(checked_sample_pages(&window), [1, 2]);
+}
+
+#[test]
+fn phone_thumbnail_repeated_taps_keep_random_mode_checks_disabled() {
+    let _phone = PhonePreview::enter();
+    let mut window = TestWindow::sample_with_settings(&crate::core::settings::Settings {
+        language: crate::i18n::Language::English,
+        toast_ms: 5_000,
+        ..Default::default()
+    });
+    window.screen_size = egui::vec2(390., 844.);
+    window.wait_for("1 / 5");
+    // Finish the initial Area layout/fade before using its button coordinates.
+    window.time += 0.25;
+    settle_checks(&mut window);
+    window.click(window.titlebar_icon("random").rect.center());
+    window.wait_for("Random order: On");
+
+    for page in [1, 1, 2, 2] {
+        tap_thumbnail(&mut window, page);
+        assert!(checked_sample_pages(&window).is_empty());
+        assert_eq!(focused_thumbnail_pages(&window), [page]);
+    }
+    assert!(
+        window
+            .draw(None)
+            .0
+            .contains(crate::i18n::tr("checks-are-not-available-in-random-mode"))
+    );
+}
+
+#[test]
+fn desktop_current_thumbnail_clicks_keep_existing_check_state() {
+    let mut window = TestWindow::sample();
+    window.reveal_controls();
+    window.wait_for("1 / 5");
+    for page in [1, 1, 2, 2] {
+        window.click(window.label_position(&page.to_string()));
+        settle_checks(&mut window);
+        assert!(checked_sample_pages(&window).is_empty());
+        assert_eq!(focused_thumbnail_pages(&window), [page]);
+    }
+    window.draw(Some(Key::Space));
+    settle_checks(&mut window);
+    assert_eq!(checked_sample_pages(&window), [2]);
+    window.click(window.label_position("2"));
+    settle_checks(&mut window);
+    assert_eq!(checked_sample_pages(&window), [2]);
+}
+
 #[test]
 fn phone_bars_stay_visible_and_fullscreen_taps_restore_them() {
     let _phone = PhonePreview::enter();
@@ -428,6 +575,8 @@ fn phone_uses_desktop_bars_without_zoom_and_hides_desktop_commands() {
             "folder",
             "recent",
             "share",
+            "rotate-right",
+            "rotate-left",
             "fullscreen",
             "trash",
             "undo-trash",
@@ -517,6 +666,93 @@ fn phone_orientation_toggle_cycles_and_menu_sets_it() {
     window.click(landscape.rect.center());
     window.draw(None);
     assert_eq!(store.load().unwrap().orientation, "landscape");
+}
+
+#[test]
+fn window_mode_hides_orientation_and_preserves_saved_preference_and_keys() {
+    let _phone = PhonePreview::enter();
+    let mut settings = crate::core::settings::Settings {
+        orientation: "portrait".into(),
+        language: crate::i18n::Language::Korean,
+        ..Default::default()
+    };
+    settings
+        .keyboard_shortcuts
+        .as_mut()
+        .unwrap()
+        .push(crate::core::settings::KeyboardShortcut {
+            action: "orientation".into(),
+            key: "F9".into(),
+        });
+    let mut window = TestWindow::sample_with_settings(&settings);
+    window.screen_size = egui::vec2(560., 1400.);
+    window.wait_for("1 / 5");
+    let store = Store::in_directories(
+        window._storage.path().join("config"),
+        window._storage.path().join("state"),
+    );
+    let saved = serde_json::to_value(store.load().unwrap()).unwrap();
+    let orientation = egui::Id::unique(("titlebar", "orientation"));
+    assert!(window.ctx.read_response(orientation).is_some());
+    let menu = window
+        .ctx
+        .read_response(egui::Id::unique(("titlebar", "menu")))
+        .unwrap();
+    window.click(menu.rect.center());
+
+    // Change while the menu is open: both UI entry points follow the same state.
+    for state in [Some(true), None, Some(false)] {
+        window.app.set_mobile_windowed_for_test(state);
+        for _ in 0..3 {
+            window.draw(None);
+        }
+        let available = state == Some(false);
+        for id in [
+            "orientation-auto",
+            "orientation-portrait",
+            "orientation-landscape",
+        ] {
+            assert_eq!(
+                window
+                    .ctx
+                    .read_response(egui::Id::unique(("menu-command", id)))
+                    .is_some(),
+                available,
+                "{id} in {state:?}"
+            );
+        }
+        assert_eq!(serde_json::to_value(store.load().unwrap()).unwrap(), saved);
+        // Compact menus cover the top bar, so check it after closing the menu.
+        window.draw(Some(Key::Escape));
+        for _ in 0..3 {
+            window.draw(None);
+        }
+        assert_eq!(window.ctx.read_response(orientation).is_some(), available);
+        let menu = window
+            .ctx
+            .read_response(egui::Id::unique(("titlebar", "menu")))
+            .unwrap();
+        window.click(menu.rect.center());
+    }
+    window.draw(Some(Key::Escape));
+    window.app.set_mobile_windowed_for_test(Some(true));
+    window.draw(Some(Key::F9));
+    assert_eq!(serde_json::to_value(store.load().unwrap()).unwrap(), saved);
+
+    // A different window size is not a separate tablet/large-display policy.
+    window.screen_size = egui::vec2(1200., 900.);
+    window.app.set_mobile_windowed_for_test(Some(false));
+    for _ in 0..3 {
+        window.draw(None);
+    }
+    assert!(window.ctx.read_response(orientation).is_some());
+    window.draw(Some(Key::F9));
+    let restored = store.load().unwrap();
+    assert_eq!(restored.orientation, "landscape");
+    assert_eq!(
+        serde_json::to_value(restored.keyboard_shortcuts).unwrap(),
+        saved["keyboard_shortcuts"]
+    );
 }
 
 #[test]

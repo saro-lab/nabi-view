@@ -42,6 +42,10 @@ pub fn set_application_language(language: &Language) {
     }
     #[cfg(not(target_os = "android"))]
     let _ = language;
+    invalidate_cache();
+}
+
+pub(crate) fn invalidate_cache() {
     if let Some(cache) = CACHE.get() {
         *cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }

@@ -94,6 +94,8 @@ impl Viewer {
             return;
         }
         self.sorting.applied = Some((self.settings.sort_by.clone(), self.settings.sort_descending));
+        self.check_navigation = None;
+        self.spread_shifted = false;
         if self.random || self.files.len() < 2 {
             return;
         }

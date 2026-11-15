@@ -2,8 +2,10 @@ fn main() {
     println!("cargo:rerun-if-changed=src/platform/apple/locale.m");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("ios") {
         println!("cargo:rerun-if-changed=src/platform/ios/mobile.m");
+        println!("cargo:rerun-if-changed=src/platform/ios/photos.m");
         cc::Build::new()
             .file("src/platform/ios/mobile.m")
+            .file("src/platform/ios/photos.m")
             .file("src/platform/apple/locale.m")
             .flag("-fobjc-arc")
             .compile("nabi_mobile");
@@ -14,6 +16,8 @@ fn main() {
             "CoreText",
             "ImageIO",
             "CoreGraphics",
+            "Photos",
+            "PhotosUI",
         ] {
             println!("cargo:rustc-link-lib=framework={framework}");
         }

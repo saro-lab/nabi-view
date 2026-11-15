@@ -46,6 +46,16 @@ pub(super) struct Library {
 }
 
 impl Library {
+    fn prefer_bookmarks_if_recent_empty(&mut self) {
+        if self.tab == Kind::Recent
+            && !self
+                .items
+                .iter()
+                .any(|item| item.entry.kind == Kind::Recent)
+        {
+            self.tab = Kind::Bookmark;
+        }
+    }
     /// Library layers that take keyboard input away from the viewer.
     pub(super) fn modal(&self) -> bool {
         self.open || self.clear_prompt || self.dialog.is_some()
@@ -118,12 +128,7 @@ impl Worker {
                                 library::decode_thumbnail(image).map(|pixels| (pixels, None))
                             })
                     } else {
-                        let result = make_thumbnail(&dir, &job);
-                        if let Some(root) = dir.parent() {
-                            let _ =
-                                crate::core::disk_cache::Cache::new(root.to_owned(), limit).prune();
-                        }
-                        result
+                        make_thumbnail(&dir, &job, &worker_limit)
                     };
                     let done = Done {
                         shown: job.shown,
@@ -146,14 +151,27 @@ impl Worker {
     }
 }
 
-fn make_thumbnail(dir: &Path, job: &Job) -> Result<(egui::ColorImage, Option<String>), String> {
+fn make_thumbnail(
+    dir: &Path,
+    job: &Job,
+    limit: &std::sync::atomic::AtomicU64,
+) -> Result<(egui::ColorImage, Option<String>), String> {
     let mut error = String::from("No thumbnail");
     if let Some((image, key)) = &job.source {
         // Another window may already have written it.
         match library::load_thumbnail(dir, key)
-            .or_else(|_| library::create_thumbnail(image, dir, key))
-        {
-            Ok(pixels) => return Ok((pixels, Some(key.clone()))),
+            .map(|pixels| {
+                (
+                    pixels,
+                    limit.load(std::sync::atomic::Ordering::Relaxed) != 0,
+                )
+            })
+            .or_else(|_| {
+                library::create_thumbnail(image, dir, key, || {
+                    limit.load(std::sync::atomic::Ordering::Relaxed)
+                })
+            }) {
+            Ok((pixels, stored)) => return Ok((pixels, stored.then(|| key.clone()))),
             Err(e) => error = e,
         }
     }
@@ -175,6 +193,103 @@ mod cache_disabled_tests {
     use super::*;
     use image::ImageEncoder;
     use std::{io::Write, time::Duration};
+
+    #[test]
+    fn disabling_cache_reaches_queued_thumbnail_jobs_without_another_request() {
+        for replace in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let ctx = egui::Context::default();
+            let store =
+                Store::in_directories(root.path().join("config"), root.path().join("state"));
+            let cache = store.cache_dir();
+            let directory = store.thumbnail_dir();
+            let mut app = Viewer::new(
+                &eframe::CreationContext::_new_kittest(ctx.clone()),
+                None,
+                Ok(store),
+            );
+            let set_enabled = |app: &mut Viewer, enabled| {
+                if replace {
+                    let mut settings = app.settings.clone();
+                    settings.disk_cache_enabled = enabled;
+                    app.replace_settings(settings);
+                } else {
+                    app.settings.disk_cache_enabled = enabled;
+                    app.save();
+                }
+            };
+            set_enabled(&mut app, true);
+            let source = root.path().join("page.png");
+            image::RgbaImage::from_pixel(2, 1, image::Rgba([220, 80, 40, 128]))
+                .save(&source)
+                .unwrap();
+            let key = library::thumbnail_key(&source).unwrap();
+            let job = || Job {
+                shown: key.clone(),
+                source: Some((source.clone(), key.clone())),
+                fallback: None,
+                owner: (Kind::Recent, root.path().to_owned()),
+            };
+
+            // Hold publication until both jobs have been queued and the setting
+            // has changed. No next UI frame or new queue_thumbnail call is needed.
+            std::fs::create_dir_all(&cache).unwrap();
+            let lock = std::fs::File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(cache.join("cache.lock"))
+                .unwrap();
+            lock.lock().unwrap();
+            let worker = Worker::start(directory.clone(), ctx, 1024 * 1024).unwrap();
+            for _ in 0..2 {
+                worker.jobs.send(job()).unwrap();
+            }
+            app.library.thumbnails.worker = Some(worker);
+            set_enabled(&mut app, false);
+            assert_eq!(
+                app.library
+                    .thumbnails
+                    .worker
+                    .as_ref()
+                    .unwrap()
+                    .limit
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0,
+            );
+            drop(lock);
+            let worker = app.library.thumbnails.worker.as_ref().unwrap();
+            for _ in 0..2 {
+                let (pixels, stored) = worker
+                    .done
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                    .result
+                    .unwrap();
+                assert_eq!(pixels.size, [2, 1]);
+                assert!(stored.is_none());
+            }
+            assert!(!directory.exists(), "queued work wrote disabled thumbnails");
+
+            // Re-enabling through the same setting path updates this worker too.
+            set_enabled(&mut app, true);
+            let worker = app.library.thumbnails.worker.as_ref().unwrap();
+            assert_eq!(
+                worker.limit.load(std::sync::atomic::Ordering::Relaxed),
+                u64::from(app.settings.disk_cache_mb) * 1_048_576,
+            );
+            worker.jobs.send(job()).unwrap();
+            let (_, stored) = worker
+                .done
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .result
+                .unwrap();
+            assert_eq!(stored.as_deref(), Some(key.as_str()));
+            assert!(library::thumbnail_file(&directory, &key).is_file());
+        }
+    }
 
     #[test]
     fn uncached_thumbnails_resolve_mobile_images_and_archive_pages() {
@@ -225,6 +340,21 @@ mod cache_disabled_tests {
 }
 
 impl Viewer {
+    /// Keep already queued thumbnail jobs in sync even when no new row needs
+    /// a thumbnail after the user changes the disk cache preference.
+    pub(super) fn sync_library_cache_policy(&self) {
+        if let Some(worker) = &self.library.thumbnails.worker {
+            worker.limit.store(
+                if self.settings.disk_cache_enabled {
+                    u64::from(self.settings.disk_cache_mb) * 1_048_576
+                } else {
+                    0
+                },
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
     pub(super) fn reload_library(&mut self) {
         let Some(store) = &self.store else {
             return;
@@ -233,6 +363,7 @@ impl Viewer {
             Ok(entries) => self.library.items = entries.into_iter().map(Item::new).collect(),
             Err(error) => self.last_error = error,
         }
+        self.library.prefer_bookmarks_if_recent_empty();
         // Thumbnails go once no entry uses them.
         if let Err(error) = store.prune_thumbnails(THUMBNAIL_GRACE) {
             self.last_error = error;
@@ -386,11 +517,27 @@ impl Viewer {
                 .clone()
                 .filter(|image| library::page_exists(image))
                 .or_else(|| library::first_image(&entry.folder));
+            #[cfg(any(target_os = "ios", target_os = "android", test))]
+            let target = target.or_else(|| {
+                crate::core::photo_library::title(&entry.folder).map(|_| entry.folder.clone())
+            });
+            #[cfg(target_os = "ios")]
+            let target = target.or_else(|| {
+                crate::core::documents::source_identity(&entry.folder)
+                    .map(|_| entry.image.clone().unwrap_or_else(|| entry.folder.clone()))
+            });
             if let Some(target) = target {
                 // Open a concrete image, so the folder starts at its saved page
                 // in this window, a new window or on a phone alike.
                 if self.open_from_user(target) {
-                    self.library.open = false;
+                    #[cfg(not(target_os = "ios"))]
+                    {
+                        self.library.open = false;
+                    }
+                    #[cfg(target_os = "ios")]
+                    {
+                        self.library.open = self.ios_access.dialog.is_some();
+                    }
                 }
             } else if entry.kind == Kind::Recent {
                 // Access or folder contents may have changed since opening the list.
@@ -402,6 +549,7 @@ impl Viewer {
         }
         if let Some(index) = removed {
             self.remove_library_entry(index);
+            self.library.prefer_bookmarks_if_recent_empty();
         }
         // A cancelled picker keeps the start screen available. Opening in the same
         // window already closes it in open(); opening a new window closes it here.
@@ -447,6 +595,7 @@ impl Viewer {
                     .items
                     .retain(|item| item.entry.kind != Kind::Recent);
                 self.library.remember = None;
+                self.library.prefer_bookmarks_if_recent_empty();
             }
             Err(error) => self.last_error = error,
         }
@@ -930,6 +1079,8 @@ fn entry_row(
         mirror(thumbnail_rect),
     );
     let path = entry.folder.display().to_string();
+    #[cfg(any(target_os = "ios", target_os = "android", test))]
+    let path = crate::core::photo_library::title(&entry.folder).unwrap_or(path);
     let title = entry.title();
     let open = ui.interact(
         open_rect,

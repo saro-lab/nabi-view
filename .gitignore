@@ -1,12 +1,12 @@
-# Rust build output (including nested local test projects)
-target/
+# Rust build output (including directory links and nested local test projects)
+target
 /dist/
 
 # OS and local editor state
 .DS_Store
 Thumbs.db
 Desktop.ini
-.idea/
+.idea
 .vscode/
 
 # Private AI workspace (ignore both a directory and a symlink/junction)
@@ -101,9 +101,10 @@ opencode.jsonc
 *.rs.bk
 
 # Mobile IDE state and generated Android output
-**/.gradle/
+**/.gradle
 **/local.properties
 **/xcuserdata/
 *.xcuserstate
 /platforms/android/app/build/
 /platforms/android/build/
+/platforms/android/gradle.properties

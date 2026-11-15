@@ -84,10 +84,28 @@ impl<'de> Deserialize<'de> for Language {
     yield ROOT / 'platforms/android/app/src/main/res/xml/locales_config.xml', xml.encode()
 
 
+def ios_resources(destination):
+    entries = json.loads((ROOT / 'locales/manifest.json').read_text(encoding='utf-8'))
+    validate(entries)
+    for entry in entries:
+        catalog = read_catalog(ROOT / f"locales/{entry['code']}.json")
+        directory = destination / f"{entry['code']}.lproj"
+        directory.mkdir(parents=True, exist_ok=True)
+        # A strings table is a property-list dictionary; XML preserves every
+        # script without hand-escaped Objective-C string literals.
+        (directory / 'InfoPlist.strings').write_bytes(plistlib.dumps({
+            'NSPhotoLibraryUsageDescription': catalog['photo-access-purpose'],
+        }))
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--check', action='store_true')
+    parser.add_argument('--ios-resources', type=Path)
     args = parser.parse_args()
+    if args.ios_resources is not None:
+        ios_resources(args.ios_resources)
+        raise SystemExit(0)
     for path, data in generated():
         if args.check:
             if not path.exists() or path.read_bytes() != data:

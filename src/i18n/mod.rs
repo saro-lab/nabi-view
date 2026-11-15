@@ -10,6 +10,10 @@ use std::{cell::Cell, collections::BTreeMap, sync::OnceLock};
 static CATALOGS: [OnceLock<BTreeMap<String, String>>; catalogs::SOURCES.len()] =
     [const { OnceLock::new() }; catalogs::SOURCES.len()];
 thread_local! { static CURRENT: Cell<usize> = const { Cell::new(0) }; }
+// Android owns a separate Java UI thread for native permission/folder dialogs.
+// Its text must follow the Rust viewer, not that thread's default catalog.
+#[cfg(any(target_os = "ios", target_os = "android"))]
+static NATIVE_CURRENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 fn catalog(index: usize) -> &'static BTreeMap<String, String> {
     CATALOGS[index].get_or_init(|| {
         serde_json::from_str(catalogs::SOURCES[index]).expect("validated locale catalog")
@@ -27,12 +31,13 @@ pub fn set_language(preference: Language) {
         Language::Other(_) => Language::English,
         language => language,
     };
-    CURRENT.set(
-        Language::ALL[1..]
-            .iter()
-            .position(|item| *item == locale)
-            .unwrap_or(0),
-    );
+    let index = Language::ALL[1..]
+        .iter()
+        .position(|item| *item == locale)
+        .unwrap_or(0);
+    CURRENT.set(index);
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    NATIVE_CURRENT.store(index, std::sync::atomic::Ordering::Relaxed);
 }
 #[cfg(test)]
 fn message_id(key: &str) -> &str {
@@ -50,6 +55,16 @@ fn message_id(key: &str) -> &str {
         .unwrap_or(key)
 }
 pub fn tr(key: &str) -> &str {
+    translate_at(CURRENT.get(), key)
+}
+#[cfg(any(target_os = "ios", target_os = "android"))]
+pub(crate) fn native_tr(key: &str) -> &str {
+    translate_at(
+        NATIVE_CURRENT.load(std::sync::atomic::Ordering::Relaxed),
+        key,
+    )
+}
+fn translate_at(index: usize, key: &str) -> &str {
     let mut key = key;
     if key == "reveal-in-file-manager" {
         if cfg!(target_os = "macos") {
@@ -58,7 +73,7 @@ pub fn tr(key: &str) -> &str {
             key = "show-in-file-explorer";
         }
     }
-    catalog(CURRENT.get())
+    catalog(index)
         .get(key)
         .filter(|s| !s.is_empty())
         .or_else(|| catalog(0).get(key))

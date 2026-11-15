@@ -23,7 +23,13 @@ case "$platform" in
             '  ./mobile.sh ios --simulator UUID 특정 시뮬레이터에서 실행' \
             '  ./mobile.sh ios --build-only     iPhone/iPad 공용 시뮬레이터 .app 생성' \
             '  ./mobile.sh ios --device         미서명 iPhone/iPad ARM64 .app 생성' \
+            '  ./mobile.sh ios --device --debug 미서명 디버그 .app과 dSYM 준비' \
+            '  ./mobile.sh ios --list-devices   연결된 iPhone/iPad 확인' \
+            '  ./mobile.sh ios --open-xcode     Xcode에서 개발 서명·USB 기기 디버그' \
             '  ./mobile.sh android             연결된 휴대폰/태블릿/에뮬레이터에서 실행' \
+            '  ./mobile.sh android --list       Android 연결·USB 승인 상태 확인' \
+            '  ./mobile.sh android --usb --debug --logs USB 기기 디버그 빌드·실행·로그' \
+            '  ./mobile.sh android --debug --build-only 디버그 심볼 포함 APK 준비' \
             '  ./mobile.sh android --build-only 휴대폰/태블릿 공용 APK 생성' \
             '  ./mobile.sh android --release --build-only 배포용 APK 생성' \
             '  ./mobile.sh android --release --bundle Play 제출용 AAB 생성' \

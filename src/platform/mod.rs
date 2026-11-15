@@ -9,6 +9,8 @@ pub(crate) mod mac_access;
 pub(crate) mod mac_open;
 #[cfg(any(target_os = "ios", target_os = "android"))]
 pub(crate) mod mobile;
+#[cfg(any(target_os = "ios", target_os = "android", test))]
+mod mobile_display;
 pub(crate) mod platform_image;
 pub(crate) mod reveal_file;
 pub(crate) mod system_memory;

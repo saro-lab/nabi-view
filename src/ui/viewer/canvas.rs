@@ -1,20 +1,43 @@
 use super::*;
 
+/// UI points per source pixel at 100%. Desktop images follow OS logical size,
+/// independently of egui's UI zoom; mobile keeps its backing-pixel zoom contract.
+fn image_points_per_pixel(ctx: &egui::Context) -> f32 {
+    let native = if crate::app::is_mobile() {
+        1.
+    } else {
+        ctx.native_pixels_per_point().unwrap_or(1.)
+    };
+    native / ctx.pixels_per_point()
+}
+
 impl Viewer {
-    pub(super) fn image_scale(&self, size: Vec2, slot: Vec2, ppp: f32) -> f32 {
-        if let Some(zoom) = self.zoom_override {
-            return zoom / ppp;
+    pub(super) fn image_scale(&self, size: Vec2, slot: Vec2, ctx: &egui::Context) -> f32 {
+        self.image_scale_for(size, slot, ctx, self.zoom, self.zoom_override)
+    }
+
+    pub(super) fn image_scale_for(
+        &self,
+        size: Vec2,
+        slot: Vec2,
+        ctx: &egui::Context,
+        zoom: f32,
+        zoom_override: Option<f32>,
+    ) -> f32 {
+        let unit = image_points_per_pixel(ctx);
+        if let Some(zoom) = zoom_override {
+            return zoom * unit;
         }
         let x = slot.x / size.x;
         let y = slot.y / size.y;
         let factor = match self.settings.view_mode.as_str() {
-            "actual" => return self.zoom / ppp,
+            "actual" => return zoom * unit,
             "fill" => x.max(y),
             "width" => x,
             "height" => y,
             _ => x.min(y),
         };
-        factor.min(self.settings.small_image_percent as f32 / 100. / ppp) * self.zoom
+        factor.min(self.settings.small_image_percent as f32 / 100. * unit) * zoom
     }
 
     pub(super) fn image_canvas(&self, mut screen: Rect) -> Rect {
@@ -30,6 +53,26 @@ impl Viewer {
             screen.max.y = (screen.bottom() - BOTTOM_CHROME_HEIGHT).max(screen.top());
         }
         screen
+    }
+
+    /// A fitted page (or spread) stays centered; only overflow needs panning.
+    pub(super) fn images_can_pan(&self, canvas: Vec2, ctx: &egui::Context) -> bool {
+        let (first, last) = self.focus_span();
+        let slot = egui::vec2(canvas.x / if first == last { 1. } else { 2. }, canvas.y);
+        (first..=last).any(|index| {
+            self.files
+                .get(index)
+                .and_then(|path| self.pictures.get(path))
+                .is_some_and(|picture| {
+                    let size = ImageTransform::from_settings(&self.settings).size(egui::vec2(
+                        picture.original[0] as f32,
+                        picture.original[1] as f32,
+                    ));
+                    let shown = size * self.image_scale(size, slot, ctx);
+                    // Ignore rounding noise at the exact fit boundary.
+                    shown.x > slot.x + 0.001 || shown.y > slot.y + 0.001
+                })
+        })
     }
 
     pub(super) fn zoom_percent(&self, ctx: &egui::Context) -> f32 {
@@ -49,10 +92,13 @@ impl Viewer {
             slot.x /= 2.;
         }
         self.image_scale(
-            egui::vec2(picture.original[0] as f32, picture.original[1] as f32),
+            ImageTransform::from_settings(&self.settings).size(egui::vec2(
+                picture.original[0] as f32,
+                picture.original[1] as f32,
+            )),
             slot,
-            ctx.pixels_per_point(),
-        ) * ctx.pixels_per_point()
+            ctx,
+        ) / image_points_per_pixel(ctx)
             * 100.
     }
 
@@ -70,6 +116,37 @@ impl Viewer {
         stopped
     }
 
+    fn metadata_overlays(&self, canvas: Rect) -> Vec<Rect> {
+        let mut base = canvas.shrink(6.);
+        if !crate::app::is_mobile()
+            && self.controls_visible
+            && self.hide_controls
+            && !self.settings_open
+        {
+            base.min.y += TOP_BAR_HEIGHT;
+        }
+        let mut overlays = vec![Rect::from_min_max(
+            base.min,
+            egui::pos2(canvas.center().x, base.bottom()),
+        )];
+        let (first, last) = self.focus_span();
+        if first != last {
+            overlays.push(Rect::from_min_max(
+                egui::pos2(canvas.center().x, base.top()),
+                base.max,
+            ));
+        }
+        overlays
+    }
+
+    fn reading_metadata(&self, ctx: &egui::Context, overlays: &[Rect]) -> bool {
+        self.inspector.open
+            && !self.transition_waiting
+            && ctx
+                .pointer_hover_pos()
+                .is_some_and(|p| overlays.iter().any(|overlay| overlay.contains(p)))
+    }
+
     pub(super) fn canvas(&mut self, root: &mut egui::Ui) {
         let ctx = &root.ctx().clone();
         if self.cache_budget() > 0
@@ -79,7 +156,7 @@ impl Viewer {
         {
             self.trim_cache(self.cache_budget() / 3);
         }
-        let detail_budget = if self.cache_budget() > 0 {
+        let detail_budget = if self.cache_budget() > 0 && !self.renaming() {
             self.cache_budget().saturating_sub(
                 self.cache_bytes()
                     .saturating_sub(self.details.retained_bytes()),
@@ -109,6 +186,12 @@ impl Viewer {
                     self.canvas_pointer(ctx, &response, false);
                     return;
                 }
+                if crate::app::is_mobile() {
+                    // Apply direct manipulation in this frame, including the
+                    // final touch-up position, before painting either page.
+                    let reading = self.reading_metadata(ctx, &self.metadata_overlays(canvas));
+                    self.touch_canvas(ctx, &response, reading);
+                }
                 let ppp = ctx.pixels_per_point();
                 // Bucket requests so resizing the window a few pixels does not restart the decoder.
                 self.fit_limit =
@@ -127,16 +210,27 @@ impl Viewer {
                     !self.pictures.contains_key(path) && !self.failures.contains_key(path)
                 });
                 self.transition_waiting = pending && !self.presentation.images.is_empty();
-                let image_uv = image_uv(self.settings.flip_horizontal, self.settings.flip_vertical);
-                if self.transition_waiting {
+                let image_transform = ImageTransform::from_settings(&self.settings);
+                if self.paint_mobile_swipe(ui, canvas, background) {
+                    // The retained outgoing frame and adjacent page move as a
+                    // unit. Normal painting resumes at the settled position.
+                } else if self.transition_waiting {
                     self.presentation.paint(
                         ui,
                         canvas,
-                        image_uv,
+                        image_transform,
                         background,
                         self.settings.transparency_checker,
                     );
                 } else {
+                    if !self.images_can_pan(canvas.size(), ctx) {
+                        // Also discard an old offset after zooming out or
+                        // enlarging the canvas, so it cannot return on zoom-in.
+                        self.pan = Vec2::ZERO;
+                        if matches!(self.canvas_drag, Some(CanvasDrag::Image { .. })) {
+                            self.canvas_drag = None;
+                        }
+                    }
                     let mut presented = Vec::new();
                     let spread = ids.len() > 1;
                     let width = canvas.width() / ids.len() as f32;
@@ -147,8 +241,9 @@ impl Viewer {
                         );
                         let path = &self.files[index];
                         if let Some(p) = self.pictures.get(path) {
-                            let size = egui::vec2(p.original[0] as f32, p.original[1] as f32);
-                            let factor = self.image_scale(size, slot.size(), ppp);
+                            let size = image_transform
+                                .size(egui::vec2(p.original[0] as f32, p.original[1] as f32));
+                            let factor = self.image_scale(size, slot.size(), ctx);
                             let shown = size * factor;
                             let center = if spread {
                                 let x = if col == 0 {
@@ -179,14 +274,13 @@ impl Viewer {
                                     12.,
                                 );
                             }
-                            ui.painter().with_clip_rect(slot).image(
+                            image_transform.paint(
+                                &ui.painter().with_clip_rect(slot),
                                 p.hdr
                                     .as_ref()
                                     .filter(|hdr| hdr.active())
                                     .map_or_else(|| p.handle.id(), |hdr| hdr.id()),
                                 rect,
-                                image_uv,
-                                Color32::WHITE,
                             );
                             presented.push(PresentedImage {
                                 hdr: p.hdr.clone(),
@@ -195,7 +289,7 @@ impl Viewer {
                                 clip: slot,
                                 backdrop: rect,
                             });
-                            let source_px_per_texel = size.x / p.handle.size_vec2().x;
+                            let source_px_per_texel = p.original[0] as f32 / p.handle.size_vec2().x;
                             let needs_detail = factor * ppp * source_px_per_texel > 1.02
                                 && source_px_per_texel > 1.02;
                             let mut detailed = false;
@@ -206,7 +300,7 @@ impl Viewer {
                                     p.original,
                                     rect,
                                     slot,
-                                    [self.settings.flip_horizontal, self.settings.flip_vertical],
+                                    image_transform,
                                     ctx,
                                     ui,
                                     background,
@@ -214,8 +308,9 @@ impl Viewer {
                                     1. / source_px_per_texel,
                                 ) {
                                     detailed = layer.rect.contains_rect(rect.intersect(slot))
-                                        && layer.rect.width() / rect.width() * p.original[0] as f32
-                                            <= layer.handle.size_vec2().x * 1.02;
+                                        && layer.rect.width() / rect.width() * size.x
+                                            <= image_transform.size(layer.handle.size_vec2()).x
+                                                * 1.02;
                                     presented.push(layer);
                                 }
                             }
@@ -256,31 +351,12 @@ impl Viewer {
                     self.presentation = Presentation {
                         images: presented,
                         canvas: Some(canvas),
+                        pan: self.pan,
+                        image_transform,
                     };
                 }
-                let mut base = canvas.shrink(6.);
-                if !crate::app::is_mobile()
-                    && self.controls_visible
-                    && self.hide_controls
-                    && !self.settings_open
-                {
-                    base.min.y += TOP_BAR_HEIGHT;
-                }
-                let mut overlays = vec![Rect::from_min_max(
-                    base.min,
-                    egui::pos2(canvas.center().x, base.bottom()),
-                )];
-                if ids.len() == 2 {
-                    overlays.push(Rect::from_min_max(
-                        egui::pos2(canvas.center().x, base.top()),
-                        base.max,
-                    ));
-                }
-                let reading = self.inspector.open
-                    && !self.transition_waiting
-                    && ctx
-                        .pointer_hover_pos()
-                        .is_some_and(|p| overlays.iter().any(|overlay| overlay.contains(p)));
+                let overlays = self.metadata_overlays(canvas);
+                let reading = self.reading_metadata(ctx, &overlays);
                 if self.inspector.open && !self.transition_waiting && !self.settings_open {
                     let visible: Vec<_> = ids.iter().map(|&i| self.files[i].as_path()).collect();
                     self.inspector.configure(
@@ -292,10 +368,10 @@ impl Viewer {
                         self.show_toast(ctx, tr("copied"));
                     }
                 }
-                self.canvas_pointer(ctx, &response, reading);
                 if crate::app::is_mobile() {
                     return;
                 }
+                self.canvas_pointer(ctx, &response, reading);
                 if !reading
                     && !self.settings_open
                     && !self.overlay_open()
@@ -392,7 +468,7 @@ impl Viewer {
             return;
         }
         if self.settings_open
-            || self.overlay_open()
+            || (self.overlay_open() && !self.default_menu_visible())
             || self.popup_open_at_input
             || self.zoom_input.is_some()
             || !ctx.input(|i| i.focused)
@@ -400,6 +476,7 @@ impl Viewer {
             self.canvas_drag = None;
             return;
         }
+        let can_pan = self.images_can_pan(response.rect.size(), ctx);
         if !reading {
             let mouse = &self.settings.mouse;
             let clicked = [
@@ -438,12 +515,13 @@ impl Viewer {
                 if let Some((pointer_origin, modifiers)) = press {
                     let window = (!self.fullscreen).then_some(CanvasDrag::Window);
                     self.canvas_drag = match self.drag_action(modifiers) {
-                        "pan" if self.over_image(pointer_origin) => (!self.transition_waiting)
-                            .then_some(CanvasDrag::Image {
+                        "pan" if can_pan && self.over_image(pointer_origin) => {
+                            (!self.transition_waiting).then_some(CanvasDrag::Image {
                                 pointer_origin,
                                 pan_origin: self.pan,
-                            }),
-                        // Panning from the background moves the window instead.
+                            })
+                        }
+                        // Fitted images and the background move the window.
                         "pan" | "window" => window,
                         _ => None,
                     };
@@ -471,6 +549,8 @@ impl Viewer {
             }
             _ => {
                 if !reading
+                    && can_pan
+                    && !self.transition_waiting
                     && response.hovered()
                     && ctx
                         .pointer_hover_pos()

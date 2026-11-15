@@ -3,8 +3,11 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <CoreText/CoreText.h>
 #import <ImageIO/ImageIO.h>
+#import <PhotosUI/PhotosUI.h>
 #import <objc/runtime.h>
 #include <fcntl.h>
+#include <errno.h>
+#include <math.h>
 #include <stdbool.h>
 #include <os/proc.h>
 #include <mach/mach.h>
@@ -17,6 +20,27 @@ extern bool nabi_mobile_import_file(int fd, const char *name);
 extern void nabi_mobile_import_error(const char *message);
 extern void nabi_mobile_import_finish(void);
 extern void nabi_mobile_import_source(const char *id, const char *name);
+extern void nabi_mobile_window_mode_changed(int state);
+extern void nabi_mobile_access_changed(void);
+extern void nabi_mobile_access_action_result(int action, bool success);
+extern void nabi_mobile_photo_error(int reason);
+extern size_t nabi_mobile_text(const char *key, unsigned short *output, size_t capacity);
+extern int nabi_mobile_photo_status(void);
+extern bool nabi_photos_is_collection(NSString *identifier);
+extern void nabi_photos_open(NSString *identifier, void (^completion)(void));
+
+// iOS 27 requires scene-based lifecycle adoption. UIKit creates the single
+// window scene from Info.plist; winit attaches its own window and root view
+// controller when the application becomes active. Keep ownership in winit.
+@interface NabiSceneDelegate : UIResponder <UIWindowSceneDelegate>
+@end
+
+@implementation NabiSceneDelegate
+- (void)sceneDidBecomeActive:(UIScene *)scene {
+    (void)scene;
+    nabi_mobile_access_changed();
+}
+@end
 
 // Available memory is constrained by both system RAM and the app's jetsam
 // allocation ceiling. Unlike desktops, total is the effective app ceiling.
@@ -49,7 +73,7 @@ static UIWindow *nabi_window(void) {
         if (![scene isKindOfClass:UIWindowScene.class]) continue;
         for (UIWindow *window in ((UIWindowScene *)scene).windows) if (window.isKeyWindow) return window;
     }
-    // winit 0.30 uses UIApplicationDelegate without a scene manifest.
+    // Retain the fallback for windows that have not yet joined a scene.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     for (UIWindow *window in UIApplication.sharedApplication.windows) if (window.isKeyWindow) return window;
@@ -85,27 +109,176 @@ const char *nabi_mobile_font(void) {
 // winit owns the root view controller. Its class answers orientation and
 // home-indicator queries from these values instead of winit's defaults.
 static UIInterfaceOrientationMask nabi_orientations = UIInterfaceOrientationMaskAll;
+// The OS-selected orientation before the viewer overrides it. In particular,
+// Control Center's portrait lock need not generate a new device-rotation event
+// when the user releases the viewer's landscape override while holding still.
+static UIInterfaceOrientation nabi_system_orientation = UIInterfaceOrientationUnknown;
+static __weak UIWindowScene *nabi_orientation_scene;
 static BOOL nabi_immersive;
+static int nabi_window_mode = -2;
+static void nabi_apply_orientation(UIViewController *controller, UIWindow *window,
+                                   UIInterfaceOrientationMask restoreOrientation);
+
+// Compare the whole window with its own display in one coordinate space. Safe
+// areas, device idiom, display count, and orientation request results do not
+// determine whether this window is a standalone or a windowed presentation.
+static int nabi_detect_window_mode(UIWindow *window) {
+    UIScreen *screen = window.screen;
+    if (!window || !screen || !window.rootViewController) return -1;
+    CGRect frame = [window convertRect:window.bounds toCoordinateSpace:screen.coordinateSpace];
+    CGRect display = screen.coordinateSpace.bounds;
+    if (!isfinite(frame.origin.x) || !isfinite(frame.origin.y) ||
+        !isfinite(frame.size.width) || !isfinite(frame.size.height) ||
+        !isfinite(display.origin.x) || !isfinite(display.origin.y) ||
+        !isfinite(display.size.width) || !isfinite(display.size.height) ||
+        CGRectIsEmpty(frame) || CGRectIsEmpty(display)) return -1;
+    CGFloat tolerance = 1. / MAX(screen.scale, 1.);
+    BOOL fillsDisplay = fabs(CGRectGetMinX(frame) - CGRectGetMinX(display)) <= tolerance &&
+        fabs(CGRectGetMinY(frame) - CGRectGetMinY(display)) <= tolerance &&
+        fabs(CGRectGetMaxX(frame) - CGRectGetMaxX(display)) <= tolerance &&
+        fabs(CGRectGetMaxY(frame) - CGRectGetMaxY(display)) <= tolerance;
+    return fillsDisplay ? 0 : 1;
+}
+
+static void nabi_publish_window_mode(UIWindow *window) {
+    int state = nabi_detect_window_mode(window);
+    if (state == nabi_window_mode) return;
+    nabi_window_mode = state;
+    if (state == 1 && nabi_orientations != UIInterfaceOrientationMaskAll) {
+        // Release a previous lock immediately; Rust retains the user's choice.
+        nabi_orientations = UIInterfaceOrientationMaskAll;
+        if (window.rootViewController) nabi_apply_orientation(window.rootViewController, window, 0);
+    }
+    nabi_mobile_window_mode_changed(state);
+}
+
+static void nabi_schedule_window_mode_refresh(void);
+static char nabi_geometry_observation;
+
+// This noninteractive view receives UIKit layout events without replacing any
+// of winit's view/controller methods. It also works with the legacy nil scene.
+@interface NabiWindowModeObserver : UIView
+@property(nonatomic, weak) UIWindowScene *observedScene;
+@end
+
+@implementation NabiWindowModeObserver
+- (void)updateSceneObservation {
+    if (@available(iOS 16.0, *)) {
+        UIWindowScene *scene = self.window.windowScene;
+        if (scene == self.observedScene) return;
+        [self.observedScene removeObserver:self forKeyPath:@"effectiveGeometry" context:&nabi_geometry_observation];
+        self.observedScene = scene;
+        [scene addObserver:self forKeyPath:@"effectiveGeometry" options:0 context:&nabi_geometry_observation];
+    }
+}
+- (void)didMoveToWindow {
+    [super didMoveToWindow];
+    [self updateSceneObservation];
+    nabi_schedule_window_mode_refresh();
+}
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    [self updateSceneObservation];
+    nabi_schedule_window_mode_refresh();
+}
+- (void)safeAreaInsetsDidChange {
+    [super safeAreaInsetsDidChange];
+    [self updateSceneObservation];
+    nabi_schedule_window_mode_refresh();
+}
+- (void)windowEnvironmentDidChange:(NSNotification *)notification {
+    (void)notification;
+    nabi_schedule_window_mode_refresh();
+}
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
+                       change:(NSDictionary<NSKeyValueChangeKey,id> *)change context:(void *)context {
+    if (context == &nabi_geometry_observation) {
+        nabi_schedule_window_mode_refresh();
+    } else {
+        [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+    }
+}
+- (void)dealloc {
+    [NSNotificationCenter.defaultCenter removeObserver:self];
+    [self.observedScene removeObserver:self forKeyPath:@"effectiveGeometry" context:&nabi_geometry_observation];
+}
+@end
+
+static NabiWindowModeObserver *nabi_window_observer;
+static void nabi_track_window(UIWindow *window) {
+    if (!nabi_window_observer) {
+        nabi_window_observer = [[NabiWindowModeObserver alloc] initWithFrame:CGRectZero];
+        nabi_window_observer.opaque = NO;
+        nabi_window_observer.userInteractionEnabled = NO;
+        nabi_window_observer.isAccessibilityElement = NO;
+        nabi_window_observer.accessibilityElementsHidden = YES;
+        nabi_window_observer.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        for (NSNotificationName name in @[
+            UIApplicationDidBecomeActiveNotification, UIWindowDidBecomeKeyNotification,
+            UIScreenDidConnectNotification, UIScreenDidDisconnectNotification, UIScreenModeDidChangeNotification
+        ]) {
+            [NSNotificationCenter.defaultCenter addObserver:nabi_window_observer
+                selector:@selector(windowEnvironmentDidChange:) name:name object:nil];
+        }
+    }
+    if (nabi_window_observer.window != window) {
+        [nabi_window_observer removeFromSuperview];
+        if (window) {
+            nabi_window_observer.frame = window.bounds;
+            [window insertSubview:nabi_window_observer atIndex:0];
+        }
+        nabi_publish_window_mode(window);
+    } else if (nabi_window_mode == -2) {
+        nabi_publish_window_mode(window);
+    }
+}
+
+static void nabi_schedule_window_mode_refresh(void) {
+    static BOOL pending;
+    if (pending) return;
+    pending = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        pending = NO;
+        UIWindow *window = nabi_window();
+        nabi_track_window(window);
+        nabi_publish_window_mode(window);
+    });
+}
+
 static UIInterfaceOrientationMask nabi_supported_orientations(id self, SEL command) {
     (void)self; (void)command; return nabi_orientations;
 }
 static BOOL nabi_home_indicator_hidden(id self, SEL command) {
     (void)self; (void)command; return nabi_immersive;
 }
-static void nabi_apply_orientation(UIViewController *controller, UIWindow *window) {
+static void nabi_apply_orientation(UIViewController *controller, UIWindow *window,
+                                   UIInterfaceOrientationMask restoreOrientation) {
     if (@available(iOS 16.0, *)) {
         [controller setNeedsUpdateOfSupportedInterfaceOrientations];
-        if (nabi_orientations != UIInterfaceOrientationMaskAll && window.windowScene) {
+        if (window.windowScene) {
+            // Allowing All (or asking for no preference) alone leaves the current
+            // landscape orientation valid. On an explicit return to Auto, make a
+            // one-shot request for the OS orientation preceding our override.
+            // The supported mask stays All, so subsequent rotation belongs to iOS.
+            UIInterfaceOrientationMask requested = restoreOrientation ?: nabi_orientations;
             UIWindowSceneGeometryPreferencesIOS *preferences =
-                [[UIWindowSceneGeometryPreferencesIOS alloc] initWithInterfaceOrientations:nabi_orientations];
-            [window.windowScene requestGeometryUpdateWithPreferences:preferences errorHandler:nil];
+                requested == UIInterfaceOrientationMaskAll
+                ? [[UIWindowSceneGeometryPreferencesIOS alloc] init]
+                : [[UIWindowSceneGeometryPreferencesIOS alloc] initWithInterfaceOrientations:requested];
+            [window.windowScene requestGeometryUpdateWithPreferences:preferences errorHandler:^(NSError *error) {
+                // A denied request does not turn a standalone window into a
+                // windowed one. Keep this separate from icon visibility.
+                NSLog(@"NABI VIEW: orientation request denied (%@:%ld)", error.domain, (long)error.code);
+            }];
         }
     } else {
         [UIViewController attemptRotationToDeviceOrientation];
     }
 }
-static UIViewController *nabi_controller(UIWindow *window) {
+static UIViewController *nabi_controller(UIWindow *window, BOOL applyInitialOrientation) {
     static Class installed;
+    static __weak UIViewController *initializedController;
+    nabi_track_window(window);
     UIViewController *controller = window.rootViewController;
     if (!controller) return nil;
     Class cls = object_getClass(controller);
@@ -113,19 +286,46 @@ static UIViewController *nabi_controller(UIWindow *window) {
         class_replaceMethod(cls, @selector(supportedInterfaceOrientations), (IMP)nabi_supported_orientations, "Q@:");
         class_replaceMethod(cls, @selector(prefersHomeIndicatorAutoHidden), (IMP)nabi_home_indicator_hidden, "B@:");
         installed = cls;
+    }
+    if (controller != initializedController) {
+        initializedController = controller;
         // A lock requested before the window existed applies now.
-        nabi_apply_orientation(controller, window);
+        if (applyInitialOrientation) nabi_apply_orientation(controller, window, 0);
     }
     return controller;
 }
 
 void nabi_mobile_set_orientation(int mode) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        nabi_orientations = mode == 1 ? (UIInterfaceOrientationMaskPortrait | UIInterfaceOrientationMaskPortraitUpsideDown)
-            : mode == 2 ? UIInterfaceOrientationMaskLandscape : UIInterfaceOrientationMaskAll;
         UIWindow *window = nabi_window();
-        UIViewController *controller = nabi_controller(window);
-        if (controller) nabi_apply_orientation(controller, window);
+        nabi_track_window(window);
+        // The queued request may have preceded a resize or a scene move.
+        int windowMode = nabi_detect_window_mode(window);
+        int effectiveMode = windowMode == 1 ? 0 : mode;
+        UIWindowScene *scene = window.windowScene;
+        if (scene != nabi_orientation_scene) {
+            nabi_orientation_scene = scene;
+            nabi_system_orientation = UIInterfaceOrientationUnknown;
+        }
+        BOOL wasAuto = nabi_orientations == UIInterfaceOrientationMaskAll;
+        if (wasAuto && effectiveMode != 0 && windowMode == 0) {
+            if (@available(iOS 16.0, *)) {
+                nabi_system_orientation = scene.effectiveGeometry.interfaceOrientation;
+            } else {
+                nabi_system_orientation = scene.interfaceOrientation;
+            }
+        }
+        UIInterfaceOrientationMask restoreOrientation = 0;
+        if (!wasAuto && effectiveMode == 0 && windowMode == 0 &&
+            (UIInterfaceOrientationIsPortrait(nabi_system_orientation) ||
+             UIInterfaceOrientationIsLandscape(nabi_system_orientation))) {
+            restoreOrientation = (UIInterfaceOrientationMask)1 << nabi_system_orientation;
+        }
+        nabi_orientations = effectiveMode == 1 ? (UIInterfaceOrientationMaskPortrait | UIInterfaceOrientationMaskPortraitUpsideDown)
+            : effectiveMode == 2 ? UIInterfaceOrientationMaskLandscape : UIInterfaceOrientationMaskAll;
+        UIViewController *controller = nabi_controller(window, NO);
+        if (controller) nabi_apply_orientation(controller, window, restoreOrientation);
+        nabi_publish_window_mode(window);
     });
 }
 
@@ -137,7 +337,7 @@ void nabi_mobile_set_immersive(bool enabled) {
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
         [UIApplication.sharedApplication setStatusBarHidden:enabled withAnimation:UIStatusBarAnimationFade];
 #pragma clang diagnostic pop
-        UIViewController *controller = nabi_controller(nabi_window());
+        UIViewController *controller = nabi_controller(nabi_window(), YES);
         [controller setNeedsUpdateOfHomeIndicatorAutoHidden];
     });
 }
@@ -146,6 +346,15 @@ static UIViewController *nabi_presenter(void) {
     UIViewController *presenter = nabi_window().rootViewController;
     while (presenter.presentedViewController) presenter = presenter.presentedViewController;
     return presenter;
+}
+
+static NSString *nabi_text(const char *key) {
+    size_t length = nabi_mobile_text(key, NULL, 0);
+    if (!length || length > 16384) return [NSString stringWithUTF8String:key];
+    NSMutableData *data = [NSMutableData dataWithLength:length * sizeof(unichar)];
+    size_t written = nabi_mobile_text(key, data.mutableBytes, length);
+    return written == length ? [[NSString alloc] initWithCharacters:data.bytes length:length]
+        : [NSString stringWithUTF8String:key];
 }
 
 void nabi_mobile_share(const unsigned short *text, int length) {
@@ -166,7 +375,7 @@ void nabi_mobile_share(const unsigned short *text, int length) {
 
 void nabi_mobile_safe_area(float *out) {
     UIWindow *window = nabi_window();
-    nabi_controller(window);
+    nabi_controller(window, YES);
     UIEdgeInsets insets = window.safeAreaInsets;
     CGFloat scale = window.screen.scale ?: 1.;
     out[0] = insets.top * scale; out[1] = insets.right * scale;
@@ -182,7 +391,15 @@ void nabi_mobile_keep_awake(bool enabled) {
 @interface NabiDocumentPicker : NSObject <UIDocumentPickerDelegate>
 @property(nonatomic) BOOL busy;
 @property(nonatomic) BOOL folder;
+@property(nonatomic) BOOL discoverKind;
+@property(nonatomic, copy) NSString *reconnecting;
 @end
+
+static BOOL nabi_valid_source_id(NSString *identifier) {
+    if (identifier.length < 8 || identifier.length > 64) return NO;
+    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"];
+    return [identifier rangeOfCharacterFromSet:allowed.invertedSet].location == NSNotFound;
+}
 
 static NSString *nabi_grants_path(void) {
     NSString *directory = [NSString stringWithUTF8String:nabi_mobile_path(0)];
@@ -207,7 +424,7 @@ static BOOL nabi_write_grants(NSDictionary *grants) {
 
 // iOS picker URLs carry implicit security scope. The macOS-only
 // NSURLBookmarkCreationWithSecurityScope option must not be used here.
-static NSString *nabi_save_source(NSArray<NSURL *> *urls, BOOL folder) {
+static NSString *nabi_save_source(NSArray<NSURL *> *urls, BOOL folder, NSString *reconnecting) {
     if (!urls.count || urls.count > 128) return nil;
     NSMutableArray *bookmarks = [NSMutableArray new], *locations = [NSMutableArray new];
     for (NSURL *url in urls) {
@@ -219,16 +436,27 @@ static NSString *nabi_save_source(NSArray<NSURL *> *urls, BOOL folder) {
         [bookmarks addObject:bookmark]; [locations addObject:url.absoluteString];
     }
     NSMutableDictionary *grants = nabi_grants();
-    NSString *identifier = nil;
-    for (NSString *key in grants) {
-        NSDictionary *record = grants[key];
-        if ([record isKindOfClass:NSDictionary.class] && [record[@"folder"] boolValue] == folder && [record[@"locations"] isEqual:locations]) {
-            identifier = key; break;
+    NSString *identifier = reconnecting;
+    if (!identifier) {
+        for (NSString *key in grants) {
+            NSDictionary *record = grants[key];
+            if ([record isKindOfClass:NSDictionary.class] && [record[@"folder"] boolValue] == folder && [record[@"locations"] isEqual:locations]) {
+                identifier = key; break;
+            }
         }
     }
     if (!identifier) identifier = NSUUID.UUID.UUIDString;
     grants[identifier] = @{@"bookmarks":bookmarks, @"locations":locations, @"folder":@(folder), @"name":urls.firstObject.lastPathComponent ?: @"Selected documents"};
     return nabi_write_grants(grants) ? identifier : nil;
+}
+
+// Keep permission/missing-source recovery separate from transient provider I/O.
+static int nabi_document_error(NSError *error, int fileError) {
+    if (fileError == EACCES || fileError == EPERM || fileError == ENOENT) return 6;
+    if ([error.domain isEqualToString:NSCocoaErrorDomain] &&
+        (error.code == NSFileReadNoPermissionError || error.code == NSFileNoSuchFileError ||
+         error.code == NSFileReadNoSuchFileError)) return 6;
+    return 7;
 }
 
 static void nabi_report_source(NSString *identifier, NSString *fallback) {
@@ -251,20 +479,29 @@ static void nabi_import_folder(NSURL *url, NSString *identifier) {
     }];
     if (!nabi_mobile_import_begin_folder()) items = @[];
     nabi_report_source(identifier, url.lastPathComponent);
-    if (listError || coordinationError) nabi_mobile_import_error("Folder access is unavailable. Select the folder again.");
+    int failure = 0;
+    NSUInteger readable = 0;
+    if (listError || coordinationError) nabi_mobile_photo_error(nabi_document_error(listError ?: coordinationError, 0));
     for (NSURL *item in items) {
         NSNumber *regular = nil;
         [item getResourceValue:&regular forKey:NSURLIsRegularFileKey error:nil];
         if (!regular.boolValue) continue;
         // Rust consumes and closes the descriptor and skips unsupported files.
         __block BOOL more = YES;
+        __block int fileError = 0;
+        __block BOOL opened = NO;
+        NSError *readError = nil;
         NSFileCoordinator *coordinator = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
-        [coordinator coordinateReadingItemAtURL:item options:0 error:nil byAccessor:^(NSURL *readURL) {
+        [coordinator coordinateReadingItemAtURL:item options:0 error:&readError byAccessor:^(NSURL *readURL) {
             int fd = open(readURL.fileSystemRepresentation, O_RDONLY | O_CLOEXEC);
-            if (fd >= 0) more = nabi_mobile_import_file(fd, item.lastPathComponent.UTF8String);
+            if (fd >= 0) { opened = YES; more = nabi_mobile_import_file(fd, item.lastPathComponent.UTF8String); }
+            else fileError = errno;
         }];
+        if (opened) readable++;
+        else if (readError || fileError) failure = nabi_document_error(readError, fileError);
         if (!more) break;
     }
+    if (!readable && failure) nabi_mobile_photo_error(failure);
     if (access) [url stopAccessingSecurityScopedResource];
     nabi_mobile_import_finish();
 }
@@ -279,12 +516,14 @@ static void nabi_import_documents(NSArray<NSURL *> *urls, NSString *identifier) 
         NSFileCoordinator *coordinator = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
         NSError *error = nil;
         __block BOOL copied = NO;
+        __block int fileError = 0;
         [coordinator coordinateReadingItemAtURL:url options:0 error:&error byAccessor:^(NSURL *readURL) {
             int fd = open(readURL.fileSystemRepresentation, O_RDONLY | O_CLOEXEC);
-            copied = nabi_mobile_import_file(fd, url.lastPathComponent.UTF8String);
+            if (fd >= 0) copied = nabi_mobile_import_file(fd, url.lastPathComponent.UTF8String);
+            else fileError = errno;
         }];
         if (access) [url stopAccessingSecurityScopedResource];
-        if (error) nabi_mobile_import_error("Document access is unavailable. Select the document again.");
+        if (error || fileError) nabi_mobile_photo_error(nabi_document_error(error, fileError));
         ok = copied && error == nil;
     }
     nabi_mobile_import_finish();
@@ -292,22 +531,68 @@ static void nabi_import_documents(NSArray<NSURL *> *urls, NSString *identifier) 
 
 @implementation NabiDocumentPicker
 - (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
-    (void)controller; self.busy = NO;
+    (void)controller;
+    BOOL reconnecting = self.reconnecting != nil;
+    self.reconnecting = nil; self.busy = NO;
+    if (reconnecting) nabi_mobile_access_action_result(3, false);
 }
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
-    (void)controller;
-    if (self.folder) {
-        NSURL *folder = urls.firstObject;
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-            if (folder) nabi_import_folder(folder, nabi_save_source(@[folder], YES));
-            dispatch_async(dispatch_get_main_queue(), ^{ self.busy = NO; });
-        });
+    BOOL folder = self.folder;
+    NSString *reconnecting = self.reconnecting;
+    if (self.discoverKind && urls.count) {
+        NSURL *url = urls.firstObject;
+        BOOL access = [url startAccessingSecurityScopedResource];
+        NSNumber *directory = nil;
+        NSError *error = nil;
+        BOOL known = [url getResourceValue:&directory forKey:NSURLIsDirectoryKey error:&error];
+        if (access) [url stopAccessingSecurityScopedResource];
+        if (!known || ![directory isKindOfClass:NSNumber.class]) {
+            nabi_mobile_import_begin();
+            nabi_mobile_photo_error(nabi_document_error(error, 0));
+            nabi_mobile_import_finish();
+            self.reconnecting = nil; self.busy = NO;
+            if (reconnecting) nabi_mobile_access_action_result(3, true);
+            return;
+        }
+        folder = directory.boolValue;
+    }
+    NSArray<NSURL *> *selection = folder && urls.count ? @[urls.firstObject] : urls;
+    if (!selection.count) {
+        [self documentPickerWasCancelled:controller];
         return;
     }
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        nabi_import_documents(urls, nabi_save_source(urls, NO));
-        dispatch_async(dispatch_get_main_queue(), ^{ self.busy = NO; });
-    });
+    void (^import)(void) = ^{
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            NSString *identifier = nabi_save_source(selection, folder, reconnecting);
+            if (reconnecting && !identifier) {
+                nabi_mobile_import_begin(); nabi_mobile_photo_error(6); nabi_mobile_import_finish();
+            } else if (folder) nabi_import_folder(selection.firstObject, identifier);
+            else nabi_import_documents(selection, identifier);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.reconnecting = nil; self.busy = NO;
+                if (reconnecting) nabi_mobile_access_action_result(3, true);
+            });
+        });
+    };
+    NSDictionary *previous = reconnecting ? nabi_grants()[reconnecting] : nil;
+    BOOL same = [previous isKindOfClass:NSDictionary.class] &&
+        [previous[@"locations"] isEqual:[selection valueForKey:@"absoluteString"]];
+    if (!reconnecting || same) { import(); return; }
+    // Do not replace an existing source with an unrelated folder silently.
+    // Missing previous locations also require an explicit reconnection choice.
+    [controller dismissViewControllerAnimated:YES completion:^{
+        UIViewController *presenter = nabi_presenter();
+        if (!presenter) { [self documentPickerWasCancelled:controller]; return; }
+        UIAlertController *confirmation = [UIAlertController alertControllerWithTitle:nabi_text("access-reconnect-title")
+            message:nabi_text("access-reconnect-message") preferredStyle:UIAlertControllerStyleAlert];
+        [confirmation addAction:[UIAlertAction actionWithTitle:nabi_text("cancel") style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
+            (void)action; [self documentPickerWasCancelled:controller];
+        }]];
+        [confirmation addAction:[UIAlertAction actionWithTitle:nabi_text("access-reconnect") style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+            (void)action; import();
+        }]];
+        [presenter presentViewController:confirmation animated:YES completion:nil];
+    }];
 }
 @end
 
@@ -320,11 +605,18 @@ static NabiDocumentPicker *nabi_document_picker(void) {
 bool nabi_mobile_reopen(const unsigned short *text, int length) {
     if (length < 8 || length > 64) return false;
     NSString *identifier = [[NSString alloc] initWithCharacters:text length:(NSUInteger)length];
+    if (!nabi_valid_source_id(identifier)) return false;
     __block BOOL accepted = NO;
     void (^start)(void) = ^{
         NabiDocumentPicker *delegate = nabi_document_picker();
         if (delegate.busy) return;
         delegate.busy = YES; accepted = YES;
+        if (nabi_photos_is_collection(identifier)) {
+            nabi_photos_open(identifier, ^{
+                dispatch_async(dispatch_get_main_queue(), ^{ delegate.busy = NO; });
+            });
+            return;
+        }
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             @autoreleasepool {
                 NSMutableDictionary *grants = nabi_grants();
@@ -360,7 +652,7 @@ bool nabi_mobile_reopen(const unsigned short *text, int length) {
                     else nabi_import_documents(urls, identifier);
                 } else {
                     nabi_mobile_import_begin();
-                    nabi_mobile_import_error("Saved document access is unavailable. Select the source again.");
+                    nabi_mobile_photo_error(6);
                     nabi_mobile_import_finish();
                 }
                 dispatch_async(dispatch_get_main_queue(), ^{ delegate.busy = NO; });
@@ -371,26 +663,111 @@ bool nabi_mobile_reopen(const unsigned short *text, int length) {
     return accepted;
 }
 
-static void nabi_pick_documents(BOOL folder) {
-    dispatch_async(dispatch_get_main_queue(), ^{
+static BOOL nabi_pick_documents(BOOL folder, NSString *reconnecting, BOOL discoverKind) {
+    __block BOOL accepted = NO;
+    void (^start)(void) = ^{
         NabiDocumentPicker *delegate = nabi_document_picker();
         if (delegate.busy) return;
         UIViewController *presenter = nabi_presenter();
         if (!presenter) return;
         // Generic data also exposes AVIF/JXL/RAW extensions not registered with
         // the OS. The shared Rust import layer validates supported extensions.
+        NSArray<UTType *> *types = discoverKind ? @[UTTypeFolder, UTTypeImage, UTTypeData]
+            : folder ? @[UTTypeFolder] : @[UTTypeImage, UTTypeData];
         UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc]
-            initForOpeningContentTypes:folder ? @[UTTypeFolder] : @[UTTypeImage, UTTypeData] asCopy:NO];
-        picker.allowsMultipleSelection = !folder;
+            initForOpeningContentTypes:types asCopy:NO];
+        picker.allowsMultipleSelection = !folder && !discoverKind;
         picker.delegate = delegate;
         delegate.folder = folder;
+        delegate.discoverKind = discoverKind;
+        delegate.reconnecting = reconnecting;
         delegate.busy = YES;
+        accepted = YES;
         [presenter presentViewController:picker animated:YES completion:nil];
-    });
+    };
+    if (NSThread.isMainThread) start(); else dispatch_sync(dispatch_get_main_queue(), start);
+    return accepted;
 }
 
-void nabi_mobile_pick(void) { nabi_pick_documents(NO); }
-void nabi_mobile_pick_folder(void) { nabi_pick_documents(YES); }
+void nabi_mobile_pick(void) { nabi_pick_documents(NO, nil, NO); }
+void nabi_mobile_pick_folder(void) { nabi_pick_documents(YES, nil, NO); }
+
+bool nabi_mobile_reselect(const unsigned short *text, int length) {
+    if (length < 8 || length > 64) return false;
+    NSString *identifier = [[NSString alloc] initWithCharacters:text length:(NSUInteger)length];
+    if (!nabi_valid_source_id(identifier) || nabi_photos_is_collection(identifier)) return false;
+    NSDictionary *record = nabi_grants()[identifier];
+    if (![record isKindOfClass:NSDictionary.class] || ![record[@"folder"] isKindOfClass:NSNumber.class]) {
+        // A missing native grant may still have its local source description.
+        NSString *path = [[NSString stringWithUTF8String:nabi_mobile_path(0)]
+            stringByAppendingPathComponent:[NSString stringWithFormat:@"document-sources/%@/.nabi-document-source.json", identifier]];
+        NSData *data = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
+        id marker = data.length <= 1024 * 1024 ? [NSJSONSerialization JSONObjectWithData:data ?: [NSData data] options:0 error:nil] : nil;
+        record = [marker isKindOfClass:NSDictionary.class] && [marker[@"id"] isEqual:identifier] ? marker : nil;
+    }
+    // A library entry may outlive both its marker and its native bookmark.
+    // Ask for one file or folder, then determine its kind from the selected
+    // URL. The explicit reconnect confirmation still protects the old entry.
+    BOOL discoverKind = ![record[@"folder"] isKindOfClass:NSNumber.class];
+    return nabi_pick_documents([record[@"folder"] boolValue], identifier, discoverKind);
+}
+
+bool nabi_mobile_open_settings(void) {
+    __block BOOL accepted = NO;
+    void (^start)(void) = ^{
+        NSURL *url = [NSURL URLWithString:UIApplicationOpenSettingsURLString];
+        NabiDocumentPicker *delegate = nabi_document_picker();
+        if (!url || delegate.busy) return;
+        delegate.busy = YES; accepted = YES;
+        [UIApplication.sharedApplication openURL:url options:@{} completionHandler:^(BOOL success) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                delegate.busy = NO;
+                nabi_mobile_access_action_result(1, success);
+            });
+        }];
+    };
+    if (NSThread.isMainThread) start(); else dispatch_sync(dispatch_get_main_queue(), start);
+    return accepted;
+}
+
+bool nabi_mobile_manage_photos(void) {
+    __block BOOL accepted = NO;
+    void (^start)(void) = ^{
+        NabiDocumentPicker *delegate = nabi_document_picker();
+        UIViewController *presenter = nabi_presenter();
+        if (delegate.busy || !presenter || nabi_mobile_photo_status() != 4) return;
+        delegate.busy = YES; accepted = YES;
+        [PHPhotoLibrary.sharedPhotoLibrary presentLimitedLibraryPickerFromViewController:presenter completionHandler:^(NSArray<NSString *> *identifiers) {
+            (void)identifiers;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                delegate.busy = NO;
+                nabi_mobile_access_action_result(2, true);
+                nabi_mobile_access_changed();
+            });
+        }];
+    };
+    if (NSThread.isMainThread) start(); else dispatch_sync(dispatch_get_main_queue(), start);
+    return accepted;
+}
+
+bool nabi_mobile_request_photo_access(void) {
+    __block BOOL accepted = NO;
+    void (^start)(void) = ^{
+        NabiDocumentPicker *delegate = nabi_document_picker();
+        if (delegate.busy || nabi_mobile_photo_status() != 0) return;
+        delegate.busy = YES; accepted = YES;
+        [PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelReadWrite handler:^(PHAuthorizationStatus status) {
+            (void)status; // The Rust UI obtains the current status after completion.
+            dispatch_async(dispatch_get_main_queue(), ^{
+                delegate.busy = NO;
+                nabi_mobile_access_action_result(4, true);
+                nabi_mobile_access_changed();
+            });
+        }];
+    };
+    if (NSThread.isMainThread) start(); else dispatch_sync(dispatch_get_main_queue(), start);
+    return accepted;
+}
 
 @interface NabiSettingsPicker : NSObject <UIDocumentPickerDelegate>
 @property(nonatomic) BOOL exporting;

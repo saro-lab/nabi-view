@@ -6,10 +6,9 @@ const FILE_COMMANDS: &[&str] = &["trash", "move", "bookmark"];
 
 impl Viewer {
     pub(super) fn update_controls(&mut self, ctx: &egui::Context) {
-        // The library fills narrow windows and phone screens, covering the bars.
-        // On desktop, chrome revealed by hovering an edge would also land above
-        // it and cover its header icons, as with settings.
-        if self.library.open && overlay::compact(ctx) {
+        // Compact overlays fill the window. Edge hover must not bring the
+        // viewer bars back over their header or footer controls.
+        if self.overlay_open() && overlay::compact(ctx) {
             self.controls_visible = false;
             return;
         }
@@ -25,7 +24,7 @@ impl Viewer {
                     || p.y >= screen.bottom() - BOTTOM_CHROME_HEIGHT)
         }) || ctx.any_popup_open()
             || self.held_button.is_some()
-            || self.menu_open
+            || self.menu_visible()
             || self.zoom_input.is_some()
         {
             self.hover_until = now + 0.05;
@@ -121,7 +120,7 @@ impl Viewer {
                                 // plus orientation and/or close), which shrink on narrow
                                 // windows, so the last one stays on the right edge.
                                 let count = 3
-                                    + usize::from(command_supported("orientation"))
+                                    + usize::from(self.orientation_available())
                                     + usize::from(command_supported("close-window"));
                                 let buttons = count as f32
                                     * (chrome_icons::size(ui) + ui.spacing().item_spacing.x);
@@ -132,6 +131,10 @@ impl Viewer {
                                     .and_then(|p| p.file_name())
                                     .map(|p| p.to_string_lossy().into_owned())
                                     .unwrap_or_else(|| "NABI VIEW".into());
+                                #[cfg(target_os = "ios")]
+                                let limited = self.ios_photos_limited();
+                                #[cfg(not(target_os = "ios"))]
+                                let limited = false;
                                 let title = ui
                                     .allocate_ui_with_layout(
                                         egui::vec2(title_width, 32.),
@@ -141,10 +144,17 @@ impl Viewer {
                                             ui.set_max_width(title_width);
                                             ui.add(
                                                 egui::Label::new(
-                                                    RichText::new(&filename).color(INK),
+                                                    RichText::new(if limited {
+                                                        tr("ios-photo-access-limited")
+                                                    } else {
+                                                        &filename
+                                                    })
+                                                    .color(INK),
                                                 )
                                                 .truncate()
-                                                .sense(if mobile {
+                                                .sense(if limited {
+                                                    egui::Sense::click()
+                                                } else if mobile {
                                                     egui::Sense::hover()
                                                 } else {
                                                     egui::Sense::click_and_drag()
@@ -154,6 +164,10 @@ impl Viewer {
                                     )
                                     .inner
                                     .hover_text(&filename);
+                                #[cfg(target_os = "ios")]
+                                if limited && title.clicked() {
+                                    self.show_ios_photo_access();
+                                }
                                 if !mobile {
                                     if !self.fullscreen
                                         && title.drag_started_by(egui::PointerButton::Primary)
@@ -165,7 +179,7 @@ impl Viewer {
                                     }
                                 }
 
-                                if command_supported("orientation")
+                                if self.orientation_available()
                                     && chrome_icons::button_with_shortcut(
                                         ui,
                                         orientation_command(&self.settings.orientation),
@@ -198,9 +212,10 @@ impl Viewer {
                                 {
                                     self.run(command, ctx);
                                 }
-                                let menu = chrome_icons::button(ui, "menu", "menu", self.menu_open);
+                                let menu =
+                                    chrome_icons::button(ui, "menu", "menu", self.menu_visible());
                                 if menu.clicked() {
-                                    self.menu_open = !self.menu_open;
+                                    self.menu_open = !self.menu_visible();
                                     self.release_held_input();
                                     self.canvas_drag = None;
                                 }
@@ -648,10 +663,15 @@ impl Viewer {
                     });
             });
         if let Some(focus_index) = next_focus {
-            self.focus_navigation(ctx, focus_index);
+            if crate::app::is_mobile() && focused_pages.contains(&focus_index) {
+                self.toggle_thumbnail_check(ctx, focus_index);
+            } else {
+                self.focus_navigation(ctx, focus_index);
+            }
         }
         if let Some(path) = wanted {
-            if !self.memory_policy.background_allowed() || self.details.pending() {
+            if !self.memory_policy.background_allowed() || self.details.pending() || self.renaming()
+            {
                 return;
             }
             if self.thumb_ticket.as_ref().is_none_or(|(_, p)| p != &path) {

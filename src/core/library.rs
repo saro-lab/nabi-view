@@ -11,7 +11,6 @@ use eframe::egui;
 use image::{ImageEncoder, ImageReader, Limits};
 use std::{
     fs,
-    io::Write,
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
@@ -226,16 +225,42 @@ pub(crate) fn decode_thumbnail(image: &Path) -> Result<egui::ColorImage, String>
     Ok(frame.image)
 }
 
-/// Decodes `image`, stores its thumbnail as `key` and returns the pixels to show.
+/// Decodes `image` and returns pixels plus whether a thumbnail was stored.
+/// A clear-all or disabled cache during decoding must not discard the pixels.
 pub(crate) fn create_thumbnail(
     image: &Path,
     dir: &Path,
     key: &str,
-) -> Result<egui::ColorImage, String> {
+    current_limit: impl Fn() -> u64,
+) -> Result<(egui::ColorImage, bool), String> {
+    create_thumbnail_with_decoder(image, dir, key, current_limit, decode_thumbnail)
+}
+
+fn create_thumbnail_with_decoder(
+    image: &Path,
+    dir: &Path,
+    key: &str,
+    current_limit: impl Fn() -> u64,
+    decode: impl FnOnce(&Path) -> Result<egui::ColorImage, String>,
+) -> Result<(egui::ColorImage, bool), String> {
     if !is_thumbnail_key(key) {
         return Err("Invalid thumbnail name.".into());
     }
-    let image = decode_thumbnail(image)?;
+    if dir.file_name().is_none_or(|name| name != "thumbnails") {
+        return Err("Invalid thumbnail directory.".into());
+    }
+    let root = dir.parent().ok_or("Invalid thumbnail directory.")?;
+    let limit = current_limit();
+    let cache = crate::core::disk_cache::Cache::new(root.to_owned(), limit);
+    let generation = if limit == 0 {
+        None
+    } else {
+        Some(cache.thumbnail_generation().map_err(|e| e.to_string())?)
+    };
+    let image = decode(image)?;
+    let Some(generation) = generation else {
+        return Ok((image, false));
+    };
     let [width, height] = image.size;
     let mut rgba = Vec::with_capacity(width * height * 4);
     for pixel in &image.pixels {
@@ -251,13 +276,10 @@ pub(crate) fn create_thumbnail(
             image::ExtendedColorType::Rgba8,
         )
         .map_err(|e| e.to_string())?;
-    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    // Write beside the target and rename, so readers never see a partial file.
-    let mut temp = tempfile::NamedTempFile::new_in(dir).map_err(|e| e.to_string())?;
-    temp.write_all(&png).map_err(|e| e.to_string())?;
-    temp.persist(thumbnail_file(dir, key))
-        .map_err(|e| e.error.to_string())?;
-    Ok(image)
+    let stored = cache
+        .store_thumbnail(generation, key, &png, current_limit)
+        .map_err(|e| e.to_string())?;
+    Ok((image, stored))
 }
 
 /// Reads a cached thumbnail written by `create_thumbnail`.
@@ -294,6 +316,67 @@ pub(crate) fn load_thumbnail(dir: &Path, key: &str) -> Result<egui::ColorImage, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn create_thumbnail(image: &Path, dir: &Path, key: &str) -> Result<egui::ColorImage, String> {
+        super::create_thumbnail(image, dir, key, || 1024 * 1024).map(|(image, _)| image)
+    }
+
+    #[test]
+    fn cache_clear_or_disable_during_thumbnail_decode_keeps_pixels_without_writing() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+            mpsc,
+        };
+        use std::time::Duration;
+
+        for clear in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("page.png");
+            image::RgbaImage::from_pixel(2, 1, image::Rgba([220, 80, 40, 128]))
+                .save(&source)
+                .unwrap();
+            let original = fs::read(&source).unwrap();
+            let directory = root.path().join("cache/thumbnails");
+            let cache = crate::core::disk_cache::Cache::new(
+                directory.parent().unwrap().to_owned(),
+                1024 * 1024,
+            );
+            let limit = Arc::new(AtomicU64::new(1024 * 1024));
+            let worker_limit = limit.clone();
+            let (started, decoded) = mpsc::channel();
+            let (resume, wait) = mpsc::channel();
+            let key = thumbnail_key(&source).unwrap();
+            let worker_source = source.clone();
+            let worker = std::thread::spawn(move || {
+                create_thumbnail_with_decoder(
+                    &worker_source,
+                    &directory,
+                    &key,
+                    || worker_limit.load(Ordering::Relaxed),
+                    |path| {
+                        let pixels = decode_thumbnail(path)?;
+                        started.send(()).unwrap();
+                        wait.recv_timeout(Duration::from_secs(10)).unwrap();
+                        Ok(pixels)
+                    },
+                )
+            });
+            decoded.recv_timeout(Duration::from_secs(10)).unwrap();
+            if clear {
+                cache.clear().unwrap();
+            } else {
+                limit.store(0, Ordering::Relaxed);
+            }
+            resume.send(()).unwrap();
+            let (pixels, stored) = worker.join().unwrap().unwrap();
+            assert_eq!(pixels.size, [2, 1]);
+            assert_eq!(pixels.pixels[0].a(), 128);
+            assert!(!stored);
+            assert_eq!(cache.stats().unwrap().files, 0);
+            assert_eq!(fs::read(&source).unwrap(), original);
+        }
+    }
 
     #[test]
     fn names_are_single_line_and_bounded() {
@@ -391,23 +474,22 @@ mod tests {
     #[test]
     fn legacy_thumbnails_remain_readable_until_sources_are_available() {
         let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("thumbnails");
+        fs::create_dir(&cache).unwrap();
         let key = "a".repeat(32);
-        let legacy = root.path().join(format!("{key}.jpg"));
+        let legacy = cache.join(format!("{key}.jpg"));
         image::RgbImage::from_pixel(8, 8, image::Rgb([28, 30, 31]))
             .save(&legacy)
             .unwrap();
-        assert_eq!(load_thumbnail(root.path(), &key).unwrap().size, [8, 8]);
+        assert_eq!(load_thumbnail(&cache, &key).unwrap().size, [8, 8]);
 
         let source = root.path().join("source.png");
         image::RgbaImage::from_pixel(8, 8, image::Rgba([220, 80, 40, 128]))
             .save(&source)
             .unwrap();
-        create_thumbnail(&source, root.path(), &key).unwrap();
+        create_thumbnail(&source, &cache, &key).unwrap();
         // Prefer RGBA PNG even if a legacy file with this key is also present.
-        assert_eq!(
-            load_thumbnail(root.path(), &key).unwrap().pixels[0].a(),
-            128
-        );
+        assert_eq!(load_thumbnail(&cache, &key).unwrap().pixels[0].a(), 128);
         assert!(legacy.is_file());
     }
 }

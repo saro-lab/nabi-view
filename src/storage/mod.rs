@@ -13,12 +13,16 @@ use tempfile::NamedTempFile;
 use crate::core::library::{self, Entry, Kind};
 use crate::core::settings::*;
 const MAX_SETTINGS_BYTES: u64 = 128 * 1024;
+#[cfg(any(target_os = "ios", test))]
+const MOBILE_SOURCE_PREFIX: &[u8] = b"nabi-mobile-source-v1\0";
 
 pub struct Store {
     settings: PathBuf,
     database: PathBuf,
     cache: PathBuf,
     thumbnails_migrated: OnceLock<()>,
+    #[cfg(any(target_os = "ios", test))]
+    mobile_sources: OnceLock<PathBuf>,
     // What this instance showed its user, which can differ from the disk
     // after another process changes a preference.
     baseline: Mutex<Settings>,
@@ -68,12 +72,205 @@ impl Store {
             database: state.join("state.sqlite"),
             cache: cache.join("v1"),
             thumbnails_migrated: OnceLock::new(),
+            #[cfg(any(target_os = "ios", test))]
+            mobile_sources: OnceLock::new(),
             baseline: Mutex::new(Settings::default()),
         }
     }
 
     pub fn cache_dir(&self) -> PathBuf {
         self.cache.clone()
+    }
+
+    /// Mobile-only first-install defaults. An existing database (including an
+    /// intentionally empty library) is never repopulated by an app update.
+    #[cfg(any(target_os = "ios", target_os = "android", test))]
+    pub(crate) fn initialize_photo_bookmarks(
+        &self,
+        sources: &Path,
+        defaults: &[(&str, &str)],
+    ) -> Result<(), String> {
+        #[cfg(any(target_os = "ios", test))]
+        let resolved_sources = {
+            if !sources.is_absolute()
+                || sources.file_name() != Some(std::ffi::OsStr::new("document-sources"))
+            {
+                return Err("Invalid saved document source directory.".into());
+            }
+            let sources = crate::core::paths::canonicalize(sources)
+                .or_else(|_| {
+                    crate::core::paths::canonicalize(sources.parent().unwrap())
+                        .map(|parent| parent.join("document-sources"))
+                })
+                .map_err(|e| e.to_string())?;
+            if self
+                .mobile_sources
+                .get()
+                .is_some_and(|registered| registered != &sources)
+            {
+                return Err("Saved document source directory changed while running.".into());
+            }
+            let _ = self.mobile_sources.set(sources.clone());
+            sources
+        };
+        #[cfg(any(target_os = "ios", test))]
+        let sources = resolved_sources.as_path();
+        if self.database.try_exists().map_err(|e| e.to_string())? {
+            #[cfg(any(target_os = "ios", test))]
+            return self.migrate_mobile_sources();
+            #[cfg(not(any(target_os = "ios", test)))]
+            return Ok(());
+        }
+        let folders = defaults
+            .iter()
+            .map(|(id, _)| crate::core::photo_library::create_source(sources, id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut conn = self.connection()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        // Library order is newest first; insert defaults in reverse display order.
+        for folder in folders.iter().rev() {
+            tx.execute(
+                "INSERT OR IGNORE INTO library (kind, path) VALUES (?1, ?2)",
+                params![Kind::Bookmark.code(), self.encode_library_path(folder)],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    fn encode_library_path(&self, path: &Path) -> Vec<u8> {
+        #[cfg(any(target_os = "ios", test))]
+        if let Some(sources) = self.mobile_sources.get() {
+            if let Some((root, id)) = crate::core::documents::source_identity(path) {
+                if root == path && root.parent() == Some(sources.as_path()) {
+                    return mobile_source_key(&id);
+                }
+            }
+        }
+        encode_path(path)
+    }
+
+    fn decode_library_path(&self, bytes: Vec<u8>) -> Result<PathBuf, String> {
+        #[cfg(any(target_os = "ios", test))]
+        if bytes.starts_with(MOBILE_SOURCE_PREFIX) {
+            let id = mobile_source_id(&bytes).ok_or("Stored document source is corrupt.")?;
+            let sources = self
+                .mobile_sources
+                .get()
+                .ok_or("Mobile document sources are not initialized.")?;
+            return Ok(sources.join(id));
+        }
+        decode_path(bytes)
+    }
+
+    #[cfg(any(target_os = "ios", test))]
+    fn migrate_mobile_sources(&self) -> Result<(), String> {
+        let Some(sources) = self.mobile_sources.get() else {
+            return Ok(());
+        };
+        let mut conn = self.connection()?;
+        let rows = {
+            let mut query = conn
+                .prepare("SELECT id, kind, path FROM library ORDER BY id DESC")
+                .map_err(|e| e.to_string())?;
+            query
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        let mut changed = Vec::new();
+        for (row, kind, stored) in rows {
+            if stored.starts_with(MOBILE_SOURCE_PREFIX) {
+                continue;
+            }
+            let path = decode_path(stored.clone())?;
+            let Some((root, id)) = crate::core::documents::source_identity(&path) else {
+                continue;
+            };
+            if root != path {
+                continue;
+            }
+            // Match the complete source structure and a current registration;
+            // a coincidentally equal leaf filename is never sufficient.
+            let current = sources.join(&id);
+            if crate::core::photo_library::label(&id).is_none()
+                && crate::core::documents::source_record(&current).is_none()
+                && root.parent() != Some(sources.as_path())
+            {
+                continue;
+            }
+            changed.push((row, kind, mobile_source_key(&id)));
+        }
+        if changed.is_empty() {
+            return Ok(());
+        }
+        // VACUUM INTO takes a consistent SQLite snapshot, including WAL data.
+        let backup = self
+            .database
+            .with_file_name("state.pre-mobile-source-v1.sqlite");
+        if !backup.try_exists().map_err(|e| e.to_string())? {
+            let temporary =
+                tempfile::tempdir_in(self.database.parent().unwrap()).map_err(|e| e.to_string())?;
+            let snapshot = temporary.path().join("snapshot.sqlite");
+            conn.execute("VACUUM INTO ?1", [snapshot.to_string_lossy().as_ref()])
+                .map_err(|e| e.to_string())?;
+            match fs::hard_link(&snapshot, &backup) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        for (row, kind, key) in changed {
+            let existing: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM library WHERE kind = ?1 AND path = ?2",
+                    params![kind, key],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if let Some(other) = existing {
+                let (keep, remove) = (row.max(other), row.min(other));
+                // Preserve newest ordering and nonempty user metadata from the
+                // older duplicate when the newer row has no corresponding value.
+                tx.execute("UPDATE library SET name = COALESCE(name, (SELECT name FROM library WHERE id = ?2)),
+                    image = COALESCE(image, (SELECT image FROM library WHERE id = ?2)),
+                    thumbnail = CASE WHEN image IS NULL OR image = (SELECT image FROM library WHERE id = ?2)
+                        THEN COALESCE(thumbnail, (SELECT thumbnail FROM library WHERE id = ?2)) ELSE thumbnail END WHERE id = ?1",
+                    params![keep, remove]).map_err(|e| e.to_string())?;
+                tx.execute("DELETE FROM library WHERE id = ?1", [remove])
+                    .map_err(|e| e.to_string())?;
+                tx.execute(
+                    "UPDATE library SET path = ?1 WHERE id = ?2",
+                    params![key, keep],
+                )
+                .map_err(|e| e.to_string())?;
+            } else {
+                tx.execute(
+                    "UPDATE library SET path = ?1 WHERE id = ?2",
+                    params![key, row],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS app_migrations (name TEXT PRIMARY KEY);
+            INSERT OR IGNORE INTO app_migrations(name) VALUES ('mobile-source-v1');",
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
     }
 
     /// Move only our named cache files, preserving database keys and old JPEGs
@@ -401,7 +598,7 @@ impl Store {
             return Err("Recent history accepts folders only.".into());
         }
         let kind = Kind::Recent.code();
-        let path = encode_path(&path);
+        let path = self.encode_library_path(&path);
         let mut conn = self.connection()?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let (image, thumbnail): (Option<Vec<u8>>, Option<String>) = tx
@@ -465,12 +662,73 @@ impl Store {
                 "UPDATE library SET image = ?3 WHERE kind = ?1 AND path = ?2",
                 params![
                     Kind::Recent.code(),
-                    encode_path(&folder),
+                    self.encode_library_path(&folder),
                     encode_path(&name)
                 ],
             )
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Update recent/bookmark pages from one snapshot so name exchanges do not
+    /// apply the mapping twice. Folder identity and bookmark titles stay intact.
+    pub(crate) fn rename_library_images(
+        &self,
+        renamed: &[(PathBuf, PathBuf)],
+    ) -> Result<(), String> {
+        if renamed.is_empty() || !self.database.try_exists().map_err(|e| e.to_string())? {
+            return Ok(());
+        }
+        let mut folders = std::collections::HashMap::new();
+        let mut mapping = std::collections::HashMap::new();
+        for (source, target) in renamed {
+            let (Some(parent), Some(name), Some(new_name)) =
+                (source.parent(), source.file_name(), target.file_name())
+            else {
+                continue;
+            };
+            if Some(parent) != target.parent() {
+                continue;
+            }
+            let folder = match folders.entry(parent.to_owned()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(encode_path(&canonical_library_folder(parent)?))
+                }
+            };
+            mapping.insert(
+                (folder.clone(), encode_path(Path::new(name))),
+                encode_path(Path::new(new_name)),
+            );
+        }
+        let mut connection = self.connection()?;
+        let tx = connection.transaction().map_err(|e| e.to_string())?;
+        let rows = {
+            let mut statement = tx
+                .prepare("SELECT kind, path, image FROM library WHERE image IS NOT NULL")
+                .map_err(|e| e.to_string())?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        for (kind, folder, image) in rows {
+            if let Some(target) = mapping.get(&(folder.clone(), image)) {
+                tx.execute(
+                    "UPDATE library SET image = ?3 WHERE kind = ?1 AND path = ?2",
+                    params![kind, folder, target],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())
     }
 
     /// Bookmarks the folder of `image`, with that image as its thumbnail, and
@@ -495,7 +753,7 @@ impl Store {
                  ON CONFLICT(kind, path) DO UPDATE SET image = excluded.image, name = excluded.name",
                 params![
                     Kind::Bookmark.code(),
-                    encode_path(&folder),
+                    self.encode_library_path(&folder),
                     encode_path(&file),
                     library::clean_name(name)
                 ],
@@ -516,7 +774,7 @@ impl Store {
             .connection()?
             .query_row(
                 "SELECT name FROM library WHERE kind = ?1 AND path = ?2",
-                params![Kind::Bookmark.code(), encode_path(&folder)],
+                params![Kind::Bookmark.code(), self.encode_library_path(&folder)],
                 |row| row.get(0),
             )
             .optional()
@@ -531,7 +789,7 @@ impl Store {
                 "UPDATE library SET name = ?3 WHERE kind = ?1 AND path = ?2",
                 params![
                     Kind::Bookmark.code(),
-                    encode_path(folder),
+                    self.encode_library_path(folder),
                     library::clean_name(name)
                 ],
             )
@@ -548,7 +806,7 @@ impl Store {
             self.connection()?
                 .execute(
                     "UPDATE library SET thumbnail = ?3 WHERE kind = ?1 AND path = ?2",
-                    params![kind.code(), encode_path(folder), key],
+                    params![kind.code(), self.encode_library_path(folder), key],
                 )
                 .map_err(|e| e.to_string())?;
         }
@@ -563,6 +821,8 @@ impl Store {
         if !self.database.try_exists().map_err(|e| e.to_string())? {
             return Ok(Vec::new());
         }
+        #[cfg(any(target_os = "ios", test))]
+        self.migrate_mobile_sources()?;
         let mut conn = self.connection()?;
         simplify_stored_paths(&mut conn, "library", "kind")?;
         type Row = (
@@ -604,29 +864,50 @@ impl Store {
             let Some(kind) = Kind::from_code(kind) else {
                 continue;
             };
-            let folder = decode_path(path.clone())?;
+            let folder = self.decode_library_path(path.clone())?;
             #[cfg(all(target_os = "macos", not(test)))]
             let protected = crate::platform::mac_access::has_grant(&folder);
             #[cfg(not(all(target_os = "macos", not(test))))]
             let protected = false;
+            #[cfg(any(target_os = "ios", target_os = "android", test))]
+            let collection = crate::core::photo_library::title(&folder).is_some();
+            #[cfg(not(any(target_os = "ios", target_os = "android", test)))]
+            let collection = false;
+            #[cfg(any(target_os = "ios", test))]
+            let mobile_source = crate::core::documents::source_identity(&folder).is_some();
+            #[cfg(not(any(target_os = "ios", test)))]
+            let mobile_source = false;
             let saved = image
                 .map(decode_path)
                 .transpose()?
+                .filter(|image| {
+                    !mobile_source
+                        || (!image.as_os_str().is_empty()
+                            && image
+                                .components()
+                                .all(|part| matches!(part, std::path::Component::Normal(_))))
+                })
                 .map(|image| folder.join(image))
-                .filter(|image| protected || library::page_exists(image));
+                .filter(|image| protected || mobile_source || library::page_exists(image));
             // An archive whose file list cannot be read still opens by itself.
             let image = saved
                 .or_else(|| library::first_image(&folder))
                 .or_else(|| library::is_archive_file(&folder).then(|| folder.clone()));
-            if image.is_none() && kind == Kind::Recent && !protected {
+            if image.is_none()
+                && kind == Kind::Recent
+                && !protected
+                && !collection
+                && !mobile_source
+            {
                 unavailable.push((id, path));
                 continue;
             }
             entries.push(Entry {
                 kind,
-                available: image
-                    .as_ref()
-                    .is_some_and(|path| !protected || library::page_exists(path)),
+                available: collection
+                    || image.as_ref().is_some_and(|path| {
+                        (!protected && !mobile_source) || library::page_exists(path)
+                    }),
                 folder,
                 image,
                 name,
@@ -665,7 +946,7 @@ impl Store {
             self.connection()?
                 .execute(
                     "DELETE FROM library WHERE kind = ?1 AND path = ?2",
-                    params![kind.code(), encode_path(path)],
+                    params![kind.code(), self.encode_library_path(path)],
                 )
                 .map_err(|e| e.to_string())?;
             #[cfg(all(target_os = "macos", not(test)))]
@@ -851,6 +1132,30 @@ fn simplify_stored_paths(conn: &mut Connection, table: &str, group: &str) -> Res
         .map_err(|e| e.to_string())?;
     }
     tx.commit().map_err(|e| e.to_string())
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn mobile_source_key(id: &str) -> Vec<u8> {
+    let kind = if crate::core::photo_library::label(id).is_some() {
+        "photo"
+    } else {
+        "document"
+    };
+    [MOBILE_SOURCE_PREFIX, kind.as_bytes(), b"\0", id.as_bytes()].concat()
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn mobile_source_id(bytes: &[u8]) -> Option<&str> {
+    let text = std::str::from_utf8(bytes.strip_prefix(MOBILE_SOURCE_PREFIX)?).ok()?;
+    let (kind, id) = text.split_once('\0')?;
+    if !crate::core::documents::valid_id(id) {
+        return None;
+    }
+    match kind {
+        "photo" if crate::core::photo_library::label(id).is_some() => Some(id),
+        "document" if crate::core::photo_library::label(id).is_none() => Some(id),
+        _ => None,
+    }
 }
 
 fn canonical_library_folder(path: &Path) -> Result<PathBuf, String> {

@@ -158,7 +158,7 @@ fn recent_overlay_prunes_unavailable_items_on_display_and_click() {
 }
 
 #[test]
-fn empty_window_opens_centered_recent_overlay_and_escape_only_dismisses_it() {
+fn empty_window_returns_to_menu_after_dismissing_recent_overlay() {
     let mut window = TestWindow::open(None);
     for _ in 0..4 {
         window.draw(None);
@@ -204,9 +204,15 @@ fn empty_window_opens_centered_recent_overlay_and_escape_only_dismisses_it() {
             .viewport_commands
             .contains(&egui::ViewportCommand::Close)
     );
-    assert!(window.draw(None).0.is_empty());
-    window.reveal_controls();
-    window.draw(None);
+    for _ in 0..4 {
+        window.draw(None);
+    }
+    assert!(
+        window
+            .ctx
+            .read_response(egui::Id::unique(("menu-command", "open")))
+            .is_some()
+    );
     assert!(window.titlebar_visible());
 }
 
@@ -443,6 +449,7 @@ fn centered_icon_menu_scrolls_and_executes_without_background_input() {
     window.screen_size = egui::vec2(520., 360.);
     window.reveal_controls();
     window.wait_for("1 / 5");
+    let focused_texture = window.photo_texture();
     window.draw(Some(Key::H));
     window.click(window.titlebar_icon("menu").rect.center());
     for size in [
@@ -526,7 +533,7 @@ fn centered_icon_menu_scrolls_and_executes_without_background_input() {
         "Missing image icon"
     );
     assert!(window.drag_pointer(menu.left_top() + egui::vec2(80., 24.), egui::vec2(30., 5.)));
-    for key in [Key::ArrowRight, Key::R, Key::Delete, Key::F] {
+    for key in [Key::ArrowRight, Key::T, Key::Delete, Key::F] {
         window.draw(Some(key));
         assert!(!window.viewport_commands.iter().any(|c| matches!(
             c,
@@ -534,7 +541,7 @@ fn centered_icon_menu_scrolls_and_executes_without_background_input() {
         )));
     }
     assert!(!saved_viewer_settings(&window).flip_horizontal);
-    assert_eq!(focused_thumbnail_pages(&window), [1]);
+    assert_eq!(window.photo_texture(), focused_texture);
     let first_y = open.top();
     window.pointer(menu.center().x, menu.center().y);
     window.draw_events(
@@ -563,8 +570,8 @@ fn centered_icon_menu_scrolls_and_executes_without_background_input() {
         "Wheel did not scroll the icon grid"
     );
     assert_eq!(
-        focused_thumbnail_pages(&window),
-        [1],
+        window.photo_texture(),
+        focused_texture,
         "Menu wheel navigated the image"
     );
     let fullscreen = window
@@ -708,7 +715,12 @@ fn centered_icon_menu_applies_view_mode_and_dismisses_with_close_or_backdrop() {
             window.draw(None);
         }
         let position = if close_button {
-            window.titlebar_icon("menu-close").rect.center()
+            window
+                .ctx
+                .read_response(egui::Id::unique(("titlebar", "menu-close")))
+                .unwrap()
+                .rect
+                .center()
         } else {
             egui::pos2(24., 180.)
         };
@@ -717,6 +729,8 @@ fn centered_icon_menu_applies_view_mode_and_dismisses_with_close_or_backdrop() {
             !window.draw(None).0.contains("Open image"),
             "Dismiss failed (close_button={close_button})"
         );
+        // Compact menus hide the viewer bars; settle their fade-in on return.
+        window.reveal_controls();
         assert_eq!(focused_thumbnail_pages(&window), [1]);
         assert!(
             !window
@@ -728,7 +742,7 @@ fn centered_icon_menu_applies_view_mode_and_dismisses_with_close_or_backdrop() {
 }
 
 #[test]
-fn right_clicking_empty_canvas_opens_menu_and_backdrop_only_dismisses_it() {
+fn empty_menu_returns_from_settings_and_library_and_stays_on_backdrop_click() {
     let mut window = TestWindow::open(None);
     for _ in 0..4 {
         window.draw(None);
@@ -760,7 +774,9 @@ fn right_clicking_empty_canvas_opens_menu_and_backdrop_only_dismisses_it() {
             .is_none()
     );
     window.click(egui::pos2(24., 180.));
-    secondary_click(&mut window);
+    for _ in 0..4 {
+        window.draw(None);
+    }
     assert!(
         window
             .ctx
@@ -782,11 +798,100 @@ fn right_clicking_empty_canvas_opens_menu_and_backdrop_only_dismisses_it() {
         window
             .ctx
             .read_response(egui::Id::unique(("menu-command", "open")))
-            .is_none()
+            .is_some()
     );
     assert!(
         !window
             .viewport_commands
             .contains(&egui::ViewportCommand::Close)
+    );
+    for action in ["settings", "recent"] {
+        let button = window
+            .ctx
+            .read_response(egui::Id::unique(("menu-command", action)))
+            .unwrap();
+        window.click(button.rect.center());
+        for _ in 0..4 {
+            window.draw(None);
+        }
+        assert!(
+            window
+                .ctx
+                .read_response(egui::Id::unique(("menu-command", "open")))
+                .is_none()
+        );
+        window.draw(Some(Key::Escape));
+        for _ in 0..4 {
+            window.draw(None);
+        }
+        assert!(
+            window
+                .ctx
+                .read_response(egui::Id::unique(("menu-command", "open")))
+                .is_some()
+        );
+    }
+}
+
+#[test]
+fn phone_empty_menu_replaces_library_and_yields_to_opened_image() {
+    let _phone = PhonePreview::enter();
+    let mut window = TestWindow::open(None);
+    window.screen_size = egui::vec2(390., 844.);
+    for _ in 0..4 {
+        window.draw(None);
+    }
+    let back = window
+        .ctx
+        .read_response(egui::Id::unique(("titlebar", "library-close")))
+        .unwrap();
+    window.click(back.rect.center());
+    for _ in 0..4 {
+        window.draw(None);
+    }
+    assert!(
+        window
+            .ctx
+            .read_response(egui::Id::unique(("menu-command", "open")))
+            .is_some()
+    );
+    assert!(
+        window
+            .ctx
+            .read_response(egui::Id::unique(("titlebar", "menu-close")))
+            .is_none()
+    );
+    assert!(!window.titlebar_visible());
+    let settings = window
+        .ctx
+        .read_response(egui::Id::unique(("menu-command", "settings")))
+        .unwrap();
+    window.click(settings.rect.center());
+    for _ in 0..4 {
+        window.draw(None);
+    }
+    assert!(
+        window
+            .ctx
+            .read_response(egui::Id::unique(("menu-command", "open")))
+            .is_none()
+    );
+    window.draw(Some(Key::Escape));
+    for _ in 0..4 {
+        window.draw(None);
+    }
+    assert!(
+        window
+            .ctx
+            .read_response(egui::Id::unique(("menu-command", "open")))
+            .is_some()
+    );
+    window.app.new_window(sample_path().as_deref());
+    window.wait_for("");
+    assert!(
+        window
+            .ctx
+            .read_response(egui::Id::unique(("menu-command", "open")))
+            .is_none()
     );
 }

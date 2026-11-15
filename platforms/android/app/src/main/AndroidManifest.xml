@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
     <uses-feature android:name="android.hardware.vulkan.level" android:required="true" android:version="1" />
     <supports-screens android:smallScreens="true" android:normalScreens="true"
         android:largeScreens="true" android:xlargeScreens="true" android:anyDensity="true" />
@@ -8,7 +11,7 @@
         android:enableOnBackInvokedCallback="true" android:hasCode="true" android:extractNativeLibs="false">
         <activity android:name=".MainActivity" android:exported="true"
             android:resizeableActivity="true"
-            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|keyboard|uiMode|density"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|keyboard|uiMode|density|locale|layoutDirection"
             android:launchMode="singleTop">
             <meta-data android:name="android.app.lib_name" android:value="nabi_view_android" />
             <intent-filter>

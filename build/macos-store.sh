@@ -1,5 +1,8 @@
 #!/bin/sh
 set -eu
+# Installed application payloads must be readable by every local user. Private
+# signing inputs stay in their source locations and mktemp staging stays 0700.
+umask 022
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$project_dir"
 fail() { printf '%s\n' "$*" >&2; exit 1; }
@@ -43,10 +46,13 @@ build_number=${NABI_BUILD_NUMBER:-1}
 case "$build_number" in ''|*[!0-9]*) fail 'NABI_BUILD_NUMBER must be a positive integer.' ;; esac
 [ "$build_number" -gt 0 ] || fail 'NABI_BUILD_NUMBER must be positive.'
 [ "$(uname -s)" = Darwin ] || fail 'macOS packaging requires a Mac.'
-out="$project_dir/target/store/macos/$target"
-python3 - "$project_dir" "$out" <<'PY'
+# Allow a relocated target root while rejecting links inside its output tree.
+target_dir=$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve())' "$project_dir/target")
+out="$target_dir/store/macos/$target"
+python3 - "$target_dir" "$out" <<'PY'
 import pathlib, sys
 root, output = map(pathlib.Path, sys.argv[1:])
+output.relative_to(root)
 for path in [output, *output.parents]:
     if path == root:
         break
@@ -58,14 +64,14 @@ PY
 if [ "$no_build" = yes ]; then set -- --no-build; else set --; fi
 sh build/package-macos.sh --target "$target" "$@"
 source_dir=$(sh build/package-macos.sh --target "$target" --print-output-dir)
-mkdir -p "$project_dir/target/store/macos"
-staging=$(mktemp -d "$project_dir/target/store/macos/.$target.stage.XXXXXXXX")
+mkdir -p "$target_dir/store/macos"
+staging=$(mktemp -d "$target_dir/store/macos/.$target.stage.XXXXXXXX")
 trap 'rm -rf "$staging"' 0
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
 app="$staging/NABI VIEW.app"
 ditto "$source_dir/NABI VIEW.app" "$app"
-cp platforms/macos/store.entitlements "$staging/entitlements.plist"
+(umask 077; cp platforms/macos/store.entitlements "$staging/entitlements.plist")
 python3 - "$app/Contents/Info.plist" <<'PY'
 import os, pathlib, plistlib, re, sys
 path = pathlib.Path(sys.argv[1])
@@ -77,7 +83,7 @@ info["LSApplicationCategoryType"] = "public.app-category.photography"
 path.write_bytes(plistlib.dumps(info))
 PY
 if [ "$signing" = signed ]; then
-    security cms -D -i "$NABI_MACOS_PROFILE" > "$staging/profile.plist"
+    (umask 077; security cms -D -i "$NABI_MACOS_PROFILE" > "$staging/profile.plist")
     python3 - "$staging/profile.plist" "$staging/entitlements.plist" <<'PY'
 import datetime, os, pathlib, plistlib, sys
 profile = plistlib.loads(pathlib.Path(sys.argv[1]).read_bytes())
@@ -105,8 +111,19 @@ else
     identity=-
 fi
 if [ "$signing" = signed ]; then set -- --signed; else set --; fi
-python3 build/sign-macos-previews.py "$app" --identity "$identity" "$@"
+(umask 077; python3 build/sign-macos-previews.py "$app" --identity "$identity" "$@")
 codesign --force --sign "$identity" --entitlements "$staging/entitlements.plist" "$app"
+# A preserved provisioning profile can be 0600, and callers may package from
+# restrictive build trees. Normalize only this generated public app payload.
+python3 - "$app" <<'PY'
+import pathlib, stat, sys
+app = pathlib.Path(sys.argv[1])
+for path in [app, *app.rglob("*")]:
+    if path.is_symlink():
+        continue
+    mode = path.stat().st_mode
+    path.chmod(0o755 if stat.S_ISDIR(mode) or mode & 0o111 else 0o644)
+PY
 codesign --verify --strict "$app"
 if [ "$signing" = signed ]; then
     productbuild --component "$app" /Applications --sign "$NABI_MACOS_INSTALLER_IDENTITY" "$staging/NABI-VIEW.pkg"

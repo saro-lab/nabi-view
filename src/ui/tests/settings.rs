@@ -1,6 +1,77 @@
 use super::*;
 
 #[test]
+fn touch_settings_edit_and_reset_independently_on_phones_and_tablets() {
+    use crate::core::settings::{MouseSettings, Settings, TouchSettings};
+    use crate::i18n::{Language, tr};
+
+    let _phone = PhonePreview::enter();
+    for size in [egui::vec2(390., 844.), egui::vec2(1024., 768.)] {
+        let mouse = MouseSettings {
+            double_click: "next".into(),
+            ..Default::default()
+        };
+        let mut window = TestWindow::sample_with_settings(&Settings {
+            language: Language::English,
+            mouse: mouse.clone(),
+            ..Default::default()
+        });
+        window.screen_size = size;
+        window.wait_for("1 / 5");
+        window.click(window.titlebar_icon("settings").rect.center());
+        for _ in 0..3 {
+            window.draw(None);
+        }
+        if size.x <= 600. {
+            window.click(window.label_position(tr("general")));
+        }
+        window.click(window.label_position(tr("touch")));
+        for _ in 0..3 {
+            window.draw(None);
+        }
+        let text = window.draw(None).0;
+        for key in [
+            "swipe-navigation",
+            "pinch-zoom",
+            "one-finger-pan",
+            "two-finger-pan",
+            "double-tap",
+            "long-press",
+            "fullscreen-tap-exits",
+        ] {
+            assert!(text.contains(tr(key)), "Missing {key} at {size}: {text}");
+        }
+        assert!(!text.contains(tr("mouse-wheel")));
+        let label = window.label_position(tr("swipe-navigation"));
+        let toggle = window
+            .paint
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                Shape::Rect(rect)
+                    if (rect.rect.center().y - label.y).abs() < 2.
+                        && rect.rect.width() < 30.
+                        && rect.rect.height() < 30. =>
+                {
+                    Some(rect.rect.center())
+                }
+                _ => None,
+            })
+            .next()
+            .expect("Missing swipe toggle");
+        window.click(toggle);
+        assert!(!saved_viewer_settings(&window).touch.swipe_navigation);
+        choose_shortcut_action(&mut window, tr("open-menu"), tr("no-action"));
+        assert_eq!(saved_viewer_settings(&window).touch.long_press, "none");
+        assert_eq!(saved_viewer_settings(&window).mouse, mouse);
+
+        window.click(window.label_position(tr("restore-default")));
+        let saved = saved_viewer_settings(&window);
+        assert_eq!(saved.touch, TouchSettings::default());
+        assert_eq!(saved.mouse, mouse);
+    }
+}
+
+#[test]
 fn shortcut_toolbar_keeps_equal_heights_and_wraps_whole_controls() {
     for language in [
         crate::i18n::Language::English,
@@ -89,14 +160,14 @@ fn shortcut_changes_render_the_current_value_in_toasts() {
     for (key, expected) in [
         (Key::Period, "슬라이드 쇼 간격: 1.1 초"),
         (Key::Comma, "슬라이드 쇼 간격: 1.0 초"),
-        (Key::R, "좌우 반전: 켜짐"),
-        (Key::R, "좌우 반전: 꺼짐"),
-        (Key::T, "상하 반전: 켜짐"),
-        (Key::T, "상하 반전: 꺼짐"),
+        (Key::T, "좌우 반전: 켜짐"),
+        (Key::T, "좌우 반전: 꺼짐"),
+        (Key::Y, "상하 반전: 켜짐"),
+        (Key::Y, "상하 반전: 꺼짐"),
         (Key::OpenBracket, "배치: 양면 (오른쪽에서 왼쪽)"),
         (Key::CloseBracket, "배치: 양면 (왼쪽에서 오른쪽)"),
         (Key::P, "배치: 단면 보기"),
-        (Key::Num1, "이미지 표시: 실제 크기 (100%)"),
+        (Key::Num1, "이미지 표시: 실제 크기(100%)"),
         (Key::Equals, "배율: 125%"),
         (Key::Num0, "이미지 표시: 이미지 전체 맞춤"),
         (Key::Space, "체크한 이미지 수: 1"),
@@ -198,6 +269,102 @@ fn cursor_idle_applies_in_settings_and_does_not_interrupt_dragging() {
     window.time += 2.1;
     window.draw(None);
     assert_eq!(window.cursor, egui::CursorIcon::None);
+}
+
+#[test]
+fn fullscreen_cursor_stays_hidden_after_keyboard_refocus_until_mouse_moves() {
+    let mut window = TestWindow::open(None);
+    window.draw(Some(Key::Escape));
+    window.pointer(500., 300.);
+    window.draw(Some(Key::F));
+    assert!(
+        window
+            .viewport_commands
+            .contains(&egui::ViewportCommand::Fullscreen(true))
+    );
+    window.time += 2.1;
+    window.draw(None);
+    assert_eq!(window.cursor, egui::CursorIcon::None);
+
+    for key in [Key::ArrowRight, Key::ArrowLeft, Key::Tab, Key::Tab] {
+        window.draw(Some(key));
+        assert_eq!(window.cursor, egui::CursorIcon::None);
+    }
+    window.focused = false;
+    window.draw_events(
+        vec![Event::PointerGone, Event::WindowFocused(false)],
+        egui::Modifiers::NONE,
+    );
+    assert_ne!(window.cursor, egui::CursorIcon::None);
+    window.focused = true;
+    window.draw_events(vec![Event::WindowFocused(true)], egui::Modifiers::NONE);
+    assert!(window.ctx.input(|i| i.pointer.hover_pos().is_none()));
+    for key in [None, Some(Key::ArrowRight), Some(Key::ArrowLeft)] {
+        window.draw(key);
+        assert_eq!(window.cursor, egui::CursorIcon::None);
+        assert!(
+            window
+                .viewport_commands
+                .contains(&egui::ViewportCommand::CursorVisible(false)),
+            "Native cursor hiding must not depend on a fresh hover position"
+        );
+    }
+
+    // Re-enter notifications can repeat the old position without movement.
+    window.pointer(500., 300.);
+    assert_eq!(window.cursor, egui::CursorIcon::None);
+    window.pointer(501., 300.);
+    assert_ne!(window.cursor, egui::CursorIcon::None);
+    assert!(
+        window
+            .viewport_commands
+            .contains(&egui::ViewportCommand::CursorVisible(true))
+    );
+    window.time += 2.1;
+    window.draw(None);
+    assert_eq!(window.cursor, egui::CursorIcon::None);
+}
+
+#[test]
+fn fullscreen_cursor_does_not_wake_for_stationary_buttons_or_wheel() {
+    let mut window = TestWindow::open(None);
+    window.draw(Some(Key::Escape));
+    window.pointer(500., 300.);
+    window.draw(Some(Key::F));
+    window.time += 2.1;
+    window.draw(None);
+    assert_eq!(window.cursor, egui::CursorIcon::None);
+    for pressed in [true, false] {
+        window.draw_events(
+            vec![Event::PointerButton {
+                pos: egui::pos2(500., 300.),
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            egui::Modifiers::NONE,
+        );
+        assert_eq!(window.cursor, egui::CursorIcon::None);
+    }
+    window.draw_events(
+        vec![Event::MouseWheel {
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0., 10.),
+            modifiers: egui::Modifiers::NONE,
+        }],
+        egui::Modifiers::NONE,
+    );
+    assert_eq!(window.cursor, egui::CursorIcon::None);
+    window.draw(Some(Key::F));
+    assert!(
+        window
+            .viewport_commands
+            .contains(&egui::ViewportCommand::Fullscreen(false))
+    );
+    window.pointer(502., 300.);
+    assert_ne!(window.cursor, egui::CursorIcon::None);
 }
 
 #[test]
@@ -307,8 +474,8 @@ fn animated_avif_updates_displayed_pixels_and_settings_background() {
         std::thread::sleep(Duration::from_millis(10));
     };
 
-    window.draw(Some(Key::R));
     window.draw(Some(Key::T));
+    window.draw(Some(Key::Y));
     assert_canvas_flips(&window, true, true);
     for settings_open in [false, true] {
         if settings_open {
@@ -454,18 +621,18 @@ fn flip_shortcuts_preserve_source_pixels_navigation_and_reopened_view() {
     let texture = window.photo_texture();
     assert_canvas_flips(&window, false, false);
 
-    window.draw(Some(Key::R));
+    window.draw(Some(Key::T));
     assert_canvas_flips(&window, true, false);
     assert_eq!(
         window.photo_texture(),
         texture,
         "A display flip must reuse decoded pixels"
     );
-    window.draw(Some(Key::T));
+    window.draw(Some(Key::Y));
     assert_canvas_flips(&window, true, true);
-    window.draw(Some(Key::R));
+    window.draw(Some(Key::T));
     assert_canvas_flips(&window, false, true);
-    window.draw(Some(Key::R));
+    window.draw(Some(Key::T));
     let settings = saved_viewer_settings(&window);
     assert!(settings.flip_horizontal && settings.flip_vertical);
 
@@ -518,7 +685,7 @@ fn flip_shortcuts_preserve_source_pixels_navigation_and_reopened_view() {
     window.reveal_controls();
     window.wait_for("1–2 / 5");
     assert_canvas_flips(&window, true, true);
-    window.draw(Some(Key::T));
+    window.draw(Some(Key::Y));
     assert_canvas_flips(&window, true, false);
     assert!(!saved_viewer_settings(&window).flip_vertical);
 }
@@ -543,11 +710,11 @@ fn alternate_navigation_and_direct_layout_shortcuts_keep_the_current_page() {
     assert_eq!(focused_thumbnail_pages(&window), [1]);
     shift_navigation(&mut window, Key::D);
     settle_checks(&mut window);
-    assert_eq!(checked_sample_pages(&window), [1]);
+    assert_eq!(checked_sample_pages(&window), [1, 2]);
     assert_eq!(focused_thumbnail_pages(&window), [2]);
     shift_navigation(&mut window, Key::A);
     settle_checks(&mut window);
-    assert_eq!(checked_sample_pages(&window), [1, 2]);
+    assert_eq!(checked_sample_pages(&window), [1]);
     assert_eq!(focused_thumbnail_pages(&window), [1]);
 
     window.draw(Some(Key::OpenBracket));
@@ -618,7 +785,6 @@ fn trash_shortcuts_restore_batches_lifo_and_fall_back_to_the_focused_spread() {
     // Check two images, then leave their pages. Delete must prefer the checks
     // over the currently focused third image.
     shift_navigation(&mut window, Key::ArrowRight);
-    window.draw(Some(Key::Space));
     window.draw(Some(Key::ArrowRight));
     window.wait_for("3 / 4");
     window.draw(Some(Key::Delete));
@@ -1416,8 +1582,14 @@ fn settings_columns_remain_visible_inside_a_small_viewport() {
         if !resize_after_open {
             window.screen_size = egui::vec2(560., 420.);
         }
-        window.reveal_controls();
-        window.click(window.titlebar_icon("settings").rect.center());
+        for _ in 0..4 {
+            window.draw(None);
+        }
+        let settings = window
+            .ctx
+            .read_response(egui::Id::unique(("menu-command", "settings")))
+            .unwrap();
+        window.click(settings.rect.center());
         window.screen_size = egui::vec2(560., 420.);
         window.time += 0.25;
         for _ in 0..3 {

@@ -138,6 +138,9 @@ pub fn run_desktop() -> eframe::Result {
             )
             .with_app_id("dev.nabi.NabiView")
             .with_decorations(preview)
+            // macOS shadows are independent of decorations and also persist
+            // when our fullscreen bridge expands the existing window.
+            .with_has_shadow(preview)
             .with_inner_size(window_size)
             .with_min_inner_size(if preview {
                 [320., 480.]
@@ -154,6 +157,14 @@ pub fn run_desktop() -> eframe::Result {
         "NABI VIEW",
         options,
         Box::new(move |cc| {
+            #[cfg(target_os = "windows")]
+            if !preview && let Some(window) = cc.winit_window() {
+                use winit::platform::windows::WindowExtWindows as _;
+                // egui-winit enables this for undecorated windows. Winit reserves
+                // a 1px top edge for it, including after a fullscreen toggle.
+                // The root window is still hidden until the first painted frame.
+                window.set_undecorated_shadow(false);
+            }
             #[cfg(target_os = "macos")]
             mac_open::set_context(cc.egui_ctx.clone());
             #[cfg(target_os = "macos")]
@@ -188,6 +199,29 @@ fn mobile_options() -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_decorations(false),
         renderer: eframe::Renderer::Wgpu,
+        // An always-HDR window also changes the compositor's treatment of the
+        // start screen and SDR photos. Keep mobile display brightness under the
+        // OS's normal SDR policy; HDR sources use the existing tone-mapped copy.
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            prefer_hdr: false,
+            #[cfg(all(target_os = "ios", target_env = "sim"))]
+            wgpu_setup: {
+                let mut setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+                let device_descriptor = std::sync::Arc::clone(&setup.device_descriptor);
+                setup.device_descriptor = std::sync::Arc::new(move |adapter| {
+                    let mut descriptor = device_descriptor(adapter);
+                    // Simulator exposes 15 varying slots, below wgpu's default 16.
+                    // The egui shader uses only two; real-device limits stay unchanged.
+                    descriptor.required_limits.max_inter_stage_shader_variables = descriptor
+                        .required_limits
+                        .max_inter_stage_shader_variables
+                        .min(adapter.limits().max_inter_stage_shader_variables);
+                    descriptor
+                });
+                setup.into()
+            },
+            ..Default::default()
+        },
         run_and_return: false,
         ..Default::default()
     }
@@ -204,5 +238,7 @@ pub fn run_android(app: android_activity::AndroidApp) -> eframe::Result {
     mobile::init_android(&app);
     let mut options = mobile_options();
     options.android_app = Some(app);
-    run_mobile(options)
+    let result = run_mobile(options);
+    mobile::shutdown_android();
+    result
 }

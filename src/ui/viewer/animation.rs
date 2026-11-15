@@ -36,6 +36,9 @@ impl Viewer {
     }
 
     pub(super) fn animate(&mut self, ctx: &egui::Context) {
+        if self.renaming() {
+            return;
+        }
         let (a, b) = self.focus_span();
         let visible = [self.files.get(a), self.files.get(b)];
         let now = std::time::Instant::now();
@@ -57,9 +60,19 @@ impl Viewer {
                                 .and_then(|state| crate::ui::hdr::Texture::new(state, hdr))
                         })
                         .map(std::sync::Arc::new);
-                    picture
-                        .handle
-                        .set(frame.image, egui::TextureOptions::LINEAR);
+                    if picture.handle.size() == frame.image.size {
+                        // A full delta reallocates the GPU texture and bind group.
+                        // Animation frames normally share one composited canvas.
+                        picture.handle.set_partial(
+                            [0, 0],
+                            frame.image,
+                            egui::TextureOptions::LINEAR,
+                        );
+                    } else {
+                        picture
+                            .handle
+                            .set(frame.image, egui::TextureOptions::LINEAR);
+                    }
                 }
                 Ok(None) => {}
                 Err(error) => {

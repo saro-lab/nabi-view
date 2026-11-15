@@ -46,12 +46,16 @@ if [ -z "${DEVELOPER_DIR:-}" ]; then
 fi
 export DEVELOPER_DIR
 [ -d "$DEVELOPER_DIR/Platforms/iPhoneOS.platform" ] || fail 'Install Xcode with iOS support.'
-out="$project_dir/target/store/ios"
-python3 - "$project_dir" "$out" "$project_dir/target/ios/derived" <<'PY'
+# Allow a relocated target root while rejecting links inside its output tree.
+target_dir=$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve())' "$project_dir/target")
+out="$target_dir/store/ios"
+derived_dir="$target_dir/ios/derived"
+python3 - "$target_dir" "$out" "$derived_dir" <<'PY'
 import pathlib, sys
 root = pathlib.Path(sys.argv[1])
 for value in [sys.argv[2], sys.argv[3], f"{sys.argv[2]}/NabiView.xcarchive", f"{sys.argv[2]}/export"]:
     path = pathlib.Path(value)
+    path.relative_to(root)
     for item in [path, *path.parents]:
         if item == root:
             break
@@ -101,8 +105,8 @@ if [ "$action" = archive ]; then
     fi
     xcodebuild -project platforms/ios/NabiView.xcodeproj -scheme NabiView \
         -configuration Release -destination 'generic/platform=iOS' \
-        -derivedDataPath "$project_dir/target/ios/derived" -archivePath "$staging/NabiView.xcarchive" \
-        "PRODUCT_BUNDLE_IDENTIFIER=${NABI_IOS_BUNDLE_ID:-dev.nabi.view}" \
+        -derivedDataPath "$derived_dir" -archivePath "$staging/NabiView.xcarchive" \
+        "PRODUCT_BUNDLE_IDENTIFIER=${NABI_IOS_BUNDLE_ID:-saro.nabi.view}" \
         "MARKETING_VERSION=$version" "CURRENT_PROJECT_VERSION=$build_number" "$@" archive
     publish "$staging/NabiView.xcarchive" "$out/NabiView.xcarchive"
     printf 'Archive: %s (%s)\n' "$out/NabiView.xcarchive" "$signing"

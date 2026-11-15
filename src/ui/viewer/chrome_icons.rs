@@ -171,7 +171,7 @@ pub(super) fn paint(
                 stroke,
             ));
         }
-        "rename" => {
+        "rename" | "normalize-names" => {
             painter.add(egui::Shape::closed_line(
                 vec![
                     point(-8., 8.),
@@ -244,6 +244,24 @@ pub(super) fn paint(
                 }
                 _ => {}
             }
+        }
+        "rotate-right" | "rotate-left" => {
+            let direction = if name == "rotate-right" { 1. } else { -1. };
+            let p = |x, y| point(x * direction, y);
+            painter.add(egui::Shape::line(
+                (0..=24)
+                    .map(|step| {
+                        let angle = std::f32::consts::FRAC_PI_2
+                            + step as f32 / 24. * std::f32::consts::PI * 1.5;
+                        p(8. * angle.cos(), 8. * angle.sin())
+                    })
+                    .collect(),
+                stroke,
+            ));
+            painter.add(egui::Shape::line(
+                vec![p(3., -2.), p(8., 0.), p(10., -5.)],
+                stroke,
+            ));
         }
         "flip-horizontal" | "flip-vertical" => {
             let p = |x, y| {

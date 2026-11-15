@@ -3,6 +3,7 @@ plugins { id("com.android.application") }
 val nabiAbi = providers.gradleProperty("nabiAbi").orElse("arm64-v8a").get()
 require(nabiAbi in listOf("arm64-v8a", "x86_64", "all")) { "Unsupported ABI: $nabiAbi" }
 val nabiAbis = if (nabiAbi == "all") listOf("arm64-v8a", "x86_64") else listOf(nabiAbi)
+val nabiRustDebug = providers.gradleProperty("nabiRustDebug").orElse("false").get().toBooleanStrict()
 val nabiNdkHome = providers.environmentVariable("ANDROID_NDK_HOME").orNull
 val nabiNdkVersion = nabiNdkHome?.let { directory ->
     file("$directory/source.properties").readLines()
@@ -14,7 +15,7 @@ val nabiVersion = Regex("(?m)^version\\s*=\\s*\"([^\"]+)\"").find(cargoPackage)?
     ?: error("Cargo.toml package version is missing")
 val nabiVersionCode = providers.environmentVariable("NABI_ANDROID_VERSION_CODE").orElse("1").get().toInt()
 require(nabiVersionCode in 1..2100000000) { "NABI_ANDROID_VERSION_CODE must be in 1..2100000000" }
-val nabiApplicationId = providers.environmentVariable("NABI_ANDROID_APPLICATION_ID").orElse("dev.nabi.view").get()
+val nabiApplicationId = providers.environmentVariable("NABI_ANDROID_APPLICATION_ID").orElse("saro.nabi.view").get()
 require(Regex("[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+").matches(nabiApplicationId)) {
     "NABI_ANDROID_APPLICATION_ID must be a valid Android application ID"
 }
@@ -31,7 +32,7 @@ android {
     compileSdk = 36
     defaultConfig {
         applicationId = nabiApplicationId
-        minSdk = 30
+        minSdk = 31
         targetSdk = 36
         versionCode = nabiVersionCode
         versionName = nabiVersion
@@ -48,7 +49,7 @@ android {
     }
     buildTypes.getByName("release").isDebuggable = false
     sourceSets["main"].apply {
-        jniLibs.srcDir("../../../target/android/jniLibs")
+        jniLibs.srcDir(if (nabiRustDebug) "../../../target/android/debug/jniLibs" else "../../../target/android/jniLibs")
         assets.srcDir("../../../target/android/assets")
         res.srcDir("../../../target/android/res")
     }
@@ -58,9 +59,18 @@ android {
 }
 layout.buildDirectory.set(file("../../../target/android/gradle/app"))
 
+androidComponents {
+    // A development native library must never enter a release APK/AAB.
+    beforeVariants(selector().withBuildType("release")) { if (nabiRustDebug) it.enable = false }
+    onVariants(selector().withBuildType("debug")) {
+        if (nabiRustDebug) it.packaging.jniLibs.keepDebugSymbols.add("**/libnabi_view_android.so")
+    }
+}
+
 val buildRust by tasks.registering(Exec::class) {
     workingDir = file("../../..")
     commandLine("sh", "build/android.sh", "--native-only", "--abi", nabiAbi)
+    if (nabiRustDebug) args("--debug")
     environment("ANDROID_HOME", android.sdkDirectory.absolutePath)
     environment("ANDROID_NDK_HOME", nabiNdkHome ?: android.sdkDirectory.resolve("ndk/$nabiNdkVersion").absolutePath)
     onlyIf { !providers.gradleProperty("nabiNativePrepared").isPresent }

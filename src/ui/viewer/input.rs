@@ -303,8 +303,11 @@ impl Viewer {
                 self.run("about", ctx);
                 continue;
             }
+            // The empty viewer's default menu keeps normal keyboard commands;
+            // a menu explicitly opened over the viewer still takes the input.
             if self.settings_open
-                || self.overlay_open()
+                || self.menu_open
+                || (self.overlay_open() && !self.default_menu_visible())
                 || self.popup_open_at_input
                 || ctx.any_popup_open()
             {
@@ -320,6 +323,8 @@ impl Viewer {
                     *id,
                     "prev"
                         | "next"
+                        | "page-prev"
+                        | "page-next"
                         | "check-prev"
                         | "check-next"
                         | "slideshow-decrease"
@@ -334,7 +339,8 @@ impl Viewer {
             }
         }
         let blocked = self.settings_open
-            || self.overlay_open()
+            || self.menu_open
+            || (self.overlay_open() && !self.default_menu_visible())
             || self.zoom_input.is_some()
             || self.inspector.filter_focused(ctx)
             || self.popup_open_at_input

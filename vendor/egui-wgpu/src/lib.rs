@@ -270,26 +270,8 @@ impl RenderState {
         log_adapter_info(&adapter.get_info());
 
         let capabilities = compatible_surface.map(|surface| surface.get_capabilities(&adapter));
-        let hdr_surface = capabilities.as_ref().is_some_and(|caps| {
-            caps.color_spaces(wgpu::TextureFormat::Rgba16Float)
-                .contains(wgpu::SurfaceColorSpaces::EXTENDED_SRGB_LINEAR)
-        });
-        let target_format = if hdr_surface {
-            wgpu::TextureFormat::Rgba16Float
-        } else {
-            crate::preferred_framebuffer_format(
-                capabilities
-                    .as_ref()
-                    .map_or(&[wgpu::TextureFormat::Rgba8Unorm][..], |caps| {
-                        caps.formats.as_slice()
-                    }),
-            )?
-        };
-        let target_color_space = if hdr_surface {
-            wgpu::SurfaceColorSpace::ExtendedSrgbLinear
-        } else {
-            wgpu::SurfaceColorSpace::Auto
-        };
+        let (target_format, target_color_space) =
+            surface_target(capabilities.as_ref(), config.prefer_hdr)?;
 
         let renderer = Renderer::new(&device, target_format, options);
 
@@ -351,6 +333,11 @@ pub struct WgpuConfiguration {
     /// Runtime-mutable configuration for the surface (present mode, frame latency).
     pub surface: SurfaceConfig,
 
+    /// Prefer an extended-linear FP16 surface when supported. This opts the
+    /// whole window into HDR composition, including menus and ordinary images.
+    /// Disable for hosts that must retain normal system-controlled SDR output.
+    pub prefer_hdr: bool,
+
     /// How to create the wgpu adapter & device
     pub wgpu_setup: WgpuSetup,
 
@@ -385,11 +372,13 @@ impl core::fmt::Debug for WgpuConfiguration {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let Self {
             surface,
+            prefer_hdr,
             wgpu_setup,
             on_surface_status: _,
         } = self;
         f.debug_struct("WgpuConfiguration")
             .field("surface", &surface)
+            .field("prefer_hdr", &prefer_hdr)
             .field("wgpu_setup", &wgpu_setup)
             .finish_non_exhaustive()
     }
@@ -407,6 +396,7 @@ impl Default for WgpuConfiguration {
     fn default() -> Self {
         Self {
             surface: SurfaceConfig::HIGH_THROUGHPUT,
+            prefer_hdr: true,
 
             // No display handle available at this point — callers should replace this with
             // `WgpuSetup::from_display_handle(...)` before creating the instance if one is available.
@@ -435,6 +425,64 @@ impl Default for WgpuConfiguration {
                 }
             }),
         }
+    }
+}
+
+fn surface_target(
+    capabilities: Option<&wgpu::SurfaceCapabilities>,
+    prefer_hdr: bool,
+) -> Result<(wgpu::TextureFormat, wgpu::SurfaceColorSpace), WgpuError> {
+    if prefer_hdr
+        && capabilities.is_some_and(|caps| {
+            caps.color_spaces(wgpu::TextureFormat::Rgba16Float)
+                .contains(wgpu::SurfaceColorSpaces::EXTENDED_SRGB_LINEAR)
+        })
+    {
+        return Ok((
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::SurfaceColorSpace::ExtendedSrgbLinear,
+        ));
+    }
+    let format = preferred_framebuffer_format(
+        capabilities.map_or(&[wgpu::TextureFormat::Rgba8Unorm][..], |caps| {
+            caps.formats.as_slice()
+        }),
+    )?;
+    Ok((format, wgpu::SurfaceColorSpace::Auto))
+}
+
+#[cfg(test)]
+mod surface_tests {
+    use super::*;
+
+    #[test]
+    fn hdr_capable_mobile_surface_can_keep_normal_sdr_composition() {
+        let mut caps = wgpu::SurfaceCapabilities {
+            formats: vec![wgpu::TextureFormat::Bgra8Unorm],
+            format_capabilities: vec![wgpu::SurfaceFormatCapabilities {
+                format: wgpu::TextureFormat::Rgba16Float,
+                color_spaces: wgpu::SurfaceColorSpaces::EXTENDED_SRGB_LINEAR,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            surface_target(Some(&caps), false).unwrap(),
+            (
+                wgpu::TextureFormat::Bgra8Unorm,
+                wgpu::SurfaceColorSpace::Auto
+            )
+        );
+        assert_eq!(
+            surface_target(Some(&caps), true).unwrap(),
+            (
+                wgpu::TextureFormat::Rgba16Float,
+                wgpu::SurfaceColorSpace::ExtendedSrgbLinear
+            )
+        );
+        // Opting out must not silently select an HDR-only format if there is
+        // no compatible default surface. Let the host report the WSI error.
+        caps.formats.clear();
+        assert!(surface_target(Some(&caps), false).is_err());
     }
 }
 

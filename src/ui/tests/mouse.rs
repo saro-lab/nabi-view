@@ -103,6 +103,7 @@ fn mouse_section_sits_above_shortcuts_and_saves_each_gesture() {
     let shortcuts = window.label_position(tr("keyboard-shortcuts"));
     let cache = window.label_position(tr("cache"));
     assert!(cache.y < mouse.y && mouse.y < shortcuts.y);
+    assert!(!window.draw(None).0.lines().any(|line| line == tr("touch")));
     window.click(mouse);
     for _ in 0..3 {
         window.draw(None);
@@ -168,6 +169,7 @@ fn phones_have_no_mouse_section() {
             .any(|shape| matches!(&shape.shape, Shape::Text(text) if text.galley.job.text == label))
     };
     assert!(label(&window, tr("keyboard-shortcuts")));
+    assert!(label(&window, tr("touch")));
     assert!(!label(&window, tr("mouse")));
 }
 
@@ -206,6 +208,8 @@ fn drag_modes_can_be_swapped_or_disabled() {
         ..Default::default()
     }));
     window.wait_for("");
+    window.draw(Some(Key::Num1));
+    window.draw(None);
     let before = window.photo_rects();
     let delta = egui::vec2(64., -30.);
     assert!(!window.drag_pointer(before.1.center(), delta));
@@ -237,6 +241,8 @@ fn default_gestures_zoom_and_pan_and_ignore_the_modifier() {
 
     let mut window = TestWindow::sample_with_settings(&english(MouseSettings::default()));
     window.wait_for("");
+    window.draw(Some(Key::Num1));
+    window.draw(None);
     let before = window.photo_rects();
     let delta = egui::vec2(64., -30.);
     assert!(!window.drag_pointer_with_modifiers(before.1.center(), delta, CTRL));
@@ -249,6 +255,8 @@ fn default_gestures_zoom_and_pan_and_ignore_the_modifier() {
 fn panning_from_the_background_moves_the_window_instead() {
     let mut window = TestWindow::sample_with_settings(&english(MouseSettings::default()));
     window.wait_for("");
+    window.draw(Some(Key::Num1));
+    window.draw(None);
     let before = window.photo_rects();
     let margin = egui::pos2(
         (before.0.left() + before.1.left()) / 2.,
@@ -285,6 +293,115 @@ fn panning_from_the_background_moves_the_window_instead() {
     assert!(before.0.contains(margin) && !before.1.contains(margin));
     assert!(!window.drag_pointer(margin, egui::vec2(30., 0.)));
     assert_eq!(window.photo_rects(), before);
+}
+
+#[test]
+fn fitted_images_stay_centered_and_drag_the_window() {
+    for scale in [1., 1.25, 2.] {
+        for pinned in [false, true] {
+            let mut window = TestWindow::sample_with_settings(&english(MouseSettings {
+                primary_drag: "pan".into(),
+                ..Default::default()
+            }));
+            window.scale = scale;
+            window.wait_for("");
+            if pinned {
+                window.draw(Some(Key::H));
+            }
+            // Cover exact fit and a manually reduced image with margins on both axes.
+            for reduced in [false, true] {
+                if reduced {
+                    window.draw(Some(Key::Minus));
+                    window.draw(None);
+                }
+                let before = window.photo_rects();
+                assert!(before.0.expand(0.5 / scale).contains_rect(before.1));
+                assert!(before.0.center().distance(before.1.center()) <= 0.71 / scale);
+                window.pointer(before.1.center().x, before.1.center().y);
+                assert_ne!(window.cursor, egui::CursorIcon::Grab);
+                for modifiers in [egui::Modifiers::NONE, CTRL] {
+                    assert!(window.drag_pointer_with_modifiers(
+                        before.1.center(),
+                        egui::vec2(50., 30.),
+                        modifiers,
+                    ));
+                    assert_eq!(window.photo_rects(), before);
+                }
+            }
+            window.draw(Some(Key::F));
+            window.draw(None);
+            let before = window.photo_rects();
+            assert!(!window.drag_pointer(before.1.center(), egui::vec2(50., 30.)));
+            assert_eq!(window.photo_rects(), before);
+        }
+    }
+}
+
+#[test]
+fn shrinking_a_panned_image_or_enlarging_the_window_discards_the_offset() {
+    for resize in [false, true] {
+        let mut window = TestWindow::sample_with_settings(&english(MouseSettings::default()));
+        window.wait_for("");
+        window.draw(Some(Key::Num1));
+        window.draw(None);
+        let original = window.photo_rects();
+        let delta = egui::vec2(64., -30.);
+        assert!(!window.drag_pointer(original.1.center(), delta));
+        assert_eq!(window.photo_rects().1, original.1.translate(delta));
+        if resize {
+            window.screen_size = egui::vec2(1600., 1400.);
+        } else {
+            for _ in 0..3 {
+                window.draw(Some(Key::Minus));
+            }
+        }
+        window.draw(None);
+        let centered = window.photo_rects();
+        assert!(centered.0.expand(0.5).contains_rect(centered.1));
+        assert!(centered.0.center().distance(centered.1.center()) <= 0.71);
+        assert!(window.drag_pointer(centered.1.center(), delta));
+        assert_eq!(window.photo_rects(), centered);
+        // Returning to the original overflowing size must not restore the old pan.
+        window.screen_size = egui::vec2(1080., 760.);
+        if !resize {
+            for _ in 0..3 {
+                window.draw(Some(Key::Equals));
+            }
+        }
+        window.draw(None);
+        let restored = window.photo_rects();
+        assert_eq!(restored.0, original.0);
+        assert!((restored.1.min - original.1.min).length() < 0.01);
+        assert!((restored.1.max - original.1.max).length() < 0.01);
+    }
+}
+
+#[test]
+fn small_originals_stay_centered_at_auto_and_os_scaled_actual_size() {
+    let images = tempfile::tempdir().unwrap();
+    let path = images.path().join("small.png");
+    image::RgbImage::new(101, 79).save(&path).unwrap();
+    for scale in [1., 1.25, 2.] {
+        let mut window =
+            TestWindow::open_with_settings(Some(path.clone()), &english(MouseSettings::default()));
+        window.scale = scale;
+        window.wait_for("");
+        for actual in [false, true] {
+            if actual {
+                window.draw(Some(Key::Num1));
+                window.draw(None);
+            }
+            let before = window.photo_rects();
+            assert!(before.0.contains_rect(before.1));
+            assert!(before.0.center().distance(before.1.center()) <= 0.71 / scale);
+            if actual {
+                assert!((before.1.width() - 101.).abs() < 0.001);
+                assert!((before.1.height() - 79.).abs() < 0.001);
+            }
+            assert!(window.drag_pointer(before.1.center(), egui::vec2(50., 30.)));
+            assert_eq!(window.photo_rects(), before);
+        }
+    }
 }
 
 #[test]

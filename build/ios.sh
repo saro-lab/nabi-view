@@ -8,12 +8,16 @@ simulator=
 simulator_family=any
 xcode=no
 device=no
+debug=no
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --build-only) mode=build ;;
         --list) mode=list ;;
         --xcode) xcode=yes; mode=build ;;
         --device) device=yes; mode=build ;;
+        --debug) debug=yes ;;
+        --list-devices) mode=devices ;;
+        --open-xcode) mode=open ;;
         --phone) simulator_family=iPhone ;;
         --tablet) simulator_family=iPad ;;
         --help|-h)
@@ -21,6 +25,10 @@ while [ "$#" -gt 0 ]; do
                 '  All builds support both iPhone and iPad; --phone/--tablet select the simulator only.' \
                 '  By default, use an available iPhone or iPad simulator, preferring a booted device.' \
                 '  --device builds an unsigned arm64 iPhone/iPad app; install using Xcode signing.' \
+                '  --debug preserves Rust source/variable information and generates a matching dSYM.' \
+                '  --list-devices lists physical devices known to Xcode (USB pairing required initially).' \
+                '  --open-xcode opens the project for device selection, development signing and LLDB.' \
+                '  Xcode Run uses the same debug profile automatically; Archive keeps release.' \
                 '  Store archives/exports: sh build/ios-store.sh --help'
             exit 0 ;;
         --simulator) [ "$#" -ge 2 ] || fail '--simulator requires a device UUID'; simulator=$2; shift ;;
@@ -38,6 +46,12 @@ fi
 export DEVELOPER_DIR
 [ -d "$DEVELOPER_DIR/Platforms/iPhoneSimulator.platform" ] || fail 'Install Xcode and its iOS platform support first.'
 if [ "$mode" = list ]; then exec xcrun simctl list devices available; fi
+if [ "$mode" = devices ]; then exec xcrun devicectl list devices --timeout 30; fi
+if [ "$mode" = open ]; then exec open -a "$DEVELOPER_DIR/../.." "$project_dir/platforms/ios/NabiView.xcodeproj"; fi
+
+if [ "$xcode" = yes ] && [ "${CONFIGURATION:-}" = Debug ]; then debug=yes; fi
+profile=release
+[ "$debug" = no ] || profile=mobile-debug
 
 sdk=iphonesimulator
 [ "$device" = no ] || sdk=iphoneos
@@ -82,21 +96,40 @@ SDKROOT=$(xcrun --sdk "$sdk" --show-sdk-path)
 export SDKROOT
 target_dir=${CARGO_TARGET_DIR:-"$project_dir/target"}
 case "$target_dir" in /*) ;; *) target_dir="$project_dir/$target_dir" ;; esac
-cargo build --locked --release --bin nabi-view --target "$target"
+if [ "$debug" = yes ]; then
+    # Keep a portable dSYM rather than relying on Cargo's intermediate objects.
+    CARGO_PROFILE_MOBILE_DEBUG_SPLIT_DEBUGINFO=packed \
+        cargo build --locked --profile "$profile" --bin nabi-view --target "$target"
+else
+    cargo build --locked --release --bin nabi-view --target "$target"
+fi
 python3 build/notices.py
 if [ "$xcode" = yes ]; then
     app="$TARGET_BUILD_DIR/$WRAPPER_NAME"
 else
-    app="$target_dir/mobile/$target/NABI VIEW.app"
+    if [ "$debug" = yes ]; then app="$target_dir/mobile/$target/debug/NABI VIEW.app"
+    else app="$target_dir/mobile/$target/NABI VIEW.app"
+    fi
 fi
 mkdir -p "$app"
-cp "$target_dir/$target/release/nabi-view" "$app/nabi-view"
+python3 build/locales.py --ios-resources "$app"
+cp "$target_dir/$target/$profile/nabi-view" "$app/nabi-view"
+if [ "$debug" = yes ]; then
+    dsym="$target_dir/$target/$profile/nabi-view.dSYM"
+    [ -d "$dsym" ] || fail 'The debug build did not produce the expected dSYM.'
+    if [ "$xcode" = yes ]; then dsym_output="$DWARF_DSYM_FOLDER_PATH/$WRAPPER_NAME.dSYM"
+    else dsym_output="$app.dSYM"
+    fi
+    mkdir -p "$dsym_output"
+    ditto "$dsym" "$dsym_output"
+    printf 'Debug symbols: %s\n' "$dsym_output"
+fi
 cp target/notices/THIRD_PARTY_NOTICES.txt "$app/THIRD_PARTY_NOTICES.txt"
 cp LICENSE THIRD_PARTY.md "$app/"
 if [ "$xcode" != yes ]; then
     cp platforms/ios/Info.plist "$app/Info.plist"
     /usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable nabi-view' "$app/Info.plist"
-    /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${NABI_IOS_BUNDLE_ID:-dev.nabi.view}" "$app/Info.plist"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${NABI_IOS_BUNDLE_ID:-saro.nabi.view}" "$app/Info.plist"
     version=$(python3 -c 'import pathlib,re; print(re.search(r"^version = \"([^\"]+)\"", pathlib.Path("Cargo.toml").read_text(), re.M)[1])')
     /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$app/Info.plist"
     /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${NABI_BUILD_NUMBER:-1}" "$app/Info.plist"
@@ -126,4 +159,4 @@ else
     open "$DEVELOPER_DIR/Applications/Simulator.app" --args -CurrentDeviceUDID "$simulator"
 fi
 xcrun simctl install "$simulator" "$app"
-xcrun simctl launch --terminate-running-process "$simulator" "${NABI_IOS_BUNDLE_ID:-dev.nabi.view}"
+xcrun simctl launch --terminate-running-process "$simulator" "${NABI_IOS_BUNDLE_ID:-saro.nabi.view}"

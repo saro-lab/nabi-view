@@ -1,6 +1,6 @@
 [package]
 name = "nabi-view"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.99"
 build = "build/cargo.rs"
@@ -11,10 +11,12 @@ homepage = "https://lab.saro.me/app/nabi-view"
 [workspace]
 members = ["platforms/android/rust", "platforms/preview/rust", "vendor/epaint", "vendor/egui-wgpu"]
 default-members = ["."]
+exclude = ["vendor/winit"]
 resolver = "3"
 
 [dependencies]
-eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
+# Hyperlinks emit OpenUrl commands; the native integration needs `links` to open them.
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "links", "wgpu", "wayland", "x11"] }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff", "ico", "tga", "qoi", "pnm", "exr", "hdr", "dds", "ff"] }
 jxl-oxide = { version = "0.12.6", features = ["image"] }
 libavif-sys = { version = "0.17.0", default-features = false, features = ["codec-aom"] }
@@ -42,15 +44,26 @@ sevenz-rust2 = { version = "0.25.0", default-features = false, features = ["aes2
 [profile.release]
 strip = "debuginfo"
 
+# Explicit mobile debugging keeps source/variable information and avoids
+# changing the optimized builds used for performance checks and distribution.
+[profile.mobile-debug]
+inherits = "dev"
+opt-level = 0
+debug = 2
+strip = "none"
+
 [build-dependencies]
 cc = "1.11.1"
 
 [patch.crates-io]
-# Keep Nabi View's text-direction and HDR integration on current upstream crates.
+# Keep Nabi View's text-direction, HDR and Android lifecycle patches on pinned upstream crates.
 epaint = { path = "vendor/epaint" }
 egui-wgpu = { path = "vendor/egui-wgpu" }
+winit = { path = "vendor/winit" }
 
 [target.'cfg(windows)'.dependencies]
+# Use eframe's existing window backend to suppress its undecorated 1px shadow edge.
+winit = { version = "0.30.13", default-features = false }
 # The latest Windows SDK crate's COM macro requires its matching core ABI.
 windows-core = "=0.62.2"
 windows = { version = "0.62.2", features = ["Win32_Devices_Display", "Win32_Graphics_Imaging", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Com", "Win32_System_Power", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_UI_Shell_Common"] }

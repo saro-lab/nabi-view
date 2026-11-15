@@ -211,7 +211,12 @@ fn folder_changes_advance_deleted_focus_clear_canvas_and_restore_new_images() {
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
         let (text, image) = window.draw(None);
-        if !image && text.is_empty() {
+        if !image
+            && window
+                .ctx
+                .read_response(egui::Id::unique(("menu-command", "open")))
+                .is_some()
+        {
             break;
         }
         assert!(
@@ -223,6 +228,12 @@ fn folder_changes_advance_deleted_focus_clear_canvas_and_restore_new_images() {
     // The watcher must stay alive while the folder has no supported images.
     write_image("04.png");
     window.wait_for("");
+    assert!(
+        window
+            .ctx
+            .read_response(egui::Id::unique(("menu-command", "open")))
+            .is_none()
+    );
     window.reveal_controls();
     window.wait_for("04.png");
     window.wait_for("1 / 1");
@@ -568,4 +579,35 @@ fn wheel_navigation_counts_events_instead_of_magnitude_or_smooth_scroll_frames()
         window.draw(None).0.contains("3 / 5"),
         "Two wheel events in one frame did not advance two pages"
     );
+}
+
+#[test]
+fn default_alt_navigation_moves_the_rendered_spread_one_page_at_a_time() {
+    for layout in [Key::OpenBracket, Key::CloseBracket] {
+        let mut window = TestWindow::sample();
+        window.screen_size.x = 1280.;
+        window.reveal_controls();
+        window.wait_for("1 / 5");
+        window.draw(Some(layout));
+        window.wait_for("1–2 / 5");
+        for (key, pages, label) in [
+            (Key::D, vec![2, 3], "2–3 / 5"),
+            (Key::ArrowRight, vec![3, 4], "3–4 / 5"),
+            (Key::A, vec![2, 3], "2–3 / 5"),
+            (Key::ArrowLeft, vec![1, 2], "1–2 / 5"),
+        ] {
+            window.draw_events(
+                vec![
+                    key_event(key, true, false, egui::Modifiers::ALT),
+                    key_event(key, false, false, egui::Modifiers::ALT),
+                ],
+                egui::Modifiers::ALT,
+            );
+            window.wait_for(label);
+            assert_eq!(focused_thumbnail_pages(&window), pages);
+        }
+        window.draw(Some(Key::D));
+        window.wait_for("3–4 / 5");
+        assert_eq!(focused_thumbnail_pages(&window), [3, 4]);
+    }
 }

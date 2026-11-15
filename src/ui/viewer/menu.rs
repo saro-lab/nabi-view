@@ -17,10 +17,13 @@ const ITEMS: &[&str] = &[
     "single",
     "spread-left",
     "spread-right",
+    "rotate-right",
+    "rotate-left",
     "flip-horizontal",
     "flip-vertical",
     "check",
     "move",
+    "normalize-names",
     "trash",
     "undo-trash",
     "fullscreen",
@@ -32,23 +35,50 @@ const TILE_HEIGHT: f32 = 108.;
 const GAP: f32 = 8.;
 
 impl Viewer {
+    /// The empty viewer returns to the command menu after other screens close.
+    pub(super) fn default_menu_visible(&self) -> bool {
+        self.files.is_empty()
+            && self.listing.is_none()
+            && !self.settings_open
+            && !self.library.modal()
+            && !self.dialog_open()
+            && !self.random_prompt
+            && self.zoom_input.is_none()
+            && self.file_job.is_none()
+    }
+
+    pub(super) fn menu_visible(&self) -> bool {
+        self.menu_open || self.default_menu_visible()
+    }
+
     pub(super) fn menu_window(&mut self, ctx: &egui::Context) {
-        if !self.menu_open {
+        if !self.menu_visible() {
             return;
         }
+        let default_menu = self.default_menu_visible();
         let mut items: Vec<_> = ITEMS
             .iter()
             .copied()
-            .filter(|id| command_supported(id))
+            .filter(|id| self.command_available(id))
             .filter(|id| self.landscape || !is_layout_command(id))
             .collect();
         if crate::app::is_mobile() {
             items.extend(["random", "slideshow"]);
         }
+        if default_menu {
+            items.insert(3, "settings");
+        }
         let mut selected = None;
         let mut close = false;
-        let modal = overlay::show(ctx, "command-menu", self.fullscreen, |ui| {
-            close = overlay::header(ui, "menu", "menu-close");
+        let dismissed = overlay::show_menu(ctx, self.fullscreen, default_menu, |ui| {
+            if default_menu {
+                if overlay::compact(ctx) {
+                    ui.heading(tr("menu"));
+                    ui.add_space(4.);
+                }
+            } else {
+                close = overlay::header(ui, "menu", "menu-close");
+            }
             egui::ScrollArea::vertical()
                 .id_salt("command-menu-scroll")
                 .max_height(ui.available_height().max(1.))
@@ -79,7 +109,7 @@ impl Viewer {
                     }
                 });
         });
-        if close || modal.should_close() || selected.is_some() {
+        if close || dismissed || selected.is_some() {
             self.menu_open = false;
             self.release_held_input();
         }

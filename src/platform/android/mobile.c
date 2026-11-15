@@ -4,17 +4,26 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <pthread.h>
+#include <unistd.h>
 
+extern size_t nabi_mobile_text(const char *, unsigned short *, size_t);
 extern void nabi_mobile_back(void);
+extern void nabi_mobile_locale_changed(void);
+extern void nabi_mobile_window_mode_changed(int);
 extern bool nabi_mobile_import_begin(void);
 extern bool nabi_mobile_import_begin_folder(void);
 extern void nabi_mobile_settings_import(int);
 extern void nabi_mobile_export_result(bool);
 extern bool nabi_mobile_import_utf16(int, const unsigned short *, size_t);
 extern void nabi_mobile_import_error(const char *);
+extern void nabi_mobile_photo_error(int);
 extern void nabi_mobile_import_finish(void);
 extern void nabi_mobile_source_utf16(const unsigned short *, size_t, const unsigned short *, size_t);
 
+// Readers may run on the UI, render and import threads simultaneously. Only
+// host replacement/teardown is exclusive; a slow import must not block insets.
+static pthread_rwlock_t host_lock = PTHREAD_RWLOCK_INITIALIZER;
 static JavaVM *vm;
 static jobject activity;
 static jmethodID pick_method, awake_method, copy_method, exit_method;
@@ -23,69 +32,146 @@ static jmethodID reopen_method, memory_method, hdr_method;
 static char *paths[3];
 static _Atomic float safe_area[4];
 
-static JNIEnv *environment(bool *attached) {
+static JNIEnv *attach_environment(bool *attached) {
     JNIEnv *env = NULL;
     *attached = false;
     if (!vm) return NULL;
-    if ((*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6) == JNI_EDETACHED) {
+    jint status = (*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6);
+    if (status == JNI_EDETACHED) {
         if ((*vm)->AttachCurrentThread(vm, &env, NULL) != JNI_OK) return NULL;
         *attached = true;
+    } else if (status != JNI_OK) {
+        return NULL;
     }
     return env;
 }
-static void release(bool attached) { if (attached) (*vm)->DetachCurrentThread(vm); }
+static JNIEnv *environment(bool *attached) {
+    pthread_rwlock_rdlock(&host_lock);
+    JNIEnv *env = activity ? attach_environment(attached) : NULL;
+    if (!env) pthread_rwlock_unlock(&host_lock);
+    return env;
+}
+static void release(bool attached) {
+    if (attached) (*vm)->DetachCurrentThread(vm);
+    pthread_rwlock_unlock(&host_lock);
+}
+// Old picker workers can finish after their Activity has been destroyed. Never
+// let their callbacks mutate a new viewer's import or display state.
+static bool enter_callback(JNIEnv *env, jobject self) {
+    pthread_rwlock_rdlock(&host_lock);
+    if (activity && (*env)->IsSameObject(env, activity, self)) return true;
+    pthread_rwlock_unlock(&host_lock);
+    return false;
+}
+static void leave_callback(void) { pthread_rwlock_unlock(&host_lock); }
 static bool clear_exception(JNIEnv *env) {
     if (!(*env)->ExceptionCheck(env)) return false;
     (*env)->ExceptionClear(env);
     return true;
 }
-static jboolean begin(JNIEnv *env, jobject self) { (void)env; (void)self; return nabi_mobile_import_begin(); }
-static jboolean begin_folder(JNIEnv *env, jobject self) { (void)env; (void)self; return nabi_mobile_import_begin_folder(); }
-static void settings(JNIEnv *env, jobject self, jint fd) { (void)env; (void)self; nabi_mobile_settings_import(fd); }
-static void export_result(JNIEnv *env, jobject self, jboolean saved) { (void)env; (void)self; nabi_mobile_export_result(saved); }
+static jstring translated_text(JNIEnv *env, jobject self, jstring key) {
+    if (!key || !enter_callback(env, self)) return NULL;
+    // Translation may query the system locale through JNI. It does not mutate
+    // host state, so do not hold the host gate across that nested query.
+    leave_callback();
+    const char *id = (*env)->GetStringUTFChars(env, key, NULL);
+    jstring result = NULL;
+    if (id) {
+        // Fixed upper bound; translations are short UI text, not user data.
+        unsigned short text[4096];
+        size_t length = nabi_mobile_text(id, text, 4096);
+        if (length <= 4096) result = (*env)->NewString(env, text, (jsize)length);
+        (*env)->ReleaseStringUTFChars(env, key, id);
+    }
+    return result;
+}
+static jboolean begin(JNIEnv *env, jobject self) {
+    if (!enter_callback(env, self)) return false;
+    bool result = nabi_mobile_import_begin();
+    leave_callback(); return result;
+}
+static jboolean begin_folder(JNIEnv *env, jobject self) {
+    if (!enter_callback(env, self)) return false;
+    bool result = nabi_mobile_import_begin_folder();
+    leave_callback(); return result;
+}
+static void settings(JNIEnv *env, jobject self, jint fd) {
+    if (!enter_callback(env, self)) { if (fd >= 0) close(fd); return; }
+    nabi_mobile_settings_import(fd);
+    leave_callback();
+}
+static void export_result(JNIEnv *env, jobject self, jboolean saved) {
+    if (!enter_callback(env, self)) return;
+    nabi_mobile_export_result(saved); leave_callback();
+}
 static jboolean document(JNIEnv *env, jobject self, jint fd, jstring name) {
-    (void)self;
+    if (!enter_callback(env, self)) { if (fd >= 0) close(fd); return false; }
     const jchar *characters = name ? (*env)->GetStringChars(env, name, NULL) : NULL;
     jsize length = characters ? (*env)->GetStringLength(env, name) : 0;
     bool result = nabi_mobile_import_utf16(fd, characters, (size_t)length);
     if (characters) (*env)->ReleaseStringChars(env, name, characters);
-    return result;
+    leave_callback(); return result;
 }
-static void back(JNIEnv *env, jobject self) { (void)env; (void)self; nabi_mobile_back(); }
+static void back(JNIEnv *env, jobject self) {
+    if (!enter_callback(env, self)) return;
+    nabi_mobile_back(); leave_callback();
+}
+static void locale_changed(JNIEnv *env, jobject self) {
+    if (!enter_callback(env, self)) return;
+    nabi_mobile_locale_changed(); leave_callback();
+}
+static void window_mode_changed(JNIEnv *env, jobject self, jint state) {
+    if (!enter_callback(env, self)) return;
+    nabi_mobile_window_mode_changed(state);
+    leave_callback();
+}
 static void source(JNIEnv *env, jobject self, jstring id, jstring name) {
-    (void)self;
-    if (!id || !name) return;
+    if (!id || !name || !enter_callback(env, self)) return;
     const jchar *key = (*env)->GetStringChars(env, id, NULL);
     const jchar *label = (*env)->GetStringChars(env, name, NULL);
     if (key && label) nabi_mobile_source_utf16(key, (size_t)(*env)->GetStringLength(env, id),
         label, (size_t)(*env)->GetStringLength(env, name));
     if (key) (*env)->ReleaseStringChars(env, id, key);
     if (label) (*env)->ReleaseStringChars(env, name, label);
+    leave_callback();
 }
-static void finish(JNIEnv *env, jobject self) { (void)env; (void)self; nabi_mobile_import_finish(); }
+static void finish(JNIEnv *env, jobject self) {
+    if (!enter_callback(env, self)) return;
+    nabi_mobile_import_finish(); leave_callback();
+}
 static void error(JNIEnv *env, jobject self) {
-    (void)env; (void)self;
-    nabi_mobile_import_error("Could not read the selected document.");
+    if (!enter_callback(env, self)) return;
+    nabi_mobile_import_error("Could not read the selected document."); leave_callback();
+}
+static void photo_error(JNIEnv *env, jobject self, jint reason) {
+    if (!enter_callback(env, self)) return;
+    nabi_mobile_photo_error(reason); leave_callback();
 }
 static void insets(JNIEnv *env, jobject self, jfloat top, jfloat right, jfloat bottom, jfloat left) {
-    (void)env; (void)self;
+    if (!enter_callback(env, self)) return;
     atomic_store(&safe_area[0], top); atomic_store(&safe_area[1], right);
     atomic_store(&safe_area[2], bottom); atomic_store(&safe_area[3], left);
+    leave_callback();
 }
 
 void nabi_android_init(void *java_vm, void *native_activity) {
+    pthread_rwlock_wrlock(&host_lock);
     vm = (JavaVM *)java_vm;
     bool attached;
-    JNIEnv *env = environment(&attached);
-    if (!env) return;
+    JNIEnv *env = attach_environment(&attached);
+    if (!env) { pthread_rwlock_unlock(&host_lock); return; }
     activity = (*env)->NewGlobalRef(env, (jobject)native_activity);
     jclass cls = (*env)->GetObjectClass(env, activity);
     JNINativeMethod methods[] = {
+        {"nativeText", "(Ljava/lang/String;)Ljava/lang/String;", (void *)translated_text},
         {"nativeBegin", "()Z", (void *)begin},
         {"nativeDocument", "(ILjava/lang/String;)Z", (void *)document},
         {"nativeFinish", "()V", (void *)finish},
         {"nativeError", "()V", (void *)error},
+        {"nativePhotoError", "(I)V", (void *)photo_error},
         {"nativeBack", "()V", (void *)back},
+        {"nativeLocaleChanged", "()V", (void *)locale_changed},
+        {"nativeWindowModeChanged", "(I)V", (void *)window_mode_changed},
         {"nativeInsets", "(FFFF)V", (void *)insets},
         {"nativeBeginFolder", "()Z", (void *)begin_folder},
         {"nativeSettings", "(I)V", (void *)settings},
@@ -123,6 +209,17 @@ void nabi_android_init(void *java_vm, void *native_activity) {
     release(attached);
 }
 
+void nabi_android_shutdown(void) {
+    pthread_rwlock_wrlock(&host_lock);
+    bool attached;
+    JNIEnv *env = attach_environment(&attached);
+    if (env && activity) (*env)->DeleteGlobalRef(env, activity);
+    activity = NULL;
+    for (int i = 0; i < 3; ++i) { free(paths[i]); paths[i] = NULL; }
+    for (int i = 0; i < 4; ++i) atomic_store(&safe_area[i], 0);
+    release(attached);
+}
+
 const char *nabi_mobile_path(int kind) { return kind >= 0 && kind < 3 ? paths[kind] : NULL; }
 void nabi_mobile_safe_area(float *out) { for (int i = 0; i < 4; ++i) out[i] = atomic_load(&safe_area[i]); }
 void nabi_mobile_pick(void) {
@@ -142,8 +239,9 @@ void nabi_mobile_keep_awake(bool enabled) {
 }
 
 void nabi_mobile_copy_text(const unsigned short *text, int length) {
+    if (length < 0) return;
     bool attached; JNIEnv *env = environment(&attached);
-    if (!env || length < 0) return;
+    if (!env) return;
     jstring value = (*env)->NewString(env, text, length);
     if (value && copy_method) (*env)->CallVoidMethod(env, activity, copy_method, value);
     if (value) (*env)->DeleteLocalRef(env, value);
@@ -170,19 +268,18 @@ void nabi_mobile_set_immersive(bool enabled) {
     if (immersive_method) (*env)->CallVoidMethod(env, activity, immersive_method, (jboolean)enabled);
     clear_exception(env); release(attached);
 }
-static void call_with_text(jmethodID method, const unsigned short *text, int length) {
+static void call_with_text(jmethodID *method, const unsigned short *text, int length) {
     if (length < 0) return;
     bool attached; JNIEnv *env = environment(&attached);
     if (!env) return;
     jstring value = (*env)->NewString(env, text, length);
-    if (value && method) (*env)->CallVoidMethod(env, activity, method, value);
+    if (value && *method) (*env)->CallVoidMethod(env, activity, *method, value);
     if (value) (*env)->DeleteLocalRef(env, value);
     clear_exception(env); release(attached);
 }
-void nabi_mobile_share(const unsigned short *path, int length) { call_with_text(share_method, path, length); }
+void nabi_mobile_share(const unsigned short *path, int length) { call_with_text(&share_method, path, length); }
 void nabi_mobile_export_settings(const unsigned short *path, int length) {
-    if (!export_method) { nabi_mobile_export_result(false); return; }
-    call_with_text(export_method, path, length);
+    call_with_text(&export_method, path, length);
 }
 void nabi_mobile_import_settings(void) {
     bool attached; JNIEnv *env = environment(&attached);

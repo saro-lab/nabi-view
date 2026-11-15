@@ -347,6 +347,677 @@ fn settings_validate_and_legacy_files_get_defaults() {
 }
 use super::*;
 
+#[test]
+fn transform_defaults_upgrade_old_bindings_alongside_earlier_migrations() {
+    let defaults = crate::core::commands::default_shortcut_rows();
+    for (action, key) in [
+        ("rotate-right", "R"),
+        ("flip-horizontal", "T"),
+        ("flip-vertical", "Y"),
+    ] {
+        assert!(
+            defaults
+                .iter()
+                .any(|row| row.action == action && row.key == key)
+        );
+    }
+    assert!(!defaults.iter().any(|row| row.action == "rotate-left"));
+
+    for older_release in [false, true] {
+        let mut old: Vec<_> = defaults
+            .iter()
+            .filter(|row| {
+                row.action != "rotate-right"
+                    && (!older_release
+                        || (!matches!(
+                            row.action.as_str(),
+                            "about"
+                                | "close-all"
+                                | "slideshow-decrease"
+                                | "slideshow-increase"
+                                | "move"
+                                | "bookmark"
+                                | "page-prev"
+                                | "page-next"
+                        ) && !(row.action == "settings" && row.key == "Ctrl+S")))
+            })
+            .cloned()
+            .collect();
+        for row in &mut old {
+            match row.action.as_str() {
+                "flip-horizontal" => row.key = "R".into(),
+                "flip-vertical" => row.key = "T".into(),
+                "trash" if older_release && row.key == "Primary+E" => {
+                    row.key = "Primary+S".into();
+                }
+                _ => {}
+            }
+        }
+        let mut json = serde_json::to_value(Settings {
+            keyboard_shortcuts: Some(old),
+            ..Default::default()
+        })
+        .unwrap();
+        let fields = json.as_object_mut().unwrap();
+        fields.remove("transform_shortcuts_migrated");
+        fields.remove("transform_rty_shortcuts_migrated");
+        if older_release {
+            for field in [
+                "help_shortcut_migrated",
+                "close_all_shortcut_migrated",
+                "slideshow_shortcuts_migrated",
+                "trash_shortcut_migrated",
+                "move_shortcut_migrated",
+                "settings_shortcut_migrated",
+                "bookmark_shortcut_migrated",
+                "single_step_shortcuts_migrated",
+            ] {
+                fields.remove(field);
+            }
+        }
+        let mut settings: Settings = serde_json::from_value(json).unwrap();
+        settings.normalize();
+        settings.validate().unwrap();
+        crate::core::commands::validate_keys(&settings).unwrap();
+        assert!(settings.transform_shortcuts_migrated);
+        assert!(settings.transform_rty_shortcuts_migrated);
+        let rows = settings.keyboard_shortcuts.as_ref().unwrap();
+        assert_eq!(rows.len(), defaults.len());
+        for row in &defaults {
+            assert!(rows.contains(row), "Missing upgraded binding: {row:?}");
+        }
+    }
+}
+
+#[test]
+fn transform_rty_upgrade_replaces_the_first_rotation_release_defaults() {
+    let defaults = crate::core::commands::default_shortcut_rows();
+    let mut previous = defaults.clone();
+    for row in &mut previous {
+        match row.action.as_str() {
+            "rotate-right" => row.key = "T".into(),
+            "flip-horizontal" => row.key = "Y".into(),
+            "flip-vertical" => row.key = "U".into(),
+            _ => {}
+        }
+    }
+    let mut json = serde_json::to_value(Settings {
+        keyboard_shortcuts: Some(previous),
+        ..Default::default()
+    })
+    .unwrap();
+    json.as_object_mut()
+        .unwrap()
+        .remove("transform_rty_shortcuts_migrated");
+    let mut settings: Settings = serde_json::from_value(json).unwrap();
+    assert!(settings.transform_shortcuts_migrated);
+    assert!(!settings.transform_rty_shortcuts_migrated);
+    settings.normalize();
+    settings.validate().unwrap();
+    assert!(settings.transform_rty_shortcuts_migrated);
+    assert_eq!(settings.keyboard_shortcuts, Some(defaults));
+    assert!(
+        !settings
+            .keyboard_shortcuts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|row| row.action == "flip-vertical" && row.key == "U")
+    );
+}
+
+#[test]
+fn transform_upgrade_replaces_conflicts_once_and_keeps_unrelated_custom_bindings() {
+    for first_rotation_installed in [false, true] {
+        let row = |action: &str, key: &str| KeyboardShortcut {
+            action: action.into(),
+            key: key.into(),
+        };
+        let preserved = vec![
+            row("next", "J"),
+            row("flip-vertical", "Alt+V"),
+            row("rotate-left", "Shift+T"),
+            row("metadata", "V"),
+            row("fullscreen", "U"),
+        ];
+        let mut rows = preserved.clone();
+        rows.extend([
+            row("next", "R"),
+            row("metadata", "T"),
+            row("fullscreen", "Y"),
+        ]);
+        let mut settings = Settings {
+            keyboard_shortcuts: Some(rows),
+            transform_shortcuts_migrated: first_rotation_installed,
+            transform_rty_shortcuts_migrated: false,
+            ..Default::default()
+        };
+        settings.normalize();
+        settings.validate().unwrap();
+        crate::core::commands::validate_keys(&settings).unwrap();
+        let mut expected = preserved;
+        expected.extend([
+            row("rotate-right", "R"),
+            row("flip-horizontal", "T"),
+            row("flip-vertical", "Y"),
+        ]);
+        assert_eq!(settings.keyboard_shortcuts, Some(expected));
+
+        // Removing or repurposing these keys after upgrading is a user choice.
+        settings.keyboard_shortcuts = Some(vec![row("next", "T"), row("metadata", "Y")]);
+        let mut reloaded: Settings =
+            serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        reloaded.normalize();
+        assert_eq!(reloaded.keyboard_shortcuts, settings.keyboard_shortcuts);
+        crate::core::commands::validate_keys(&reloaded).unwrap();
+
+        for legacy_map in [false, true] {
+            let mut empty = Settings {
+                keyboard_shortcuts: if legacy_map { None } else { Some(vec![]) },
+                transform_shortcuts_migrated: first_rotation_installed,
+                transform_rty_shortcuts_migrated: false,
+                ..Default::default()
+            };
+            empty.normalize();
+            assert!(empty.transform_shortcuts_migrated);
+            assert_eq!(empty.keyboard_shortcuts, Some(vec![]));
+        }
+    }
+}
+
+#[test]
+fn legacy_transform_map_upgrades_without_losing_other_commands() {
+    let mut settings = Settings {
+        keyboard_shortcuts: None,
+        shortcuts: [
+            ("flip-horizontal".into(), "R".into()),
+            ("flip-vertical".into(), "T".into()),
+            ("next".into(), "J".into()),
+        ]
+        .into_iter()
+        .collect(),
+        transform_shortcuts_migrated: false,
+        transform_rty_shortcuts_migrated: false,
+        ..Default::default()
+    };
+    settings.normalize();
+    crate::core::commands::validate_keys(&settings).unwrap();
+    assert!(settings.shortcuts.is_empty());
+    let rows = settings.keyboard_shortcuts.as_ref().unwrap();
+    assert_eq!(rows.len(), 4);
+    for (action, key) in [
+        ("next", "J"),
+        ("rotate-right", "R"),
+        ("flip-horizontal", "T"),
+        ("flip-vertical", "Y"),
+    ] {
+        assert!(
+            rows.iter()
+                .any(|row| row.action == action && row.key == key)
+        );
+    }
+}
+
+#[test]
+fn transform_upgrade_waits_for_room_instead_of_saving_only_some_new_bindings() {
+    for first_rotation_installed in [false, true] {
+        let keys: Vec<_> = ('A'..='Z')
+            .map(|key| key.to_string())
+            .chain((0..10).map(|key| key.to_string()))
+            .chain((1..=4).map(|key| format!("F{key}")))
+            .collect();
+        let mut rows = Vec::new();
+        for prefix in [
+            "Alt+",
+            "Shift+",
+            "Primary+",
+            "Alt+Shift+",
+            "Primary+Alt+",
+            "Primary+Shift+",
+            "Primary+Alt+Shift+",
+        ] {
+            for key in &keys {
+                rows.push(KeyboardShortcut {
+                    action: "next".into(),
+                    key: format!("{prefix}{key}"),
+                });
+            }
+        }
+        rows.truncate(crate::core::settings::MAX_SHORTCUTS - 1);
+        let retired = KeyboardShortcut {
+            action: if first_rotation_installed {
+                "flip-vertical"
+            } else {
+                "flip-horizontal"
+            }
+            .into(),
+            key: if first_rotation_installed { "U" } else { "R" }.into(),
+        };
+        rows.push(retired.clone());
+        let mut settings = Settings {
+            keyboard_shortcuts: Some(rows.clone()),
+            transform_shortcuts_migrated: first_rotation_installed,
+            transform_rty_shortcuts_migrated: false,
+            ..Default::default()
+        };
+
+        for _ in 0..2 {
+            settings.normalize();
+            settings.validate().unwrap();
+            crate::core::commands::validate_keys(&settings).unwrap();
+            assert_eq!(settings.keyboard_shortcuts, Some(rows.clone()));
+            assert_eq!(
+                settings.transform_shortcuts_migrated,
+                first_rotation_installed
+            );
+            assert!(!settings.transform_rty_shortcuts_migrated);
+            // A restart must preserve both the pending upgrade and the old key.
+            settings = serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+            rows.remove(0);
+            settings.keyboard_shortcuts = Some(rows.clone());
+        }
+
+        // With two free slots, replacing the old key with all three new keys fits exactly.
+        settings.normalize();
+        settings.validate().unwrap();
+        crate::core::commands::validate_keys(&settings).unwrap();
+        assert!(settings.transform_shortcuts_migrated);
+        assert!(settings.transform_rty_shortcuts_migrated);
+        let upgraded = settings.keyboard_shortcuts.as_ref().unwrap();
+        assert_eq!(upgraded.len(), crate::core::settings::MAX_SHORTCUTS);
+        assert!(
+            !upgraded
+                .iter()
+                .any(|row| row.action == "flip-horizontal" && row.key == "R")
+        );
+        for row in rows.iter().filter(|row| **row != retired) {
+            assert!(upgraded.contains(row));
+        }
+        for (action, key) in [
+            ("rotate-right", "R"),
+            ("flip-horizontal", "T"),
+            ("flip-vertical", "Y"),
+        ] {
+            assert!(
+                upgraded
+                    .iter()
+                    .any(|row| row.action == action && row.key == key)
+            );
+        }
+    }
+}
+
+#[test]
+fn display_rotation_round_trips_and_rejects_invalid_saved_or_imported_angles() {
+    let dir = tempfile::tempdir_in(crate::test_support::root()).unwrap();
+    let store = isolated(dir.path());
+    let exported = dir.path().join("rotation.json");
+    for quarter_turns in 0..4 {
+        let settings = Settings {
+            rotation_quarter_turns: quarter_turns,
+            flip_horizontal: true,
+            flip_vertical: true,
+            ..Default::default()
+        };
+        store.save(&settings).unwrap();
+        store.export(&exported, &settings).unwrap();
+        assert_eq!(isolated(dir.path()).load().unwrap(), settings);
+        assert_eq!(store.import(&exported).unwrap(), settings);
+    }
+    let saved = store.load().unwrap();
+    for quarter_turns in [4, u8::MAX] {
+        let invalid = Settings {
+            rotation_quarter_turns: quarter_turns,
+            ..saved.clone()
+        };
+        assert!(store.save(&invalid).is_err());
+        fs::write(&exported, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(store.import(&exported).is_err());
+        assert_eq!(isolated(dir.path()).load().unwrap(), saved);
+    }
+    let mut legacy = serde_json::to_value(&saved).unwrap();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("rotation_quarter_turns");
+    let legacy: Settings = serde_json::from_value(legacy).unwrap();
+    assert_eq!(legacy.rotation_quarter_turns, 0);
+    assert!(legacy.flip_horizontal && legacy.flip_vertical);
+}
+
+#[test]
+fn simultaneous_windows_merge_rotation_and_other_view_preferences() {
+    let dir = tempfile::tempdir_in(crate::test_support::root()).unwrap();
+    let left_store = isolated(dir.path());
+    let right_store = isolated(dir.path());
+    let mut left = left_store.load().unwrap();
+    let mut right = right_store.load().unwrap();
+    left.rotation_quarter_turns = 1;
+    left_store.save(&left).unwrap();
+    right.flip_horizontal = true;
+    right_store.save(&right).unwrap();
+    let merged = isolated(dir.path()).load().unwrap();
+    assert_eq!(merged.rotation_quarter_turns, 1);
+    assert!(merged.flip_horizontal);
+
+    right.rotation_quarter_turns = 3;
+    right_store.save(&right).unwrap();
+    left.flip_vertical = true;
+    left_store.save(&left).unwrap();
+    let merged = isolated(dir.path()).load().unwrap();
+    assert_eq!(merged.rotation_quarter_turns, 3);
+    assert!(merged.flip_horizontal && merged.flip_vertical);
+}
+
+#[test]
+fn mobile_photo_defaults_are_first_install_only_and_empty_collections_open() {
+    use crate::core::photo_library;
+    for (defaults, expected_count) in [
+        (photo_library::ANDROID, 3),
+        (photo_library::IOS_DEFAULTS, 2),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::in_directories(root.path().join("config"), root.path().join("state"));
+        let sources = root.path().join("document-sources");
+        assert!(store.library().unwrap().is_empty());
+        store
+            .initialize_photo_bookmarks(&sources, defaults)
+            .unwrap();
+        let entries = store.library().unwrap();
+        assert_eq!(entries.len(), expected_count);
+        for (entry, (id, _)) in entries.iter().zip(defaults) {
+            assert_eq!(entry.kind, Kind::Bookmark);
+            assert_eq!(entry.folder.file_name().unwrap(), *id);
+            assert!(entry.available);
+            assert!(entry.image.is_none());
+            assert_eq!(entry.title(), photo_library::label(id).unwrap());
+        }
+        store
+            .rename_bookmark(&entries[0].folder, "My album")
+            .unwrap();
+        for entry in &entries[1..] {
+            store.remove_entry(Kind::Bookmark, &entry.folder).unwrap();
+        }
+        store
+            .initialize_photo_bookmarks(&sources, defaults)
+            .unwrap();
+        let entries = store.library().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title(), "My album");
+        store
+            .remove_entry(Kind::Bookmark, &entries[0].folder)
+            .unwrap();
+        store
+            .initialize_photo_bookmarks(&sources, defaults)
+            .unwrap();
+        assert!(store.library().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn existing_mobile_state_and_desktop_defaults_are_not_seeded() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::in_directories(root.path().join("config"), root.path().join("state"));
+    assert!(store.library().unwrap().is_empty());
+    assert!(
+        !store.database.exists(),
+        "desktop library reads must stay read-only"
+    );
+    store.connection().unwrap();
+    store
+        .initialize_photo_bookmarks(
+            &root.path().join("document-sources"),
+            crate::core::photo_library::ANDROID,
+        )
+        .unwrap();
+    assert!(store.library().unwrap().is_empty());
+    assert!(!root.path().join("document-sources").exists());
+}
+
+#[test]
+fn mobile_source_migration_survives_container_moves_without_restoring_deleted_bookmarks() {
+    use crate::core::{documents, photo_library};
+    let temp = tempfile::tempdir().unwrap();
+    let base = crate::core::paths::canonicalize(temp.path()).unwrap();
+    let old = base.join("old-container");
+    fs::create_dir_all(&old).unwrap();
+    let store = Store::in_directories(old.join("config"), old.join("state"));
+    let sources = old.join("document-sources");
+    // Reproduce the earlier three-default installation, including Favorites.
+    store
+        .initialize_photo_bookmarks(&sources, photo_library::IOS)
+        .unwrap();
+    let entries = store.library().unwrap();
+    store
+        .remove_entry(Kind::Bookmark, &sources.join("nabi-ios-screenshots"))
+        .unwrap();
+    let document = documents::create_empty_source(&sources, "12345678-picked", "Travel").unwrap();
+    let conn = store.connection().unwrap();
+    // Reproduce an older app's absolute paths in an otherwise intact container.
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.folder != sources.join("nabi-ios-screenshots"))
+    {
+        conn.execute(
+            "UPDATE library SET path = ?1 WHERE path = ?2",
+            params![
+                encode_path(&entry.folder),
+                store.encode_library_path(&entry.folder)
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "UPDATE library SET name = 'My photos', image = ?1 WHERE path = ?2",
+        params![
+            encode_path(Path::new("last.png")),
+            encode_path(&sources.join("nabi-ios-library"))
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO library(kind, path, image, name) VALUES (?1, ?2, ?3, 'Travel custom')",
+        params![
+            Kind::Recent.code(),
+            encode_path(&document),
+            encode_path(Path::new("book.zip/page10.png"))
+        ],
+    )
+    .unwrap();
+    let before: Vec<(i64, i64, Option<String>, Option<Vec<u8>>)> = conn
+        .prepare("SELECT id, kind, name, image FROM library ORDER BY kind, id DESC")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    drop(conn);
+    drop(store);
+    let current = base.join("current-container");
+    fs::rename(&old, &current).unwrap();
+    let store = Store::in_directories(current.join("config"), current.join("state"));
+    let sources = current.join("document-sources");
+    store
+        .initialize_photo_bookmarks(&sources, photo_library::IOS_DEFAULTS)
+        .unwrap();
+    let entries = store.library().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert!(
+        entries
+            .iter()
+            .all(|e| e.folder.parent() == Some(sources.as_path()))
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|e| e.folder.ends_with("nabi-ios-screenshots"))
+    );
+    let photos = entries
+        .iter()
+        .find(|e| e.folder.ends_with("nabi-ios-library"))
+        .unwrap();
+    assert_eq!(photos.title(), "My photos");
+    assert_eq!(
+        photos.image.as_deref(),
+        Some(sources.join("nabi-ios-library/last.png").as_path())
+    );
+    let recent = entries.iter().find(|e| e.kind == Kind::Recent).unwrap();
+    assert_eq!(
+        recent.image.as_deref(),
+        Some(
+            sources
+                .join("12345678-picked/book.zip/page10.png")
+                .as_path()
+        )
+    );
+    let conn = store.connection().unwrap();
+    let after: Vec<(i64, i64, Option<String>, Option<Vec<u8>>)> = conn
+        .prepare("SELECT id, kind, name, image FROM library ORDER BY kind, id DESC")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        before, after,
+        "migration must preserve row order, names and relative pages"
+    );
+    let keys: Vec<Vec<u8>> = conn
+        .prepare("SELECT path FROM library")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(keys.iter().all(|key| mobile_source_id(key).is_some()));
+    let backup = store
+        .database
+        .with_file_name("state.pre-mobile-source-v1.sqlite");
+    let snapshot = fs::read(&backup).unwrap();
+    store
+        .initialize_photo_bookmarks(&sources, photo_library::IOS_DEFAULTS)
+        .unwrap();
+    assert_eq!(fs::read(&backup).unwrap(), snapshot);
+    assert_eq!(store.library().unwrap(), entries);
+    drop(conn);
+    drop(store);
+    // Once migrated, another container move requires no further path rewrite.
+    let moved = base.join("third-container");
+    fs::rename(&current, &moved).unwrap();
+    let store = Store::in_directories(moved.join("config"), moved.join("state"));
+    let sources = moved.join("document-sources");
+    store
+        .initialize_photo_bookmarks(&sources, photo_library::IOS_DEFAULTS)
+        .unwrap();
+    assert!(
+        store
+            .library()
+            .unwrap()
+            .iter()
+            .all(|e| e.folder.parent() == Some(sources.as_path()))
+    );
+    assert_eq!(
+        fs::read(moved.join("state/state.pre-mobile-source-v1.sqlite")).unwrap(),
+        snapshot
+    );
+}
+
+#[test]
+fn mobile_source_migration_merges_duplicates_and_keeps_missing_sources() {
+    use crate::core::photo_library;
+    let temp = tempfile::tempdir().unwrap();
+    let root = crate::core::paths::canonicalize(temp.path()).unwrap();
+    let store = Store::in_directories(root.join("config"), root.join("state"));
+    let conn = store.connection().unwrap();
+    let photo_old = root.join("old/document-sources/nabi-ios-library");
+    let photo_new = root.join("document-sources/nabi-ios-library");
+    let missing = root.join("old/document-sources/12345678-missing");
+    let current_missing = root.join("document-sources/12345678-current");
+    let unrelated = root.join("ordinary-folder/nabi-ios-favorites");
+    for (id, kind, path, name, page) in [
+        (
+            10,
+            Kind::Bookmark,
+            &photo_old,
+            Some("My album"),
+            Some("old.png"),
+        ),
+        (20, Kind::Bookmark, &photo_new, None, Some("new.png")),
+        (30, Kind::Recent, &missing, None, None),
+        (40, Kind::Bookmark, &unrelated, None, None),
+        (50, Kind::Recent, &current_missing, None, None),
+    ] {
+        conn.execute(
+            "INSERT INTO library(id, kind, path, name, image) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id,
+                kind.code(),
+                encode_path(path),
+                name,
+                page.map(|p| encode_path(Path::new(p)))
+            ],
+        )
+        .unwrap();
+    }
+    drop(conn);
+    store
+        .initialize_photo_bookmarks(&root.join("document-sources"), photo_library::IOS)
+        .unwrap();
+    let entries = store.library().unwrap();
+    assert_eq!(entries.len(), 4);
+    let photo = entries.iter().find(|e| e.folder == photo_new).unwrap();
+    assert_eq!(photo.title(), "My album");
+    assert_eq!(photo.image, Some(photo_new.join("new.png")));
+    assert!(
+        photo.available,
+        "built-in photos must open even without a marker"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.folder == missing && e.kind == Kind::Recent && !e.available)
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.folder == unrelated && !e.available)
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.folder == current_missing && !e.available)
+    );
+    store.remove_entry(Kind::Recent, &current_missing).unwrap();
+    assert!(
+        !store
+            .library()
+            .unwrap()
+            .iter()
+            .any(|e| e.folder == current_missing)
+    );
+    let conn = store.connection().unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT id FROM library WHERE path = ?1",
+            [mobile_source_key("nabi-ios-library")],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        20
+    );
+    store.remove_entry(Kind::Bookmark, &photo_new).unwrap();
+    store
+        .initialize_photo_bookmarks(&root.join("document-sources"), photo_library::IOS)
+        .unwrap();
+    assert!(
+        !store
+            .library()
+            .unwrap()
+            .iter()
+            .any(|e| e.folder == photo_new)
+    );
+}
+
 fn isolated(root: &Path) -> Store {
     Store::in_directories(root.join("config"), root.join("data"))
 }
@@ -1444,6 +2115,110 @@ fn mouse_gestures_round_trip_and_merge_across_windows() {
 }
 
 #[test]
+fn touch_gestures_default_for_old_files_and_repair_only_invalid_actions() {
+    use crate::core::settings::TouchSettings;
+    let defaults = TouchSettings::default();
+    assert!(defaults.swipe_navigation && defaults.pinch_zoom);
+    assert!(defaults.one_finger_pan && defaults.two_finger_pan);
+    assert_eq!(defaults.double_tap, "fit");
+    assert_eq!(defaults.long_press, "menu");
+
+    let root = tempfile::tempdir().unwrap();
+    let store = isolated(root.path());
+    let file = root.path().join("old-settings.json");
+    let mut old = serde_json::to_value(Settings::default()).unwrap();
+    old.as_object_mut().unwrap().remove("touch");
+    old["mouse"]["double_click"] = serde_json::json!("recent");
+    std::fs::write(&file, serde_json::to_vec(&old).unwrap()).unwrap();
+    let imported = store.import(&file).unwrap();
+    assert_eq!(imported.touch, defaults);
+    assert_eq!(imported.mouse.double_click, "recent");
+
+    // Partial files retain disabled gestures and the other valid action.
+    old["touch"] = serde_json::json!({
+        "swipe_navigation": false,
+        "one_finger_pan": false,
+        "double_tap": "share",
+        "long_press": "no-such-command"
+    });
+    std::fs::write(&file, serde_json::to_vec(&old).unwrap()).unwrap();
+    let imported = store.import(&file).unwrap();
+    assert_eq!(
+        imported.touch,
+        TouchSettings {
+            swipe_navigation: false,
+            one_finger_pan: false,
+            double_tap: "share".into(),
+            ..defaults.clone()
+        }
+    );
+
+    for action in ["bogus", "new-window", "move", "chrome"] {
+        let mut invalid = imported.clone();
+        invalid.touch.double_tap = action.into();
+        assert!(invalid.validate().is_err());
+        invalid.normalize();
+        invalid.validate().unwrap();
+        assert_eq!(invalid.touch.double_tap, defaults.double_tap);
+        assert!(!invalid.touch.swipe_navigation && !invalid.touch.one_finger_pan);
+    }
+    for action in ["none", "menu", "fit", "fullscreen", "share", "orientation"] {
+        let mut valid = imported.clone();
+        valid.touch.double_tap = action.into();
+        valid.touch.long_press = action.into();
+        valid.validate().unwrap();
+    }
+}
+
+#[test]
+fn touch_and_mouse_gestures_save_merge_export_and_reset_independently() {
+    use crate::core::settings::{MouseSettings, TouchSettings};
+    let root = tempfile::tempdir().unwrap();
+    let desktop = isolated(root.path());
+    let mobile = isolated(root.path());
+    let mut mouse_edit = desktop.load().unwrap();
+    let mut touch_edit = mobile.load().unwrap();
+    mouse_edit.mouse.double_click = "recent".into();
+    mouse_edit.mouse.wheel = "page".into();
+    touch_edit.touch = TouchSettings {
+        swipe_navigation: false,
+        pinch_zoom: false,
+        one_finger_pan: false,
+        two_finger_pan: false,
+        double_tap: "none".into(),
+        long_press: "share".into(),
+    };
+    desktop.save(&mouse_edit).unwrap();
+    mobile.save(&touch_edit).unwrap();
+    let merged = desktop.load().unwrap();
+    assert_eq!(merged.mouse, mouse_edit.mouse);
+    assert_eq!(merged.touch, touch_edit.touch);
+
+    let exported = root.path().join("export.json");
+    desktop.export(&exported, &merged).unwrap();
+    assert_eq!(desktop.import(&exported).unwrap(), merged);
+    let mut touch_reset = merged.clone();
+    touch_reset.touch = TouchSettings::default();
+    desktop.save(&touch_reset).unwrap();
+    assert_eq!(mobile.load().unwrap().touch, TouchSettings::default());
+    assert_eq!(mobile.load().unwrap().mouse, mouse_edit.mouse);
+
+    // Editing the touch group after a concurrent mouse reset keeps both changes.
+    let mut mouse_reset = mobile.load().unwrap();
+    let mut next_touch = desktop.load().unwrap();
+    mouse_reset.mouse = MouseSettings::default();
+    next_touch.touch.long_press = "none".into();
+    mobile.save(&mouse_reset).unwrap();
+    desktop.save(&next_touch).unwrap();
+    let merged = mobile.load().unwrap();
+    assert_eq!(merged.mouse, MouseSettings::default());
+    assert_eq!(merged.touch.long_press, "none");
+
+    desktop.replace_from_import(&Settings::default()).unwrap();
+    assert_eq!(desktop.load().unwrap(), Settings::default());
+}
+
+#[test]
 fn new_display_preferences_round_trip_default_old_files_and_merge_independently() {
     let root = tempfile::tempdir().unwrap();
     let first = isolated(root.path());
@@ -1584,4 +2359,98 @@ fn saved_mobile_source_history_and_bookmark_survive_released_import_pixels() {
             .title(),
         "Saved page"
     );
+}
+
+#[test]
+fn single_step_defaults_upgrade_free_keys_and_preserve_custom_or_deleted_assignments() {
+    let defaults = crate::core::commands::default_shortcut_rows();
+    let old: Vec<_> = defaults
+        .iter()
+        .filter(|row| !matches!(row.action.as_str(), "page-prev" | "page-next"))
+        .cloned()
+        .collect();
+    let mut json = serde_json::to_value(Settings {
+        keyboard_shortcuts: Some(old.clone()),
+        ..Default::default()
+    })
+    .unwrap();
+    json.as_object_mut()
+        .unwrap()
+        .remove("single_step_shortcuts_migrated");
+    let mut settings: Settings = serde_json::from_value(json).unwrap();
+    settings.normalize();
+    assert_eq!(settings.keyboard_shortcuts, Some(defaults));
+    settings.validate().unwrap();
+    settings.keyboard_shortcuts = Some(old);
+    let mut reloaded: Settings =
+        serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+    reloaded.normalize();
+    assert_eq!(reloaded.keyboard_shortcuts, settings.keyboard_shortcuts);
+
+    let row = |action: &str, key: &str| KeyboardShortcut {
+        action: action.into(),
+        key: key.into(),
+    };
+    for rows in [
+        vec![],
+        vec![row("metadata", "Alt+D")],
+        vec![row("page-next", "J")],
+    ] {
+        let mut settings = Settings {
+            keyboard_shortcuts: Some(rows.clone()),
+            single_step_shortcuts_migrated: false,
+            ..Default::default()
+        };
+        settings.normalize();
+        settings.validate().unwrap();
+        let upgraded = settings.keyboard_shortcuts.as_ref().unwrap();
+        for existing in &rows {
+            assert!(upgraded.contains(existing));
+        }
+        if rows.is_empty() {
+            assert!(upgraded.is_empty());
+        } else if rows[0].action == "metadata" {
+            assert!(!upgraded.contains(&row("page-next", "Alt+D")));
+            assert!(upgraded.contains(&row("page-next", "Alt+Right")));
+        } else {
+            assert!(!upgraded.contains(&row("page-next", "Alt+D")));
+            assert!(!upgraded.contains(&row("page-next", "Alt+Right")));
+        }
+    }
+}
+
+#[test]
+fn renamed_library_pages_follow_name_exchanges_once_and_keep_bookmark_title() {
+    let root = tempfile::tempdir_in(crate::test_support::root()).unwrap();
+    let folder = root.path().join("album");
+    std::fs::create_dir(&folder).unwrap();
+    let first = folder.join("one.png");
+    let second = folder.join("two.png");
+    std::fs::write(&first, b"one").unwrap();
+    std::fs::write(&second, b"two").unwrap();
+    let store = Store::in_directories(root.path().join("config"), root.path().join("state"));
+    store.record_folder(&folder, 10).unwrap();
+    store.remember_page(&first).unwrap();
+    store.add_bookmark(&second, "My album").unwrap();
+    store
+        .rename_library_images(&[(first.clone(), second.clone()), (second, first)])
+        .unwrap();
+    let entries = store.library().unwrap();
+    let recent = entries
+        .iter()
+        .find(|entry| entry.kind == Kind::Recent)
+        .unwrap();
+    let bookmark = entries
+        .iter()
+        .find(|entry| entry.kind == Kind::Bookmark)
+        .unwrap();
+    assert_eq!(
+        recent.image.as_ref().unwrap().file_name().unwrap(),
+        "two.png"
+    );
+    assert_eq!(
+        bookmark.image.as_ref().unwrap().file_name().unwrap(),
+        "one.png"
+    );
+    assert_eq!(bookmark.title(), "My album");
 }
