@@ -335,6 +335,8 @@ fn visit(
     live: &dyn Fn() -> bool,
     emit: &mut dyn FnMut(AnimationFrame, [u32; 2]) -> Result<bool, String>,
 ) -> Result<usize, String> {
+    #[cfg(any(target_os = "ios", target_os = "android", test))]
+    crate::core::documents::materialize(&source.path, live)?;
     #[cfg(all(target_os = "macos", not(test)))]
     let access = crate::platform::mac_access::resolve(&source.path)?;
     #[cfg(all(target_os = "macos", not(test)))]

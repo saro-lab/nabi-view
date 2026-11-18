@@ -20,7 +20,7 @@ struct Settle {
 
 impl Viewer {
     fn swipe_target(&self, forward: bool) -> Option<usize> {
-        if self.files.is_empty() || self.listing.is_some() {
+        if self.files.is_empty() || self.listing.is_some() || self.source_list_pending() {
             return None;
         }
         let (first, last) = self.focus_span();
@@ -35,6 +35,11 @@ impl Viewer {
     }
 
     pub(super) fn drag_mobile_swipe(&mut self, ctx: &egui::Context, canvas: Rect, offset: f32) {
+        if self.touch_gesture.pan_only() || self.touch_pan_mode(canvas.size(), ctx) {
+            self.touch_gesture.lock_pan();
+            self.mobile_swipe = None;
+            return;
+        }
         if let Some(swipe) = &mut self.mobile_swipe {
             swipe.offset = offset.clamp(-canvas.width() * 0.95, canvas.width() * 0.95);
             if offset.abs() >= 8. {
@@ -62,6 +67,16 @@ impl Viewer {
     }
 
     pub(super) fn finish_mobile_swipe(&mut self, ctx: &egui::Context, forward: Option<bool>) {
+        if self.touch_gesture.pan_only()
+            || self
+                .presentation
+                .canvas
+                .is_some_and(|canvas| self.touch_pan_mode(canvas.size(), ctx))
+        {
+            self.touch_gesture.lock_pan();
+            self.mobile_swipe = None;
+            return;
+        }
         let swipe = self.mobile_swipe.take();
         let previous = self.files.get(self.focus_index).cloned();
         if let Some(forward) = forward {

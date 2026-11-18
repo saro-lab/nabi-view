@@ -33,11 +33,20 @@ fn default_metadata_font_size() -> u32 {
 fn default_disk_cache_enabled() -> bool {
     true
 }
+/// Desktops keep room for screen-sized entries of several folders; phones
+/// share less storage.
 fn default_disk_cache_mb() -> u32 {
-    1024
+    if cfg!(any(target_os = "ios", target_os = "android")) {
+        1024
+    } else {
+        2048
+    }
 }
 fn default_recent_moves() -> usize {
     10
+}
+fn default_prefill_library() -> bool {
+    true
 }
 fn default_slide() -> u32 {
     1000
@@ -71,6 +80,7 @@ fn default_orientation() -> String {
 }
 pub(crate) const ORIENTATIONS: &[&str] = &["auto", "portrait", "landscape"];
 pub const MIN_WINDOW_SIZE: [f32; 2] = [560., 420.];
+#[cfg(any(not(any(target_os = "ios", target_os = "android")), test))]
 pub const DEFAULT_WINDOW_SIZE: [f32; 2] = [1080., 760.];
 
 pub fn valid_window_size(size: [f32; 2]) -> bool {
@@ -281,6 +291,9 @@ pub struct Settings {
     pub cache_memory_mb: u32,
     pub remember_recent: bool,
     pub recent_limit: usize,
+    /// Prepare bookmarked and recent folders' pages on disk while idle.
+    #[serde(default = "default_prefill_library")]
+    pub prefill_library: bool,
     #[serde(default = "default_recent_moves")]
     pub recent_move_limit: usize,
     #[serde(default)]
@@ -346,6 +359,7 @@ impl Default for Settings {
             cache_memory_mb: default_cache_memory_mb(),
             remember_recent: true,
             recent_limit: 50,
+            prefill_library: default_prefill_library(),
             recent_move_limit: default_recent_moves(),
             mouse: MouseSettings::default(),
             touch: TouchSettings::default(),
@@ -785,6 +799,7 @@ impl Settings {
             cache_memory_mb,
             remember_recent,
             recent_limit,
+            prefill_library,
             recent_move_limit,
             mouse,
             touch,

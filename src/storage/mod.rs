@@ -7,7 +7,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use tempfile::NamedTempFile;
 
 use crate::core::library::{self, Entry, Kind};
@@ -39,6 +39,7 @@ impl Store {
         self.database.with_file_name("close-all.signal")
     }
 
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     pub fn new() -> Result<Self, String> {
         let config = dirs::config_dir().ok_or("User configuration directory is unavailable.")?;
         #[cfg(target_os = "linux")]
@@ -61,6 +62,7 @@ impl Store {
 
     /// Compatibility constructor for isolated callers. Platform hosts should
     /// supply their OS cache directory with `in_directories_with_cache`.
+    #[cfg(any(not(any(target_os = "ios", target_os = "android")), test))]
     pub fn in_directories(config: PathBuf, state: PathBuf) -> Self {
         let cache = state.join("cache");
         Self::in_directories_with_cache(config, state, cache)
@@ -340,12 +342,14 @@ impl Store {
 
     /// Window geometry belongs to this device and is excluded from portable settings.
     /// The initial read is read-only and does not create or migrate the state database.
+    #[cfg(any(not(any(target_os = "ios", target_os = "android")), test))]
     pub fn load_window_size(&self) -> Result<Option<[f32; 2]>, String> {
         if !self.database.try_exists().map_err(|e| e.to_string())? {
             return Ok(None);
         }
-        let conn = Connection::open_with_flags(&self.database, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|e| e.to_string())?;
+        let conn =
+            Connection::open_with_flags(&self.database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|e| e.to_string())?;
         conn.busy_timeout(Duration::from_millis(30))
             .map_err(|e| e.to_string())?;
         let exists: bool = conn.query_row(

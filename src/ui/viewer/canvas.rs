@@ -55,6 +55,24 @@ impl Viewer {
         screen
     }
 
+    /// Keep first-open requests and later painting on the same physical-pixel
+    /// bucket, including while the library is covering an empty viewer.
+    pub(super) fn update_fit_limit(&mut self, screen: Rect, pixels_per_point: f32) {
+        let size = self.image_canvas(screen).size();
+        if !size.is_finite()
+            || size.x <= 0.
+            || size.y <= 0.
+            || !pixels_per_point.is_finite()
+            || pixels_per_point <= 0.
+        {
+            return;
+        }
+        // Clamp before converting/bucketing so extreme or transient window
+        // dimensions cannot overflow. Small resizes keep the same request.
+        let pixels = (size.max_elem() * pixels_per_point).clamp(1024., MAX_DECODE_SIDE as f32);
+        self.fit_limit = (pixels.ceil() as u32).div_ceil(512) * 512;
+    }
+
     /// A fitted page (or spread) stays centered; only overflow needs panning.
     pub(super) fn images_can_pan(&self, canvas: Vec2, ctx: &egui::Context) -> bool {
         let (first, last) = self.focus_span();
@@ -149,6 +167,10 @@ impl Viewer {
 
     pub(super) fn canvas(&mut self, root: &mut egui::Ui) {
         let ctx = &root.ctx().clone();
+        #[cfg(any(target_os = "ios", test))]
+        let source_refreshing = self.ios_photos_refreshing();
+        #[cfg(not(any(target_os = "ios", test)))]
+        let source_refreshing = false;
         if self.cache_budget() > 0
             && (self.zoom_override.is_some()
                 || self.settings.view_mode == "actual"
@@ -156,7 +178,7 @@ impl Viewer {
         {
             self.trim_cache(self.cache_budget() / 3);
         }
-        let detail_budget = if self.cache_budget() > 0 && !self.renaming() {
+        let detail_budget = if self.cache_budget() > 0 && !self.renaming() && !source_refreshing {
             self.cache_budget().saturating_sub(
                 self.cache_bytes()
                     .saturating_sub(self.details.retained_bytes()),
@@ -180,7 +202,9 @@ impl Viewer {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(background))
             .show(root, |ui| {
-                let canvas = self.image_canvas(ui.available_rect_before_wrap());
+                let screen = ui.available_rect_before_wrap();
+                self.update_fit_limit(screen, ctx.pixels_per_point());
+                let canvas = self.image_canvas(screen);
                 let response = ui.allocate_rect(canvas, egui::Sense::click_and_drag());
                 if self.files.is_empty() {
                     self.canvas_pointer(ctx, &response, false);
@@ -193,10 +217,6 @@ impl Viewer {
                     self.touch_canvas(ctx, &response, reading);
                 }
                 let ppp = ctx.pixels_per_point();
-                // Bucket requests so resizing the window a few pixels does not restart the decoder.
-                self.fit_limit =
-                    ((((canvas.width().max(canvas.height()) * ppp) as u32).div_ceil(512)) * 512)
-                        .clamp(1024, MAX_DECODE_SIDE);
                 let (first, last) = self.focus_span();
                 let mut ids = vec![first];
                 if first != last {
@@ -357,7 +377,11 @@ impl Viewer {
                 }
                 let overlays = self.metadata_overlays(canvas);
                 let reading = self.reading_metadata(ctx, &overlays);
-                if self.inspector.open && !self.transition_waiting && !self.settings_open {
+                if self.inspector.open
+                    && !self.transition_waiting
+                    && !self.settings_open
+                    && !source_refreshing
+                {
                     let visible: Vec<_> = ids.iter().map(|&i| self.files[i].as_path()).collect();
                     self.inspector.configure(
                         self.settings.metadata_font_size,

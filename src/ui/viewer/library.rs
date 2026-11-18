@@ -8,11 +8,18 @@ const ROW_HEIGHT: f32 = 68.;
 const THUMBNAIL_SIZE: f32 = 56.;
 /// Narrowest list that still fits a thumbnail, two lines of text and its buttons.
 const MIN_COLUMN_WIDTH: f32 = 240.;
-/// Thumbnail textures kept while the overlay is open; rows reload evicted ones.
+/// Thumbnail textures kept across overlay visits; rows reload evicted ones.
 const TEXTURE_LIMIT: usize = 64;
-/// Unused thumbnails stay this long, so another window can still record new ones.
-const THUMBNAIL_GRACE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+const THUMBNAIL_RESERVATION: usize =
+    library::THUMBNAIL_EDGE as usize * library::THUMBNAIL_EDGE as usize * 4;
 const NAME_FIELD: &str = "bookmark-name";
+
+#[path = "library_preview.rs"]
+mod opening_preview;
+
+#[cfg(test)]
+#[path = "library_cache_tests.rs"]
+mod memory_cache_tests;
 
 pub(super) struct Item {
     pub entry: Entry,
@@ -21,6 +28,11 @@ pub(super) struct Item {
 }
 
 impl Item {
+    #[cfg(test)]
+    pub(super) fn for_test(entry: Entry) -> Self {
+        Self::new(entry)
+    }
+
     fn new(entry: Entry) -> Self {
         let key = entry.image.as_deref().and_then(library::thumbnail_key);
         Self { entry, key }
@@ -43,9 +55,121 @@ pub(super) struct Library {
     pub clear_prompt: bool,
     pub dialog: Option<BookmarkDialog>,
     thumbnails: Thumbnails,
+    opening_preview: Option<opening_preview::OpeningPreview>,
+    #[cfg(test)]
+    preview_test_status: Option<crate::core::ios_access::PhotoStatus>,
 }
 
 impl Library {
+    fn thumbnail(&self, item: &Item) -> Option<&egui::TextureHandle> {
+        item.shown()
+            .and_then(|key| self.thumbnails.textures.get(key))
+            .or_else(|| {
+                item.entry
+                    .thumbnail
+                    .as_ref()
+                    .and_then(|key| self.thumbnails.textures.get(key))
+            })
+            .map(|(texture, _)| texture)
+    }
+
+    pub(super) fn thumbnails_pending(&self) -> bool {
+        self.thumbnails
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.pending > 0)
+    }
+
+    pub(super) fn thumbnail_textures(&self) -> impl Iterator<Item = &egui::TextureHandle> {
+        self.thumbnails
+            .textures
+            .values()
+            .map(|(texture, _)| texture)
+            .chain(
+                self.dialog
+                    .iter()
+                    .filter_map(|dialog| dialog.preview.as_ref()),
+            )
+            .chain(self.opening_preview.iter().map(|preview| &preview.texture))
+    }
+
+    /// Reclaim the least recently shown thumbnails, including the count limit.
+    pub(super) fn trim_thumbnails(&mut self, bytes_to_free: usize) -> usize {
+        self.trim_thumbnails_except(bytes_to_free, None)
+    }
+
+    /// Reserve space for new rows without cycling thumbnails already visible.
+    fn trim_thumbnails_except(
+        &mut self,
+        bytes_to_free: usize,
+        visible: Option<&HashSet<String>>,
+    ) -> usize {
+        let previews = [
+            self.dialog
+                .as_ref()
+                .and_then(|dialog| dialog.preview.as_ref())
+                .map(egui::TextureHandle::id),
+            self.opening_preview
+                .as_ref()
+                .map(|preview| preview.texture.id()),
+        ];
+        let textures = &mut self.thumbnails.textures;
+        if bytes_to_free == 0 && textures.len() <= TEXTURE_LIMIT {
+            return 0;
+        }
+        let mut used: Vec<_> = textures
+            .iter()
+            .filter(|(key, (texture, _))| {
+                visible.is_none_or(|visible| {
+                    !visible.contains(*key) && !previews.contains(&Some(texture.id()))
+                })
+            })
+            .map(|(key, (_, frame))| (*frame, key.clone()))
+            .collect();
+        used.sort_unstable();
+        let mut freed = 0usize;
+        for (_, key) in used {
+            if textures.len() <= TEXTURE_LIMIT && freed >= bytes_to_free {
+                break;
+            }
+            if let Some((texture, _)) = textures.remove(&key) {
+                // The rename dialog may still own this exact texture. Removing
+                // the map's reference does not reclaim its pixels in that case.
+                if !previews.contains(&Some(texture.id())) {
+                    freed = freed.saturating_add(texture.byte_size());
+                }
+            }
+        }
+        freed
+    }
+
+    /// Also disconnect queued results, so cleared pixels cannot be restored by
+    /// a worker that was already decoding when pressure or deletion arrived.
+    pub(super) fn clear_thumbnails(&mut self) {
+        if let Some(worker) = &self.thumbnails.worker {
+            worker.limit.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.thumbnails = Thumbnails::default();
+    }
+
+    fn retain_current_thumbnails(&mut self) {
+        let current: HashSet<_> = self
+            .items
+            .iter()
+            .flat_map(|item| [item.key.as_deref(), item.entry.thumbnail.as_deref()])
+            .flatten()
+            .collect();
+        self.thumbnails
+            .textures
+            .retain(|key, _| current.contains(key.as_str()));
+        self.thumbnails
+            .failed
+            .retain(|key| current.contains(key.as_str()));
+        self.thumbnails
+            .required_bytes
+            .retain(|key, _| current.contains(key.as_str()));
+    }
+
     fn prefer_bookmarks_if_recent_empty(&mut self) {
         if self.tab == Kind::Recent
             && !self
@@ -58,7 +182,7 @@ impl Library {
     }
     /// Library layers that take keyboard input away from the viewer.
     pub(super) fn modal(&self) -> bool {
-        self.open || self.clear_prompt || self.dialog.is_some()
+        self.open || self.clear_prompt || self.dialog.is_some() || self.opening_preview_active()
     }
 }
 
@@ -82,6 +206,9 @@ struct Thumbnails {
     textures: HashMap<String, (egui::TextureHandle, u64)>,
     requested: HashSet<String>,
     failed: HashSet<String>,
+    /// Actual output size when a result could not fit. Retry only after enough
+    /// memory becomes available, including for larger legacy cache entries.
+    required_bytes: HashMap<String, usize>,
 }
 
 struct Job {
@@ -97,8 +224,15 @@ struct Job {
 struct Done {
     shown: String,
     owner: (Kind, PathBuf),
-    /// Pixels to show, and the cache key to record when they are the image's own.
-    result: Result<(egui::ColorImage, Option<String>), String>,
+    result: Result<Thumbnail, String>,
+}
+
+struct Thumbnail {
+    pixels: egui::ColorImage,
+    /// Record a newly stored thumbnail only for the image that produced it.
+    written: Option<String>,
+    /// Older representative pixels keep their own identity in memory too.
+    fallback: Option<String>,
 }
 
 /// Reads and writes thumbnail files away from the UI thread.
@@ -118,6 +252,7 @@ impl Worker {
         std::thread::Builder::new()
             .name("thumbnails".into())
             .spawn(move || {
+                crate::platform::worker_priority::background();
                 for job in inbox {
                     let limit = worker_limit.load(std::sync::atomic::Ordering::Relaxed);
                     let result = if limit == 0 {
@@ -125,7 +260,11 @@ impl Worker {
                             .as_ref()
                             .ok_or_else(|| "No thumbnail".to_owned())
                             .and_then(|(image, _)| {
-                                library::decode_thumbnail(image).map(|pixels| (pixels, None))
+                                library::decode_thumbnail(image).map(|pixels| Thumbnail {
+                                    pixels,
+                                    written: None,
+                                    fallback: None,
+                                })
                             })
                     } else {
                         make_thumbnail(&dir, &job, &worker_limit)
@@ -155,7 +294,7 @@ fn make_thumbnail(
     dir: &Path,
     job: &Job,
     limit: &std::sync::atomic::AtomicU64,
-) -> Result<(egui::ColorImage, Option<String>), String> {
+) -> Result<Thumbnail, String> {
     let mut error = String::from("No thumbnail");
     if let Some((image, key)) = &job.source {
         // Another window may already have written it.
@@ -171,12 +310,22 @@ fn make_thumbnail(
                     limit.load(std::sync::atomic::Ordering::Relaxed)
                 })
             }) {
-            Ok((pixels, stored)) => return Ok((pixels, stored.then(|| key.clone()))),
+            Ok((pixels, stored)) => {
+                return Ok(Thumbnail {
+                    pixels,
+                    written: stored.then(|| key.clone()),
+                    fallback: None,
+                });
+            }
             Err(e) => error = e,
         }
     }
     match &job.fallback {
-        Some(key) => library::load_thumbnail(dir, key).map(|pixels| (pixels, None)),
+        Some(key) => library::load_thumbnail(dir, key).map(|pixels| Thumbnail {
+            pixels,
+            written: None,
+            fallback: Some(key.clone()),
+        }),
         None => Err(error),
     }
 }
@@ -261,7 +410,11 @@ mod cache_disabled_tests {
             drop(lock);
             let worker = app.library.thumbnails.worker.as_ref().unwrap();
             for _ in 0..2 {
-                let (pixels, stored) = worker
+                let Thumbnail {
+                    pixels,
+                    written: stored,
+                    ..
+                } = worker
                     .done
                     .recv_timeout(Duration::from_secs(10))
                     .unwrap()
@@ -280,7 +433,9 @@ mod cache_disabled_tests {
                 u64::from(app.settings.disk_cache_mb) * 1_048_576,
             );
             worker.jobs.send(job()).unwrap();
-            let (_, stored) = worker
+            let Thumbnail {
+                written: stored, ..
+            } = worker
                 .done
                 .recv_timeout(Duration::from_secs(10))
                 .unwrap()
@@ -330,7 +485,11 @@ mod cache_disabled_tests {
                 })
                 .unwrap();
             let done = worker.done.recv_timeout(Duration::from_secs(10)).unwrap();
-            let (pixels, stored) = done.result.unwrap();
+            let Thumbnail {
+                pixels,
+                written: stored,
+                ..
+            } = done.result.unwrap();
             assert_eq!(pixels.size, [1, 1]);
             assert_eq!(pixels.pixels[0].a(), 128);
             assert!(stored.is_none());
@@ -363,11 +522,11 @@ impl Viewer {
             Ok(entries) => self.library.items = entries.into_iter().map(Item::new).collect(),
             Err(error) => self.last_error = error,
         }
+        self.library.retain_current_thumbnails();
         self.library.prefer_bookmarks_if_recent_empty();
-        // Thumbnails go once no entry uses them.
-        if let Err(error) = store.prune_thumbnails(THUMBNAIL_GRACE) {
-            self.last_error = error;
-        }
+        self.prefill.dirty = true;
+        // Unused thumbnails stay: the viewer's strip shares this store, and
+        // the disk cache limit removes the least recently used ones.
     }
 
     /// Saves the page shown in this window's folder for its recent entry, so the
@@ -395,6 +554,9 @@ impl Viewer {
     }
 
     pub(super) fn library_window(&mut self, ctx: &egui::Context) {
+        if self.library_opening_preview_window(ctx) {
+            return;
+        }
         if !self.library.open {
             return;
         }
@@ -527,17 +689,26 @@ impl Viewer {
                     .map(|_| entry.image.clone().unwrap_or_else(|| entry.folder.clone()))
             });
             if let Some(target) = target {
+                #[cfg(any(target_os = "ios", test))]
+                let preview = {
+                    #[cfg(target_os = "ios")]
+                    let status = Some(crate::platform::mobile::photo_status());
+                    #[cfg(all(test, not(target_os = "ios")))]
+                    let status = self.library.preview_test_status;
+                    status.and_then(|status| self.library_preview_for_open(index, &target, status))
+                };
                 // Open a concrete image, so the folder starts at its saved page
                 // in this window, a new window or on a phone alike.
-                if self.open_from_user(target) {
-                    #[cfg(not(target_os = "ios"))]
-                    {
-                        self.library.open = false;
-                    }
-                    #[cfg(target_os = "ios")]
-                    {
-                        self.library.open = self.ios_access.dialog.is_some();
-                    }
+                let accepted = self.open_from_user(target);
+                #[cfg(any(target_os = "ios", test))]
+                if accepted && self.library.open && self.ios_access.dialog.is_none() {
+                    self.start_library_preview(preview, ctx);
+                }
+                if accepted && !crate::app::is_mobile() {
+                    // Desktop may open another window. Mobile opens here and
+                    // reset_view() closes the library once the result is ready;
+                    // closing it at native request acceptance flashes the empty menu.
+                    self.library.open = false;
                 }
             } else if entry.kind == Kind::Recent {
                 // Access or folder contents may have changed since opening the list.
@@ -616,9 +787,6 @@ impl Viewer {
                 if kind == Kind::Recent && self.library.remember.as_ref() == Some(&folder) {
                     self.library.remember = None;
                 }
-                if let Err(error) = store.prune_thumbnails(THUMBNAIL_GRACE) {
-                    self.last_error = error;
-                }
             }
             Err(error) => self.last_error = error,
         }
@@ -626,16 +794,29 @@ impl Viewer {
 
     /// Loads or creates thumbnails for rows shown this frame.
     fn request_thumbnails(&mut self, ctx: &egui::Context, visible: &[usize]) {
+        if self.cache_budget() == 0 {
+            return;
+        }
         let mut jobs = Vec::new();
         let thumbnails = &mut self.library.thumbnails;
+        let mut visible_keys = HashSet::new();
         for &index in visible {
             let item = &self.library.items[index];
             let Some(shown) = item.shown() else {
                 continue;
             };
+            if !visible_keys.insert(shown.to_owned()) {
+                continue;
+            }
             if let Some((_, used)) = thumbnails.textures.get_mut(shown) {
                 *used = self.frame;
                 continue;
+            }
+            if let Some(fallback) = &item.entry.thumbnail
+                && let Some((_, used)) = thumbnails.textures.get_mut(fallback)
+            {
+                *used = self.frame;
+                visible_keys.insert(fallback.clone());
             }
             if thumbnails.requested.contains(shown) || thumbnails.failed.contains(shown) {
                 continue;
@@ -655,25 +836,48 @@ impl Viewer {
                 owner: (item.entry.kind, item.entry.folder.clone()),
             });
         }
+        if jobs.is_empty() {
+            return;
+        }
+        let mut reserved = thumbnails
+            .requested
+            .iter()
+            .map(|key| {
+                thumbnails
+                    .required_bytes
+                    .get(key)
+                    .copied()
+                    .unwrap_or(THUMBNAIL_RESERVATION)
+            })
+            .fold(0usize, usize::saturating_add);
         for mut job in jobs {
+            let needed = self
+                .library
+                .thumbnails
+                .required_bytes
+                .get(&job.shown)
+                .copied()
+                .unwrap_or(THUMBNAIL_RESERVATION);
+            let total = reserved.saturating_add(needed);
+            let excess = self
+                .cache_bytes()
+                .saturating_add(total)
+                .saturating_sub(self.cache_budget());
+            if excess > 0 {
+                self.library
+                    .trim_thumbnails_except(excess, Some(&visible_keys));
+            }
+            if self.cache_bytes().saturating_add(total) > self.cache_budget() {
+                self.trim_cache_for_library(total);
+            }
+            if self.cache_bytes().saturating_add(total) > self.cache_budget() {
+                continue;
+            }
+            reserved = total;
             self.use_extracted_page(&mut job);
             self.queue_thumbnail(ctx, job);
         }
-        let thumbnails = &mut self.library.thumbnails;
-        if thumbnails.textures.len() > TEXTURE_LIMIT {
-            let mut used: Vec<_> = thumbnails
-                .textures
-                .iter()
-                .map(|(key, (_, frame))| (*frame, key.clone()))
-                .collect();
-            used.sort_unstable();
-            for (_, key) in used
-                .into_iter()
-                .take(thumbnails.textures.len() - TEXTURE_LIMIT)
-            {
-                thumbnails.textures.remove(&key);
-            }
-        }
+        self.library.trim_thumbnails(0);
     }
 
     /// Reads a page of the archive open in this window from its extracted
@@ -718,6 +922,10 @@ impl Viewer {
 
     /// Shows finished thumbnails and records the files that were written.
     pub(super) fn poll_library_thumbnails(&mut self, ctx: &egui::Context) {
+        if self.cache_budget() == 0 {
+            self.library.clear_thumbnails();
+            return;
+        }
         let Some(worker) = &mut self.library.thumbnails.worker else {
             return;
         };
@@ -727,24 +935,47 @@ impl Viewer {
             finished.push(done);
         }
         let idle = worker.pending == 0;
+        let received = !finished.is_empty();
         for done in finished {
+            let available = self.cache_budget().saturating_sub(self.cache_bytes());
             let thumbnails = &mut self.library.thumbnails;
             thumbnails.requested.remove(&done.shown);
-            let (pixels, written) = match done.result {
+            let Thumbnail {
+                pixels,
+                written,
+                fallback,
+            } = match done.result {
                 Ok(result) => result,
                 Err(_) => {
                     thumbnails.failed.insert(done.shown);
                     continue;
                 }
             };
-            let texture = ctx.load_texture(
-                format!("library-thumbnail-{}", done.shown),
-                pixels,
-                egui::TextureOptions::LINEAR,
-            );
-            thumbnails
-                .textures
-                .insert(done.shown, (texture, self.frame));
+            let shown = fallback.as_ref().unwrap_or(&done.shown).clone();
+            let needed = pixels.pixels.len().saturating_mul(4);
+            let displayed = if thumbnails.textures.contains_key(&shown) {
+                thumbnails.required_bytes.remove(&done.shown);
+                true
+            } else if needed <= available {
+                let texture = ctx.load_texture(
+                    format!("library-thumbnail-{shown}"),
+                    pixels,
+                    egui::TextureOptions::LINEAR,
+                );
+                thumbnails.required_bytes.remove(&done.shown);
+                thumbnails.textures.insert(shown, (texture, self.frame));
+                true
+            } else {
+                // Do not upload then immediately evict the same pixels on every
+                // frame when the current image already occupies the budget.
+                thumbnails.required_bytes.insert(done.shown.clone(), needed);
+                false
+            };
+            if fallback.is_some() && displayed {
+                thumbnails.failed.insert(done.shown);
+            } else if fallback.is_none() {
+                thumbnails.failed.remove(&done.shown);
+            }
             let Some(key) = written else {
                 continue;
             };
@@ -768,9 +999,16 @@ impl Viewer {
                 self.last_error = error;
             }
         }
-        // Free the thread and the textures once nothing shows or waits for them.
+        // Release the idle thread, but retain a bounded set of textures so the
+        // next recent/bookmark visit can paint them in its first frame.
         if idle && !self.library.open && self.library.dialog.is_none() {
-            self.library.thumbnails = Thumbnails::default();
+            self.library.thumbnails.worker = None;
+            self.library.thumbnails.requested.clear();
+            self.library.thumbnails.failed.clear();
+        }
+        if received {
+            self.library.trim_thumbnails(0);
+            self.trim_cache(0);
         }
     }
 
@@ -828,10 +1066,7 @@ impl Viewer {
             folder: item.entry.folder.clone(),
             image: item.entry.image.clone().unwrap_or_default(),
             name: item.entry.title(),
-            preview: item
-                .shown()
-                .and_then(|key| self.library.thumbnails.textures.get(key))
-                .map(|(texture, _)| texture.clone()),
+            preview: self.library.thumbnail(item).cloned(),
             rename: true,
             replaces: false,
             focus: true,
@@ -1006,10 +1241,7 @@ fn entry_list(ui: &mut egui::Ui, library: &Library, kind: Kind) -> ListResponse 
                     continue;
                 }
                 empty = false;
-                let texture = item
-                    .shown()
-                    .and_then(|key| library.thumbnails.textures.get(key))
-                    .map(|(texture, _)| texture);
+                let texture = library.thumbnail(item);
                 let row = entry_row(ui, &item.entry, texture);
                 if row.visible {
                     response.visible.push(index);

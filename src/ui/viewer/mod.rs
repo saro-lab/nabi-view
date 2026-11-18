@@ -1,4 +1,6 @@
 mod actions;
+#[cfg(any(target_os = "android", test))]
+mod android_sources;
 mod animation;
 mod archive;
 #[cfg(test)]
@@ -8,6 +10,8 @@ mod checked_files;
 mod chrome;
 mod chrome_icons;
 mod details;
+#[cfg(test)]
+mod fit_limit_tests;
 mod forms;
 mod image_pipeline;
 mod image_transform;
@@ -18,12 +22,17 @@ mod library;
 mod menu;
 mod metadata;
 mod mobile_chrome;
+mod mobile_home;
 #[cfg(any(target_os = "ios", target_os = "android", test))]
 mod mobile_sources;
 mod mobile_swipe;
 mod move_files;
 mod navigation;
 mod overlay;
+mod prefill;
+mod prewarm;
+#[cfg(test)]
+mod prewarm_tests;
 mod rename_files;
 mod settings;
 mod sorting;
@@ -58,8 +67,13 @@ const ZOOM_PERCENT: std::ops::RangeInclusive<f32> = 20. ..=3000.;
 const ZOOM_STEP: f32 = 1.25;
 /// Longest side decoded for a page; larger images show a reduced preview.
 const MAX_DECODE_SIDE: u32 = 4096;
+/// Prefetched textures above this many pixels upload one per frame.
+const LARGE_UPLOAD_PIXELS: usize = 4_000_000;
+/// Prefetched frames kept while uploads are deferred.
+const HELD_PREFETCH: usize = 2;
 /// Longest side decoded for the thumbnail strip.
-const THUMBNAIL_DECODE_SIDE: u32 = 192;
+/// The library list uses the same size and disk store, so each page decodes once.
+const THUMBNAIL_DECODE_SIDE: u32 = crate::core::library::THUMBNAIL_EDGE;
 /// Page steps typed while a folder is still loading; later ones are dropped.
 const MAX_PENDING_STEPS: usize = i16::MAX as usize;
 const TOP_BAR_HEIGHT: f32 = 47.;
@@ -305,6 +319,17 @@ pub struct Viewer {
     prefetch_ticket: Option<Ticket>,
     prefetch_blocked: HashSet<PathBuf>,
     prefetch_settings: (usize, u32, u32),
+    prefetch_urgency: media::Urgency,
+    /// Pages whose display entry a disk-only prefetch confirmed on disk.
+    disk_warmed: HashSet<PathBuf>,
+    /// Bookmarks and recent folders prepared on disk while idle.
+    prefill: prefill::Prefill,
+    /// Prefetched frames waiting for the upload policy (M7).
+    held_prefetch: std::collections::VecDeque<(u64, PathBuf, media::Frame, u32)>,
+    /// Large prefetched textures uploaded during this frame.
+    large_uploads: usize,
+    /// Reading direction from the last short step; a jump resets it to forward.
+    backward: bool,
     memory_monitor: crate::core::cache::Monitor,
     memory_policy: crate::core::cache::Policy,
     pictures: HashMap<PathBuf, Picture>,
@@ -321,6 +346,7 @@ pub struct Viewer {
     transition_waiting: bool,
     pending_steps: Vec<(bool, NavigationStep)>,
     thumb_ticket: Option<(u64, PathBuf)>,
+    thumb_urgency: media::Urgency,
     thumbs: HashMap<PathBuf, egui::TextureHandle>,
     app_icon: egui::TextureHandle,
     thumb_errors: HashSet<PathBuf>,
@@ -366,6 +392,8 @@ pub struct Viewer {
     mobile_swipe: Option<mobile_swipe::Swipe>,
     #[cfg(any(target_os = "ios", target_os = "android", test))]
     mobile_selection: Option<crate::core::documents::ImportBatch>,
+    #[cfg(test)]
+    deferred_mobile_open_requests: Option<Vec<PathBuf>>,
     #[cfg(any(target_os = "ios", test))]
     ios_access: ios_access::AccessUi,
     window_size_state: window_frame::WindowSizeState,
@@ -382,7 +410,28 @@ impl Viewer {
 
     /// Runtime visibility/execution only; saved shortcuts keep static support.
     fn command_available(&self, id: &str) -> bool {
-        command_supported(id)
+        !self.library.opening_preview_active()
+            && !(self.source_list_pending()
+                && matches!(
+                    id,
+                    "prev"
+                        | "next"
+                        | "page-prev"
+                        | "page-next"
+                        | "first"
+                        | "last"
+                        | "random"
+                        | "slideshow"
+                        | "check"
+                        | "check-prev"
+                        | "check-next"
+                        | "move"
+                        | "trash"
+                        | "undo-trash"
+                        | "normalize-names"
+                        | "bookmark"
+                ))
+            && command_supported(id)
             && (!matches!(
                 id,
                 "orientation"
@@ -473,6 +522,12 @@ impl Viewer {
             prefetch_ticket: None,
             prefetch_blocked: HashSet::new(),
             prefetch_settings: (0, 0, 0),
+            prefetch_urgency: media::Urgency::default(),
+            disk_warmed: HashSet::new(),
+            prefill: Default::default(),
+            held_prefetch: Default::default(),
+            large_uploads: 0,
+            backward: false,
             memory_monitor: crate::core::cache::Monitor::new(ctx.clone()),
             memory_policy: crate::core::cache::Policy::default(),
             pictures: HashMap::new(),
@@ -485,6 +540,7 @@ impl Viewer {
             transition_waiting: false,
             pending_steps: Vec::new(),
             thumb_ticket: None,
+            thumb_urgency: media::Urgency::default(),
             thumbs: HashMap::new(),
             thumb_errors: HashSet::new(),
             failures: HashMap::new(),
@@ -527,6 +583,8 @@ impl Viewer {
             mobile_swipe: None,
             #[cfg(any(target_os = "ios", target_os = "android", test))]
             mobile_selection: None,
+            #[cfg(test)]
+            deferred_mobile_open_requests: None,
             #[cfg(any(target_os = "ios", test))]
             ios_access: Default::default(),
             window_size_state: window_frame::WindowSizeState::default(),
@@ -557,6 +615,11 @@ impl Viewer {
             }
         }
         app.sync_disk_cache();
+        // eframe supplies the native window size before its first UI pass;
+        // Context::viewport_rect() still has a placeholder size at this point.
+        if let Some(screen) = ctx.input(|input| input.viewport().inner_rect) {
+            app.update_fit_limit(screen, ctx.pixels_per_point());
+        }
         #[cfg(all(target_os = "macos", not(test)))]
         if let Some(store) = &app.store {
             if let Err(error) = crate::platform::mac_access::configure(store.state_directory()) {
@@ -648,10 +711,14 @@ impl Viewer {
         self.menu_visible() || self.library.modal() || self.dialog_open() || self.random_prompt
     }
 
-    /// The phone's back gesture closes the topmost layer. Returns false when
-    /// nothing is open, so the platform host can leave the app.
+    /// Close transient layers first, then return the photo viewer to its start
+    /// destination. Back from home lets the platform leave the app.
     #[cfg(any(target_os = "ios", target_os = "android", test))]
     fn handle_back(&mut self, ctx: &egui::Context) -> bool {
+        if self.mobile_import_loading() || self.library.opening_preview_active() {
+            self.open_mobile_home(ctx);
+            return true;
+        }
         #[cfg(any(target_os = "ios", test))]
         if self.ios_access.dialog.is_some() {
             self.ios_access = Default::default();
@@ -673,7 +740,7 @@ impl Viewer {
             self.library.clear_prompt = false;
         } else if self.library.dialog.is_some() {
             self.library.dialog = None;
-        } else if self.archives.prompt.is_some() {
+        } else if self.archives.password_prompt_open() {
             self.leave_archive();
         } else if self.rename_dialog.is_some() {
             if self.file_job.is_none() {
@@ -690,13 +757,9 @@ impl Viewer {
             self.settings_open = false;
             self.close_shortcut_editing();
         } else if self.library.open {
-            self.library.open = false;
-        } else if self.inspector.open {
-            self.inspector.close();
-        } else if self.fullscreen {
-            self.fullscreen = false;
-        } else {
             return false;
+        } else {
+            self.open_mobile_home(ctx);
         }
         // A closed dialog must not keep the on-screen keyboard up.
         ctx.memory_mut(|m| {
@@ -831,6 +894,9 @@ impl eframe::App for Viewer {
         if self.close_request_accepted {
             return;
         }
+        // Native results and dropped files can queue a visible image below,
+        // before canvas() paints anything (or while the viewer is still empty).
+        self.update_fit_limit(root.available_rect_before_wrap(), ctx.pixels_per_point());
         if let Some(state) = &self.render_state {
             crate::ui::hdr::configure_display(state);
             if state.target_format == eframe::wgpu::TextureFormat::Rgba16Float {
@@ -864,11 +930,19 @@ impl eframe::App for Viewer {
         self.frame += 1;
         #[cfg(target_os = "ios")]
         self.poll_ios_access();
+        #[cfg(target_os = "android")]
+        self.poll_android_reuse();
+        #[cfg(target_os = "ios")]
+        if let Some(error) = crate::platform::mobile::take_share_error() {
+            self.last_error = crate::i18n::tr(&error).into();
+        }
         #[cfg(any(target_os = "ios", target_os = "android"))]
         if crate::platform::mobile::take_back() && !self.handle_back(ctx) {
             #[cfg(target_os = "android")]
             crate::platform::mobile::exit();
         }
+        #[cfg(target_os = "ios")]
+        self.poll_mobile_seed();
         #[cfg(any(target_os = "ios", target_os = "android"))]
         if let Some(result) = crate::platform::mobile::take_result() {
             #[cfg(target_os = "ios")]
@@ -879,12 +953,20 @@ impl eframe::App for Viewer {
                     {
                         self.ios_access.dialog = None;
                     }
+                    #[cfg(target_os = "ios")]
+                    self.accept_ios_selection(
+                        selection,
+                        completion,
+                        crate::platform::mobile::photo_status(),
+                        crate::platform::mobile::access_revision(),
+                    );
+                    #[cfg(not(target_os = "ios"))]
                     self.accept_mobile_selection(selection);
                 }
                 Err(error) => {
                     #[cfg(target_os = "ios")]
                     {
-                        let (source, issue) = completion.unwrap_or_default();
+                        let (source, issue, _) = completion.unwrap_or_default();
                         self.ios_import_error(source, issue, &error);
                     }
                     #[cfg(not(target_os = "ios"))]
@@ -997,6 +1079,12 @@ impl eframe::App for Viewer {
         self.poll_archive(ctx);
         self.collect(ctx);
         self.poll_reveal();
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        if self.mobile_import_loading() {
+            self.release_held_input();
+            self.draw_mobile_import_loading(root);
+            return;
+        }
         self.keyboard(ctx);
         self.library_mouse(ctx);
         self.advance_slideshow(ctx);
@@ -1032,6 +1120,7 @@ impl eframe::App for Viewer {
             self.thumb_ticket = None;
         }
         self.queue_prefetch();
+        self.run_prefill(ctx);
         if self.library.remember.is_some() && !self.pictures.is_empty() {
             ctx.request_repaint();
         }

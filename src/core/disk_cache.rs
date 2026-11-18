@@ -3,18 +3,34 @@
 use eframe::egui;
 use image::{ImageDecoder, ImageEncoder};
 use std::{
+    collections::HashMap,
     fs::{self, File},
-    io::{self, BufReader, Read, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const MAGIC: &[u8; 8] = b"NABIC001";
+/// Display entries: a 24-byte header followed by a QOI image (lossless RGBA).
+const MAGIC: &[u8; 8] = b"NABIC002";
 const MAX_PIXELS: u64 = 6 * 1024 * 1024;
 const MAX_FILE: u64 = 32 * 1024 * 1024;
-const KEY_VERSION: &[u8] = b"display-rgba-v2-color-managed";
+const KEY_VERSION: &[u8] = b"display-rgba-v4-qoi";
+/// Re-list the directories after this many writes even when the running total
+/// stays under the limit, so other processes' writes cannot drift unnoticed.
+const RESCAN_WRITES: u32 = 64;
 
-#[derive(Clone)]
+/// Running size estimate per cache root, shared by every `Cache` value in this
+/// process. A missing root means unknown: the next write lists the directories.
+static USAGE: Mutex<Option<HashMap<PathBuf, Usage>>> = Mutex::new(None);
+
+#[derive(Clone, Copy)]
+struct Usage {
+    bytes: u64,
+    writes: u32,
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Cache {
     root: PathBuf,
     limit: u64,
@@ -26,12 +42,38 @@ struct Stamp {
     modified: SystemTime,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SourceIdentity {
+    File(Stamp),
+    /// An extracted archive page: archive path and inner path, with the
+    /// archive's stamp. A new extraction folder keeps the same key.
+    Archive {
+        archive: PathBuf,
+        inner: PathBuf,
+        stamp: Stamp,
+    },
+    #[cfg(any(target_os = "ios", target_os = "android", test))]
+    Provider(crate::core::documents::ProviderIdentity),
+}
+
 /// Source identity captured before decoding, invalidated by edits and clear-all.
 pub(crate) struct Key {
     name: String,
     source: PathBuf,
-    stamp: Stamp,
+    identity: SourceIdentity,
     generation: u64,
+}
+
+impl Key {
+    /// Whether two keys name the same cache entry (for de-duplicating writes).
+    pub(crate) fn same_entry(&self, other: &Key) -> bool {
+        self.name == other.name && self.generation == other.generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 pub(crate) struct CachedImage {
@@ -59,30 +101,62 @@ impl Cache {
         &self.root
     }
 
+    /// Lock-free: entries are published by atomic rename and checked against
+    /// the clear generation, so readers never wait for writers or pruning.
     pub fn key(&self, source: &Path, max_side: u32) -> Option<Key> {
+        self.make_key(source, max_side, KEY_VERSION)
+    }
+
+    /// Provider-rendered small images must never satisfy a full display request,
+    /// even when both happen to ask for the same number of pixels.
+    #[cfg(any(target_os = "ios", target_os = "android", test))]
+    pub fn provider_thumbnail_key(&self, source: &Path, max_side: u32) -> Option<Key> {
+        self.make_key(source, max_side, b"provider-thumbnail-srgba-v1")
+    }
+
+    fn make_key(&self, source: &Path, max_side: u32, version: &[u8]) -> Option<Key> {
         if self.limit == 0 {
             return None;
         }
         let source = crate::core::paths::canonicalize(source).ok()?;
-        let stamp = stamp(&source)?;
-        let mut bytes = source.as_os_str().as_encoded_bytes().to_vec();
-        bytes.extend(stamp.size.to_le_bytes());
+        let identity = source_identity(&source)?;
+        let (mut bytes, modified) = match &identity {
+            SourceIdentity::File(stamp) => {
+                let mut bytes = source.as_os_str().as_encoded_bytes().to_vec();
+                bytes.extend(stamp.size.to_le_bytes());
+                (bytes, stamp.modified)
+            }
+            SourceIdentity::Archive {
+                archive,
+                inner,
+                stamp,
+            } => {
+                let mut bytes = b"archive-page-v1".to_vec();
+                for part in [archive.as_os_str(), inner.as_os_str()] {
+                    let part = part.as_encoded_bytes();
+                    bytes.extend((part.len() as u64).to_le_bytes());
+                    bytes.extend(part);
+                }
+                bytes.extend(stamp.size.to_le_bytes());
+                (bytes, stamp.modified)
+            }
+            #[cfg(any(target_os = "ios", target_os = "android", test))]
+            SourceIdentity::Provider(provider) => (provider.bytes.clone(), provider.modified),
+        };
         bytes.extend(
-            stamp
-                .modified
+            modified
                 .duration_since(UNIX_EPOCH)
                 .ok()?
                 .as_nanos()
                 .to_le_bytes(),
         );
         bytes.extend(max_side.to_le_bytes());
-        bytes.extend(KEY_VERSION);
+        bytes.extend(version);
         let hash = |basis: u64| {
             bytes.iter().fold(basis, |hash, &byte| {
                 (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
             })
         };
-        let _lock = self.lock().ok()?;
         Some(Key {
             name: format!(
                 "{:016x}{:016x}",
@@ -90,26 +164,42 @@ impl Cache {
                 hash(0x6c62_272e_07bb_0142)
             ),
             source,
-            stamp,
+            identity,
             generation: self.generation(),
         })
     }
 
-    /// Corrupt, stale and unsupported entries are ordinary misses.
+    /// Whether a current entry exists, without reading its pixels.
+    pub fn contains(&self, key: &Key) -> bool {
+        self.limit != 0 && self.current(key) && self.path(key).is_file()
+    }
+
+    /// Corrupt, stale and unsupported entries are ordinary misses. Lock-free:
+    /// a concurrent clear is caught by the generation check after reading.
     pub fn load(&self, key: &Key) -> Option<CachedImage> {
-        let _lock = self.lock().ok()?;
-        if key.generation != self.generation() || stamp(&key.source).as_ref() != Some(&key.stamp) {
+        if self.limit == 0 || !self.current(key) {
             return None;
         }
         let path = self.path(key);
-        let image = read_image(&path);
-        match image {
+        match read_image(&path) {
             Ok(image) => {
+                // Clear-all, permission or content revision may change while
+                // decoding the entry.
+                if !self.current(key) {
+                    return None;
+                }
                 let _ = touch(&path);
                 Some(image)
             }
-            Err(_) => {
-                let _ = fs::remove_file(path);
+            Err(error) => {
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+                ) {
+                    // Entries are published by atomic rename, so this is
+                    // truly corrupt rather than a write in progress.
+                    let _ = fs::remove_file(path);
+                }
                 None
             }
         }
@@ -138,7 +228,7 @@ impl Cache {
             rgba.extend(pixel.to_srgba_unmultiplied());
         }
         let mut encoded = Vec::new();
-        image::codecs::png::PngEncoder::new(&mut encoded)
+        image::codecs::qoi::QoiEncoder::new(&mut encoded)
             .write_image(
                 &rgba,
                 width as u32,
@@ -150,11 +240,13 @@ impl Cache {
             return Ok(());
         }
         let _lock = self.lock()?;
-        if key.generation != self.generation() || stamp(&key.source).as_ref() != Some(&key.stamp) {
+        if !self.current(key) {
             return Ok(());
         }
         let directory = self.root.join("display");
         fs::create_dir_all(&directory)?;
+        let target = self.path(key);
+        let replaced = fs::metadata(&target).map_or(0, |meta| meta.len());
         let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
         temporary.write_all(MAGIC)?;
         for value in [
@@ -166,10 +258,13 @@ impl Cache {
             temporary.write_all(&value.to_le_bytes())?;
         }
         temporary.write_all(&encoded)?;
-        temporary
-            .persist(self.path(key))
-            .map_err(|error| error.error)?;
-        self.prune_locked()
+        temporary.persist(&target).map_err(|error| error.error)?;
+        self.after_write_locked(24 + encoded.len() as u64, replaced)
+    }
+
+    fn current(&self, key: &Key) -> bool {
+        key.generation == self.generation()
+            && source_identity(&key.source).as_ref() == Some(&key.identity)
     }
 
     /// Capture before thumbnail decoding, so clear-all also invalidates work
@@ -177,6 +272,32 @@ impl Cache {
     pub fn thumbnail_generation(&self) -> io::Result<u64> {
         let _lock = self.lock()?;
         Ok(self.generation())
+    }
+
+    /// Lock-free generation for decoders; `store_thumbnail` re-checks it
+    /// under the lock, so a clear during decoding still discards the result.
+    pub fn current_generation(&self) -> u64 {
+        self.generation()
+    }
+
+    /// The library thumbnail store, shared by the viewer's strip.
+    pub fn thumbnail_dir(&self) -> PathBuf {
+        self.root.join("thumbnails")
+    }
+
+    pub fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    /// This process's running size estimate; None until a write or a prune
+    /// has listed the directories.
+    pub fn estimated_bytes(&self) -> Option<u64> {
+        USAGE
+            .lock()
+            .unwrap()
+            .as_ref()?
+            .get(&self.root)
+            .map(|usage| usage.bytes)
     }
 
     /// Publish a thumbnail only while its generation and current policy allow
@@ -198,12 +319,12 @@ impl Cache {
         }
         let directory = self.root.join("thumbnails");
         fs::create_dir_all(&directory)?;
+        let target = crate::core::library::thumbnail_file(&directory, key);
+        let replaced = fs::metadata(&target).map_or(0, |meta| meta.len());
         let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
         temporary.write_all(png)?;
-        temporary
-            .persist(crate::core::library::thumbnail_file(&directory, key))
-            .map_err(|error| error.error)?;
-        Self::new(self.root.clone(), limit).prune_locked()?;
+        temporary.persist(&target).map_err(|error| error.error)?;
+        Self::new(self.root.clone(), limit).after_write_locked(png.len() as u64, replaced)?;
         Ok(true)
     }
 
@@ -233,9 +354,11 @@ impl Cache {
         temporary
             .persist(self.root.join("generation"))
             .map_err(|error| error.error)?;
+        self.set_usage(None);
         for entry in self.entries()? {
             fs::remove_file(entry.path)?;
         }
+        self.set_usage(Some(0));
         Ok(())
     }
 
@@ -251,16 +374,54 @@ impl Cache {
             .unwrap_or(0)
     }
 
-    fn lock(&self) -> io::Result<File> {
+    fn lock_file(&self) -> io::Result<File> {
         fs::create_dir_all(&self.root)?;
-        let file = File::options()
+        File::options()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(self.root.join("cache.lock"))?;
+            .open(self.root.join("cache.lock"))
+    }
+
+    fn lock(&self) -> io::Result<File> {
+        let file = self.lock_file()?;
         file.lock()?;
         Ok(file)
+    }
+
+    /// Updates the running size after a write (lock held). The directories
+    /// are listed only when the estimate is unknown, over the limit, or stale.
+    fn after_write_locked(&self, added: u64, replaced: u64) -> io::Result<()> {
+        let needs_scan = {
+            let mut usage = USAGE.lock().unwrap();
+            match usage.get_or_insert_with(HashMap::new).get_mut(&self.root) {
+                Some(entry) => {
+                    entry.bytes = entry.bytes.saturating_sub(replaced).saturating_add(added);
+                    entry.writes += 1;
+                    entry.bytes > self.limit || entry.writes >= RESCAN_WRITES
+                }
+                None => true,
+            }
+        };
+        if needs_scan {
+            self.prune_locked()
+        } else {
+            Ok(())
+        }
+    }
+
+    fn set_usage(&self, bytes: Option<u64>) {
+        let mut usage = USAGE.lock().unwrap();
+        let map = usage.get_or_insert_with(HashMap::new);
+        match bytes {
+            Some(bytes) => {
+                map.insert(self.root.clone(), Usage { bytes, writes: 0 });
+            }
+            None => {
+                map.remove(&self.root);
+            }
+        }
     }
 
     fn entries(&self) -> io::Result<Vec<Entry>> {
@@ -307,9 +468,13 @@ impl Cache {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     bytes = bytes.saturating_sub(entry.bytes)
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    self.set_usage(None);
+                    return Err(error);
+                }
             }
         }
+        self.set_usage(Some(bytes));
         Ok(())
     }
 }
@@ -335,6 +500,21 @@ fn stamp(path: &Path) -> Option<Stamp> {
         modified: metadata.modified().ok()?,
     })
 }
+
+fn source_identity(path: &Path) -> Option<SourceIdentity> {
+    #[cfg(any(target_os = "ios", target_os = "android", test))]
+    if let Some(provider) = crate::core::documents::provider_cache_identity(path).ok()? {
+        return Some(SourceIdentity::Provider(provider));
+    }
+    if let Some((archive, inner)) = crate::core::archive::page_origin(path) {
+        return stamp(&archive).map(|stamp| SourceIdentity::Archive {
+            archive,
+            inner,
+            stamp,
+        });
+    }
+    stamp(path).map(SourceIdentity::File)
+}
 pub(crate) fn touch(path: &Path) -> io::Result<()> {
     File::options()
         .write(true)
@@ -343,11 +523,16 @@ pub(crate) fn touch(path: &Path) -> io::Result<()> {
 }
 
 fn read_image(path: &Path) -> io::Result<CachedImage> {
-    let file = File::open(path)?;
-    if file.metadata()?.len() > MAX_FILE {
+    let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    if length > MAX_FILE {
         return Err(invalid());
     }
-    let mut input = BufReader::new(file);
+    // One read: the QOI decoder issues many small reads, which a buffered
+    // file serves far more slowly than a slice.
+    let mut bytes = Vec::with_capacity(length as usize);
+    file.read_to_end(&mut bytes)?;
+    let mut input = io::Cursor::new(bytes);
     let mut header = [0; 24];
     input.read_exact(&mut header)?;
     if &header[..8] != MAGIC {
@@ -365,7 +550,7 @@ fn read_image(path: &Path) -> io::Result<CachedImage> {
     {
         return Err(invalid());
     }
-    let mut decoder = image::codecs::png::PngDecoder::new(input).map_err(io::Error::other)?;
+    let mut decoder = image::codecs::qoi::QoiDecoder::new(input).map_err(|_| invalid())?;
     if decoder.dimensions() != (width, height)
         || decoder.total_bytes() != u64::from(width) * u64::from(height) * 4
         || decoder.color_type() != image::ColorType::Rgba8
@@ -374,9 +559,12 @@ fn read_image(path: &Path) -> io::Result<CachedImage> {
     }
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(MAX_PIXELS * 4);
-    decoder.set_limits(limits).map_err(io::Error::other)?;
+    decoder.set_limits(limits).map_err(|_| invalid())?;
     let mut rgba = vec![0; width as usize * height as usize * 4];
-    decoder.read_image(&mut rgba).map_err(io::Error::other)?;
+    decoder.read_image(&mut rgba).map_err(|error| match error {
+        image::ImageError::IoError(error) if error.kind() != io::ErrorKind::UnexpectedEof => error,
+        _ => invalid(),
+    })?;
     Ok(CachedImage {
         image: egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba),
         original_size,
@@ -396,6 +584,56 @@ mod tests {
     fn pixels() -> egui::ColorImage {
         egui::ColorImage::from_rgba_unmultiplied([2, 1], &[200, 90, 10, 128, 0, 0, 0, 0])
     }
+
+    #[test]
+    fn reads_hit_while_a_writer_or_pruner_holds_the_lock() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let (_root, cache, source) = fixture();
+        let key = cache.key(&source, 512).unwrap();
+        cache.store(&key, &pixels(), [20, 10]).unwrap();
+        let held = cache.lock().unwrap();
+        let (send, receive) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            send.send((
+                cache.key(&source, 512).is_some(),
+                cache.load(&key).map(|image| image.original_size),
+            ))
+            .unwrap();
+        });
+        // Release before joining even on failure, so a blocking regression
+        // reports an assertion instead of stranding the test's reader thread.
+        let result = receive.recv_timeout(Duration::from_secs(1));
+        drop(held);
+        reader.join().unwrap();
+        assert_eq!(result, Ok((true, Some([20, 10]))));
+    }
+
+    #[test]
+    fn foreground_cache_reads_preserve_hits_and_invalidation() {
+        let (_root, cache, source) = fixture();
+        let key = cache.key(&source, 512).unwrap();
+        cache.store(&key, &pixels(), [20, 10]).unwrap();
+        let loaded = cache.load(&key).unwrap();
+        assert_eq!(loaded.original_size, [20, 10]);
+        assert_eq!(loaded.image.pixels, pixels().pixels);
+
+        let disabled = Cache::new(cache.root().to_owned(), 0);
+        assert!(disabled.key(&source, 512).is_none());
+        assert!(disabled.load(&key).is_none());
+
+        cache.clear().unwrap();
+        cache.store(&key, &pixels(), [20, 10]).unwrap();
+        assert!(cache.load(&key).is_none());
+        assert_eq!(cache.stats().unwrap().files, 0);
+
+        let current = cache.key(&source, 512).unwrap();
+        cache.store(&current, &pixels(), [20, 10]).unwrap();
+        assert!(cache.load(&current).is_some());
+        fs::write(&source, b"different source").unwrap();
+        assert!(cache.load(&current).is_none());
+    }
+
     #[test]
     fn round_trip_preserves_alpha_dimensions_and_invalidates_source_edits() {
         let (_root, cache, source) = fixture();
@@ -454,6 +692,42 @@ mod tests {
                 .store_thumbnail(current, &key, b"thumbnail", || 1024)
                 .unwrap()
         );
+        assert_eq!(cache.stats().unwrap().files, 1);
+    }
+    #[test]
+    fn running_size_keeps_the_limit_without_listing_every_write() {
+        let root = tempfile::tempdir().unwrap();
+        let image = egui::ColorImage::filled([64, 64], egui::Color32::from_rgb(9, 99, 199));
+        let probe = Cache::new(root.path().join("probe"), 1 << 30);
+        let source = root.path().join("probe.png");
+        fs::write(&source, b"probe").unwrap();
+        probe
+            .store(&probe.key(&source, 1).unwrap(), &image, [64, 64])
+            .unwrap();
+        let entry = probe.stats().unwrap().bytes;
+        // Room for three entries: older ones are evicted as new ones arrive.
+        let cache = Cache::new(root.path().join("cache"), entry * 3 + entry / 2);
+        for index in 0..10 {
+            let source = root.path().join(format!("{index}.png"));
+            fs::write(&source, format!("source {index}")).unwrap();
+            cache
+                .store(&cache.key(&source, 1).unwrap(), &image, [64, 64])
+                .unwrap();
+            let stats = cache.stats().unwrap();
+            assert!(
+                stats.bytes <= cache.limit,
+                "write {index}: {} bytes",
+                stats.bytes
+            );
+        }
+        assert_eq!(cache.stats().unwrap().files, 3);
+        // Clear-all resets the running total as well as the files.
+        cache.clear().unwrap();
+        let source = root.path().join("after.png");
+        fs::write(&source, b"after").unwrap();
+        cache
+            .store(&cache.key(&source, 1).unwrap(), &image, [64, 64])
+            .unwrap();
         assert_eq!(cache.stats().unwrap().files, 1);
     }
     #[test]

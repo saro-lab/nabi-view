@@ -23,9 +23,16 @@ impl Monitor {
         let spawned = std::thread::Builder::new()
             .name("memory-monitor".into())
             .spawn(move || {
+                let mut shown: Option<Option<Snapshot>> = None;
                 loop {
-                    *worker_latest.lock().unwrap() = Some(system_memory::snapshot());
-                    ctx.request_repaint();
+                    let sample = system_memory::snapshot();
+                    *worker_latest.lock().unwrap() = Some(sample);
+                    // Wake an idle window only for a change the policy can act
+                    // on; otherwise the next frame picks the sample up.
+                    if shown.is_none_or(|shown| significant_change(shown, sample)) {
+                        shown = Some(sample);
+                        ctx.request_repaint();
+                    }
                     if receiver.recv_timeout(Duration::from_secs(1))
                         != Err(mpsc::RecvTimeoutError::Timeout)
                     {
@@ -49,6 +56,19 @@ impl Monitor {
             latest: Arc::new(Mutex::new(None)),
             _stop: None,
         }
+    }
+}
+
+/// Available memory moving by less than this does not wake an idle window.
+const REPAINT_STEP: u64 = 32 * MIB as u64;
+
+fn significant_change(shown: Option<Snapshot>, sample: Option<Snapshot>) -> bool {
+    match (shown, sample) {
+        (Some(shown), Some(sample)) => {
+            shown.total != sample.total
+                || shown.available.abs_diff(sample.available) >= REPAINT_STEP
+        }
+        (shown, sample) => shown.is_some() != sample.is_some(),
     }
 }
 
@@ -139,6 +159,16 @@ mod tests {
             total: 16 * 1024 * MIB as u64,
             available: available_mib * MIB as u64,
         })
+    }
+
+    #[test]
+    fn idle_windows_wake_only_for_memory_changes_the_policy_can_act_on() {
+        assert!(!significant_change(memory(4096), memory(4096)));
+        assert!(!significant_change(memory(4096), memory(4096 - 31)));
+        assert!(significant_change(memory(4096), memory(4096 - 32)));
+        assert!(significant_change(memory(4096), None));
+        assert!(significant_change(None, memory(4096)));
+        assert!(!significant_change(None, None));
     }
 
     #[test]

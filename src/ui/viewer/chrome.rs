@@ -43,7 +43,7 @@ impl Viewer {
     ) {
         let response = chrome_icons::tooltip(
             ui.add_enabled(
-                !self.files.is_empty(),
+                !self.files.is_empty() && !self.source_list_pending(),
                 egui::Button::new(if forward { "›" } else { "‹" }),
             ),
             if forward { "next" } else { "previous" },
@@ -110,12 +110,20 @@ impl Viewer {
                             ui.available_size(),
                             crate::ui::direction::flow(),
                             |ui| {
-                                let (brand, _) = ui.allocate_exact_size(
-                                    egui::vec2(24., 24.),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter()
-                                    .image(self.app_icon.id(), brand, uv(), Color32::WHITE);
+                                if mobile {
+                                    self.mobile_home_button(ui);
+                                } else {
+                                    let (brand, _) = ui.allocate_exact_size(
+                                        egui::vec2(24., 24.),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().image(
+                                        self.app_icon.id(),
+                                        brand,
+                                        uv(),
+                                        Color32::WHITE,
+                                    );
+                                }
                                 // Reserve exactly the trailing buttons (pin, menu, settings,
                                 // plus orientation and/or close), which shrink on narrow
                                 // windows, so the last one stays on the right edge.
@@ -438,7 +446,9 @@ impl Viewer {
         let (a, b) = self.focus_span();
         self.navigation_button(ui, ctx, false);
         let count = self.files.len();
-        let pages = if count == 0 {
+        let pages = if self.source_list_pending() {
+            "…".to_string()
+        } else if count == 0 {
             "0 / 0".to_string()
         } else if a == b {
             format!("{} / {}", a + 1, count)
@@ -453,25 +463,33 @@ impl Viewer {
             self.spread_button(ui, ctx);
             ui.separator();
         }
-        if chrome_icons::button_with_shortcut(
-            ui,
-            "random",
-            "random-order",
-            self.random,
-            &self.shortcut_text("random"),
-        )
-        .clicked()
+        if ui
+            .add_enabled_ui(self.command_available("random"), |ui| {
+                chrome_icons::button_with_shortcut(
+                    ui,
+                    "random",
+                    "random-order",
+                    self.random,
+                    &self.shortcut_text("random"),
+                )
+            })
+            .inner
+            .clicked()
         {
             self.run("random", ctx);
         }
-        if chrome_icons::button_with_shortcut(
-            ui,
-            "slideshow",
-            "slideshow",
-            self.slideshow,
-            &self.shortcut_text("slideshow"),
-        )
-        .clicked()
+        if ui
+            .add_enabled_ui(self.command_available("slideshow"), |ui| {
+                chrome_icons::button_with_shortcut(
+                    ui,
+                    "slideshow",
+                    "slideshow",
+                    self.slideshow,
+                    &self.shortcut_text("slideshow"),
+                )
+            })
+            .inner
+            .clicked()
         {
             self.run("slideshow", ctx);
         }
@@ -549,16 +567,19 @@ impl Viewer {
             return;
         }
         let clicked = ui
-            .add_enabled_ui(!self.files.is_empty() && self.file_job.is_none(), |ui| {
-                chrome_icons::button_with_shortcut(
-                    ui,
-                    id,
-                    command_label(id),
-                    false,
-                    &self.shortcut_text(id),
-                )
-                .clicked()
-            })
+            .add_enabled_ui(
+                !self.files.is_empty() && self.file_job.is_none() && self.command_available(id),
+                |ui| {
+                    chrome_icons::button_with_shortcut(
+                        ui,
+                        id,
+                        command_label(id),
+                        false,
+                        &self.shortcut_text(id),
+                    )
+                    .clicked()
+                },
+            )
             .inner;
         if clicked {
             self.run(id, ctx);
@@ -566,6 +587,12 @@ impl Viewer {
     }
 
     pub(super) fn thumbnail_bar(&mut self, ctx: &egui::Context) {
+        if self.source_list_pending() {
+            if self.thumb_ticket.take().is_some() {
+                self.media.clear_thumbnail();
+            }
+            return;
+        }
         let mut wanted = None;
         let mut next_focus = None;
         let (focus_start, focus_end) = self.focus_span();
@@ -667,24 +694,58 @@ impl Viewer {
                 self.toggle_thumbnail_check(ctx, focus_index);
             } else {
                 self.focus_navigation(ctx, focus_index);
+                // `wanted` belongs to the range painted before this navigation.
+                // Let the next frame choose thumbnails for the new page.
+                return;
             }
         }
-        if let Some(path) = wanted {
-            if !self.memory_policy.background_allowed() || self.details.pending() || self.renaming()
+        // A visible missing thumbnail always replaces speculative range work.
+        // Once the strip is ready, fill only the bounded mobile neighborhood.
+        let candidate = wanted
+            .map(|path| (path, media::Urgency::VisibleThumbnail))
+            .or_else(|| {
+                self.warm_thumbnail_candidate()
+                    .map(|path| (path, media::Urgency::RangeThumbnail))
+            });
+        if let Some((path, urgency)) = candidate {
+            #[cfg(any(target_os = "ios", test))]
+            if self.ios_photos_refreshing() {
+                return;
+            }
+            if !self.memory_policy.background_allowed() || self.listing.is_some() || self.renaming()
+            {
+                if self.thumb_ticket.take().is_some() {
+                    self.media.clear_thumbnail();
+                }
+                return;
+            }
+            let interacting = self.touch_gesture.active() || self.mobile_swipe.is_some();
+            // Range work stops for a gesture; the on-screen strip keeps its
+            // request. Otherwise busy foreground work only delays new requests.
+            if interacting
+                && self.thumb_urgency == media::Urgency::RangeThumbnail
+                && self.thumb_ticket.take().is_some()
+            {
+                self.media.clear_thumbnail();
+            }
+            if interacting
+                || self.details.pending()
+                || self.library.thumbnails_pending()
+                || self.current_images_pending()
             {
                 return;
             }
             if self.thumb_ticket.as_ref().is_none_or(|(_, p)| p != &path) {
-                self.cancel_prefetch();
                 let reserved = (THUMBNAIL_DECODE_SIDE * THUMBNAIL_DECODE_SIDE * 4) as usize;
                 self.trim_cache(reserved);
                 if self.cache_bytes().saturating_add(reserved) > self.cache_budget() {
                     return;
                 }
-                let id = self
-                    .media
-                    .request_thumbnail(path.clone(), THUMBNAIL_DECODE_SIDE);
+                let id =
+                    self.media
+                        .request_thumbnail_with(path.clone(), THUMBNAIL_DECODE_SIDE, urgency);
                 self.thumb_ticket = Some((id, path));
+                self.thumb_urgency = urgency;
             }
         }
     }

@@ -3,9 +3,15 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("ios") {
         println!("cargo:rerun-if-changed=src/platform/ios/mobile.m");
         println!("cargo:rerun-if-changed=src/platform/ios/photos.m");
+        println!("cargo:rerun-if-changed=src/platform/ios/photo_snapshot.m");
+        println!("cargo:rerun-if-changed=src/platform/ios/photo_snapshot.h");
+        println!("cargo:rerun-if-changed=src/platform/ios/photo_thumbnails.m");
+        println!("cargo:rerun-if-changed=src/platform/ios/photo_thumbnails.h");
         cc::Build::new()
             .file("src/platform/ios/mobile.m")
             .file("src/platform/ios/photos.m")
+            .file("src/platform/ios/photo_snapshot.m")
+            .file("src/platform/ios/photo_thumbnails.m")
             .file("src/platform/apple/locale.m")
             .flag("-fobjc-arc")
             .compile("nabi_mobile");

@@ -167,6 +167,7 @@ impl Viewer {
                     self.open_from_user(p);
                 }
             }
+            "recent" if crate::app::is_mobile() => self.open_mobile_home(ctx),
             "recent" => {
                 self.library.open = !self.library.open;
                 if self.library.open {

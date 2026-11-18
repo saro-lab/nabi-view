@@ -168,6 +168,13 @@ impl Viewer {
     }
 
     pub(super) fn keyboard(&mut self, ctx: &egui::Context) {
+        if self.library.opening_preview_active() {
+            if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+                self.stop_library_preview();
+            }
+            self.release_held_input();
+            return;
+        }
         let mut events = ctx.input(|i| i.events.clone());
         // Restore shortcut order for the app only, after egui's focus pass.
         for (at, tab) in self.tab_presses.drain(..) {

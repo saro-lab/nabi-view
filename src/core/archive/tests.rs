@@ -12,6 +12,7 @@ fn png(shade: u8) -> Vec<u8> {
 
 enum ZipKey {
     None,
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     Aes(&'static str),
 }
 
@@ -23,6 +24,7 @@ fn write_zip(path: &Path, entries: &[(&str, Vec<u8>)], key: ZipKey) {
             SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
         let options = match key {
             ZipKey::None => options,
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             ZipKey::Aes(password) => options.with_aes_encryption(zip::AesMode::Aes256, password),
         };
         if name.ends_with('/') {
@@ -36,10 +38,13 @@ fn write_zip(path: &Path, entries: &[(&str, Vec<u8>)], key: ZipKey) {
 }
 
 fn write_7z(path: &Path, entries: &[(&str, Vec<u8>)], password: Option<&str>, header: bool) {
-    use sevenz_rust2::{
-        ArchiveEntry, ArchiveWriter, EncoderMethod, encoder_options::AesEncoderOptions,
-    };
+    use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    use sevenz_rust2::{EncoderMethod, encoder_options::AesEncoderOptions};
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    assert!(password.is_none() && !header);
     let mut writer = ArchiveWriter::create(path).unwrap();
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     if let Some(password) = password {
         writer.set_content_methods(vec![
             AesEncoderOptions::new(password.into()).into(),
@@ -168,6 +173,7 @@ fn entry_names_cannot_leave_the_extraction_folder() {
 }
 
 #[test]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 fn encrypted_zips_ask_for_a_password_and_reject_wrong_ones() {
     let root = tempfile::tempdir().unwrap();
     // The writer only makes AES zips; legacy ZipCrypto takes the same path when read.
@@ -207,6 +213,7 @@ fn sevenz_archives_open_with_and_without_passwords() {
     assert_eq!(fs::read(&page.pages[0].file).unwrap(), png(2));
     assert!(extract_page(&plain, Path::new("missing.png")).is_err());
 
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     for header in [false, true] {
         let archive = root.path().join(format!("locked-{header}.7z"));
         write_7z(&archive, &entries, Some("비밀"), header);
@@ -291,4 +298,89 @@ fn archive_sort_keys_use_entry_dates_and_decoded_entry_sizes() {
             .iter()
             .all(|page| page.sort.bytes == payload.len() as u64)
     );
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn apple_refuses_encrypted_zip_and_sevenz_archives() {
+    let root = tempfile::tempdir().unwrap();
+    for (name, bytes) in [
+        ("aes.zip", include_bytes!("fixtures/aes.zip").as_slice()),
+        (
+            "zipcrypto.zip",
+            include_bytes!("fixtures/zipcrypto.zip").as_slice(),
+        ),
+        (
+            "encrypted-data.7z",
+            include_bytes!("fixtures/encrypted-data.7z").as_slice(),
+        ),
+        (
+            "encrypted-header.7z",
+            include_bytes!("fixtures/encrypted-header.7z").as_slice(),
+        ),
+    ] {
+        let path = root.path().join(name);
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            extract(&path, None, &|| true).err(),
+            Some(Error::EncryptedUnsupported),
+            "{name}",
+        );
+        assert_eq!(
+            extract_page(&path, Path::new("1.png")).err(),
+            Some(Error::EncryptedUnsupported),
+            "{name}",
+        );
+    }
+}
+
+#[test]
+fn reextracted_page_keeps_its_display_cache_key() {
+    let dir = tempfile::tempdir_in(crate::test_support::root()).unwrap();
+    let path = dir.path().join("book.zip");
+    write_zip(
+        &path,
+        &[("ch1/001.png", png(10)), ("ch1/002.png", png(20))],
+        ZipKey::None,
+    );
+    let cache = crate::core::disk_cache::Cache::new(dir.path().join("cache"), 8 * 1024 * 1024);
+    let key = |extracted: &Extracted, index: usize| {
+        cache
+            .key(&extracted.pages[index].file, 2048)
+            .unwrap()
+            .name()
+            .to_owned()
+    };
+    let first = extract(&path, None, &|| true).unwrap();
+    let second = extract(&path, None, &|| true).unwrap();
+    assert_ne!(first.pages[0].file, second.pages[0].file);
+    // Each open extracts to a new folder, yet a page keeps its cache entry.
+    assert_eq!(key(&first, 0), key(&second, 0));
+    assert_ne!(key(&first, 0), key(&first, 1));
+    let single = extract_page(&path, Path::new("ch1/001.png")).unwrap();
+    assert_eq!(key(&first, 0), key(&single, 0));
+    assert_eq!(
+        logical_page(&first.pages[0].file),
+        Some(
+            crate::core::paths::canonicalize(&path)
+                .unwrap()
+                .join("ch1/001.png")
+        )
+    );
+    let file = crate::core::paths::canonicalize(&first.pages[0].file).unwrap();
+    drop(first);
+    assert_eq!(page_origin(&file), None, "closing forgets the extraction");
+    // Editing the archive is a different entry.
+    let before = key(&second, 0);
+    write_zip(
+        &path,
+        &[
+            ("ch1/001.png", png(30)),
+            ("ch1/002.png", png(20)),
+            ("x.png", png(1)),
+        ],
+        ZipKey::None,
+    );
+    let edited = extract(&path, None, &|| true).unwrap();
+    assert_ne!(before, key(&edited, 0));
 }

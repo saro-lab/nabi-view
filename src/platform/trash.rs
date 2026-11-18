@@ -768,6 +768,11 @@ mod parking {
             .parent()
             .and_then(crate::core::documents::removed_directory)
             .ok_or_else(invalid)?;
+        // Finish a pending private copy before moving it. Otherwise an older
+        // loader could publish at `path` after parking and resurrect the row.
+        // This function runs on the file worker; the viewer keeps responding.
+        #[cfg(any(target_os = "ios", target_os = "android", test))]
+        crate::core::documents::materialize(path, &|| true)?;
         std::fs::create_dir_all(&holding).map_err(|e| e.to_string())?;
         let slot = tempfile::Builder::new()
             .prefix("item-")
@@ -793,6 +798,95 @@ mod parking {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::{
+            io::Write,
+            sync::{
+                Arc, Mutex,
+                atomic::{AtomicUsize, Ordering},
+                mpsc,
+            },
+            time::Duration,
+        };
+
+        #[test]
+        fn parking_waits_for_deferred_copy_and_restore_reuses_it() {
+            let cache = tempfile::tempdir_in(crate::test_support::root()).unwrap();
+            let mut batch = crate::core::documents::ImportBatch::new_folder(cache.path()).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let count = calls.clone();
+            let (started, ready) = mpsc::channel();
+            let (release, blocked) = mpsc::channel();
+            let blocked = Mutex::new(blocked);
+            batch
+                .add_deferred(
+                    "large.png",
+                    8,
+                    None,
+                    Arc::new(move |file, _, _| {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        started.send(()).unwrap();
+                        blocked.lock().unwrap().recv().unwrap();
+                        file.write_all(b"original")
+                            .map_err(|error| error.to_string())
+                    }),
+                )
+                .unwrap();
+            let path = batch.first().unwrap().to_owned();
+            let requested = path.clone();
+            let reader = std::thread::spawn(move || {
+                crate::core::documents::materialize(&requested, &|| true)
+            });
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+
+            let removing = path.clone();
+            let (finished, result) = mpsc::channel();
+            let remover = std::thread::spawn(move || finished.send(trash(&removing)).unwrap());
+            assert!(matches!(
+                result.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            release.send(()).unwrap();
+            reader.join().unwrap().unwrap();
+            let token = result
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            remover.join().unwrap();
+
+            assert!(
+                !path.exists(),
+                "a completed copy must not recreate the parked row"
+            );
+            assert_eq!(std::fs::read(&token.0).unwrap(), b"original");
+            assert_eq!(restore(&token, &path).unwrap(), path);
+            crate::core::documents::materialize(&path, &|| true).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"original");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn failed_deferred_copy_is_not_parked() {
+            let cache = tempfile::tempdir_in(crate::test_support::root()).unwrap();
+            let mut batch = crate::core::documents::ImportBatch::new_folder(cache.path()).unwrap();
+            batch
+                .add_deferred(
+                    "unavailable.png",
+                    8,
+                    None,
+                    Arc::new(|_, _, _| Err("Source is unavailable".into())),
+                )
+                .unwrap();
+            let path = batch.first().unwrap();
+            assert!(trash(path).is_err());
+            assert!(path.exists());
+            assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
+            assert!(
+                !crate::core::documents::removed_directory(batch.directory())
+                    .unwrap()
+                    .exists()
+            );
+        }
+
         #[test]
         fn parks_outside_the_batch_and_restores() {
             let cache = tempfile::tempdir().unwrap();

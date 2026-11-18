@@ -1,5 +1,5 @@
 //! Zip and 7z archives open like folders, read-only. Their images are
-//! extracted in the background; an encrypted archive asks for its password.
+//! extracted in the background.
 use super::*;
 use crate::core::archive::{self, Error, Extracted};
 use std::sync::{
@@ -11,6 +11,7 @@ use std::sync::{
 /// `Viewer::listing` while an archive is being opened. Media job ids count up
 /// from one and never reach it.
 pub(super) const LISTING: u64 = u64::MAX;
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 const PASSWORD_FIELD: &str = "archive-password";
 
 pub(super) struct Archives {
@@ -18,6 +19,7 @@ pub(super) struct Archives {
     /// The archive shown in this window.
     open: Option<Opened>,
     job: Option<Job>,
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     pub prompt: Option<Prompt>,
 }
 
@@ -45,6 +47,7 @@ impl Drop for Job {
 }
 
 /// Asks for the password of an encrypted archive.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub(super) struct Prompt {
     source: PathBuf,
     start: Option<PathBuf>,
@@ -66,6 +69,7 @@ impl Archives {
             ctx,
             open: None,
             job: None,
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             prompt: None,
         }
     }
@@ -73,12 +77,22 @@ impl Archives {
     /// Forgets the archive and deletes its extracted files.
     pub(super) fn close(&mut self) {
         self.job = None;
-        self.prompt = None;
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            self.prompt = None;
+        }
         self.open = None;
     }
 
     fn active(&self) -> bool {
-        self.open.is_some() || self.job.is_some() || self.prompt.is_some()
+        self.open.is_some() || self.job.is_some() || self.password_prompt_open()
+    }
+
+    pub(super) fn password_prompt_open(&self) -> bool {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        return false;
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        self.prompt.is_some()
     }
 
     fn start(&mut self, source: PathBuf, start: Option<PathBuf>, password: Option<String>) {
@@ -175,7 +189,9 @@ impl Viewer {
         if self.ios_access.dialog.is_some() {
             return true;
         }
-        self.move_dialog.is_some() || self.rename_dialog.is_some() || self.archives.prompt.is_some()
+        self.move_dialog.is_some()
+            || self.rename_dialog.is_some()
+            || self.archives.password_prompt_open()
     }
 
     /// Moving, deleting and restoring files does not apply inside an archive.
@@ -250,6 +266,7 @@ impl Viewer {
         self.archives.job = None;
         match result {
             Ok(extracted) => self.show_archive(ctx, source, start, extracted),
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             Err(error @ (Error::PasswordRequired | Error::WrongPassword)) => {
                 self.archives.prompt = Some(Prompt {
                     source,
@@ -261,6 +278,15 @@ impl Viewer {
                 self.menu_open = false;
                 self.release_held_input();
                 self.canvas_drag = None;
+            }
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            Err(Error::EncryptedUnsupported) => {
+                self.leave_archive();
+                self.last_error = if crate::i18n::current() == crate::i18n::Language::Korean {
+                    "macOS와 iOS에서는 암호가 설정된 압축 파일을 열 수 없습니다.".into()
+                } else {
+                    Error::EncryptedUnsupported.to_string()
+                };
             }
             Err(Error::Cancelled) => {}
             Err(error) => {
@@ -328,6 +354,12 @@ impl Viewer {
                     ui.label(RichText::new(tr("opening-the-archive")).color(MUTED));
                 });
         }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        self.archive_password_window(ctx);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    fn archive_password_window(&mut self, ctx: &egui::Context) {
         let Some(mut prompt) = self.archives.prompt.take() else {
             return;
         };

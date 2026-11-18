@@ -6,8 +6,28 @@
 #include <stdint.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <errno.h>
+#include <sys/resource.h>
+
+void nabi_android_background_worker(void) {
+    // Match Process.THREAD_PRIORITY_BACKGROUND's Linux nice value without
+    // depending on a Java Activity or changing Android task-group membership.
+    // On Android/Linux PRIO_PROCESS with gettid() affects only this worker.
+    const int background_priority = 10;
+    const pid_t tid = gettid();
+    if (tid <= 0) return;
+    errno = 0;
+    const int current = getpriority(PRIO_PROCESS, tid);
+    if (errno != 0 || current >= background_priority) return;
+    // Lowering priority is best effort; decoding/cache writes must still work
+    // if a device's scheduling policy rejects the adjustment.
+    (void)setpriority(PRIO_PROCESS, tid, background_priority);
+}
 
 extern size_t nabi_mobile_text(const char *, unsigned short *, size_t);
+extern bool nabi_mobile_is_rtl(void);
+extern void nabi_android_request_started(void);
+extern void nabi_mobile_import_pending(void);
 extern void nabi_mobile_back(void);
 extern void nabi_mobile_locale_changed(void);
 extern void nabi_mobile_window_mode_changed(int);
@@ -20,6 +40,11 @@ extern void nabi_mobile_import_error(const char *);
 extern void nabi_mobile_photo_error(int);
 extern void nabi_mobile_import_finish(void);
 extern void nabi_mobile_source_utf16(const unsigned short *, size_t, const unsigned short *, size_t);
+extern void nabi_android_source_snapshot(uint64_t);
+extern bool nabi_android_source_reused(uint64_t, uint64_t);
+extern bool nabi_mobile_import_deferred_utf16(const unsigned short *, size_t, const unsigned short *, size_t,
+    uint64_t, int64_t, int);
+extern void nabi_android_media_access_changed(void);
 
 // Readers may run on the UI, render and import threads simultaneously. Only
 // host replacement/teardown is exclusive; a slow import must not block insets.
@@ -29,6 +54,9 @@ static jobject activity;
 static jmethodID pick_method, awake_method, copy_method, exit_method;
 static jmethodID folder_method, orientation_method, immersive_method, share_method, export_method, import_method;
 static jmethodID reopen_method, memory_method, hdr_method;
+static jmethodID source_epoch_method;
+static jmethodID open_source_method, media_thumbnail_method, decode_scaled_method;
+static jmethodID bitmap_width_method, bitmap_height_method, bitmap_copy_method, bitmap_recycle_method;
 static char *paths[3];
 static _Atomic float safe_area[4];
 
@@ -85,6 +113,23 @@ static jstring translated_text(JNIEnv *env, jobject self, jstring key) {
     }
     return result;
 }
+static jboolean translated_direction(JNIEnv *env, jobject self) {
+    if (!enter_callback(env, self)) return JNI_FALSE;
+    // Like nativeText, direction is an immutable catalog lookup and does not
+    // retain the Activity or require the host gate while entering Rust.
+    leave_callback();
+    return nabi_mobile_is_rtl() ? JNI_TRUE : JNI_FALSE;
+}
+static void request_started(JNIEnv *env, jobject self) {
+    if (!enter_callback(env, self)) return;
+    nabi_android_request_started();
+    leave_callback();
+}
+static void import_pending(JNIEnv *env, jobject self) {
+    if (!enter_callback(env, self)) return;
+    nabi_mobile_import_pending();
+    leave_callback();
+}
 static jboolean begin(JNIEnv *env, jobject self) {
     if (!enter_callback(env, self)) return false;
     bool result = nabi_mobile_import_begin();
@@ -103,6 +148,25 @@ static void settings(JNIEnv *env, jobject self, jint fd) {
 static void export_result(JNIEnv *env, jobject self, jboolean saved) {
     if (!enter_callback(env, self)) return;
     nabi_mobile_export_result(saved); leave_callback();
+}
+// Listing records metadata only; Rust opens the source later through openSource.
+static jboolean document_deferred(JNIEnv *env, jobject self, jstring name, jstring token,
+        jlong bytes, jlong modified, jint kind) {
+    if (!name || !token || !enter_callback(env, self)) return false;
+    const jchar *label = (*env)->GetStringChars(env, name, NULL);
+    const jchar *key = (*env)->GetStringChars(env, token, NULL);
+    bool result = label && key && nabi_mobile_import_deferred_utf16(
+        label, (size_t)(*env)->GetStringLength(env, name),
+        key, (size_t)(*env)->GetStringLength(env, token),
+        bytes > 0 ? (uint64_t)bytes : 0, (int64_t)modified, (int)kind);
+    if (label) (*env)->ReleaseStringChars(env, name, label);
+    if (key) (*env)->ReleaseStringChars(env, token, key);
+    leave_callback();
+    return result;
+}
+static void media_access_changed(JNIEnv *env, jobject self) {
+    if (!enter_callback(env, self)) return;
+    nabi_android_media_access_changed(); leave_callback();
 }
 static jboolean document(JNIEnv *env, jobject self, jint fd, jstring name) {
     if (!enter_callback(env, self)) { if (fd >= 0) close(fd); return false; }
@@ -135,6 +199,17 @@ static void source(JNIEnv *env, jobject self, jstring id, jstring name) {
     if (label) (*env)->ReleaseStringChars(env, name, label);
     leave_callback();
 }
+static void source_snapshot(JNIEnv *env, jobject self, jlong token) {
+    if (!enter_callback(env, self)) return;
+    if (token > 0) nabi_android_source_snapshot((uint64_t)token);
+    leave_callback();
+}
+static jboolean source_reused(JNIEnv *env, jobject self, jlong token, jlong epoch) {
+    if (!enter_callback(env, self)) return false;
+    bool reused = token > 0 && epoch > 0 && nabi_android_source_reused((uint64_t)token, (uint64_t)epoch);
+    leave_callback();
+    return reused;
+}
 static void finish(JNIEnv *env, jobject self) {
     if (!enter_callback(env, self)) return;
     nabi_mobile_import_finish(); leave_callback();
@@ -164,6 +239,9 @@ void nabi_android_init(void *java_vm, void *native_activity) {
     jclass cls = (*env)->GetObjectClass(env, activity);
     JNINativeMethod methods[] = {
         {"nativeText", "(Ljava/lang/String;)Ljava/lang/String;", (void *)translated_text},
+        {"nativeIsRtl", "()Z", (void *)translated_direction},
+        {"nativeRequestStarted", "()V", (void *)request_started},
+        {"nativeImportPending", "()V", (void *)import_pending},
         {"nativeBegin", "()Z", (void *)begin},
         {"nativeDocument", "(ILjava/lang/String;)Z", (void *)document},
         {"nativeFinish", "()V", (void *)finish},
@@ -177,6 +255,10 @@ void nabi_android_init(void *java_vm, void *native_activity) {
         {"nativeSettings", "(I)V", (void *)settings},
         {"nativeExportResult", "(Z)V", (void *)export_result},
         {"nativeSource", "(Ljava/lang/String;Ljava/lang/String;)V", (void *)source},
+        {"nativeSourceSnapshot", "(J)V", (void *)source_snapshot},
+        {"nativeSourceReused", "(JJ)Z", (void *)source_reused},
+        {"nativeDocumentDeferred", "(Ljava/lang/String;Ljava/lang/String;JJI)Z", (void *)document_deferred},
+        {"nativeMediaAccessChanged", "()V", (void *)media_access_changed},
     };
     (*env)->RegisterNatives(env, cls, methods, sizeof(methods) / sizeof(methods[0]));
     pick_method = (*env)->GetMethodID(env, cls, "pickImages", "()V");
@@ -189,9 +271,25 @@ void nabi_android_init(void *java_vm, void *native_activity) {
     share_method = (*env)->GetMethodID(env, cls, "share", "(Ljava/lang/String;)V");
     export_method = (*env)->GetMethodID(env, cls, "exportSettings", "(Ljava/lang/String;)V");
     import_method = (*env)->GetMethodID(env, cls, "importSettings", "()V");
-    reopen_method = (*env)->GetMethodID(env, cls, "reopenSource", "(Ljava/lang/String;)Z");
+    reopen_method = (*env)->GetMethodID(env, cls, "reopenSourceCached", "(Ljava/lang/String;J)Z");
+    source_epoch_method = (*env)->GetMethodID(env, cls, "sourceReuseEpoch", "()J");
     memory_method = (*env)->GetMethodID(env, cls, "memorySnapshot", "()[J");
     hdr_method = (*env)->GetMethodID(env, cls, "hdrDisplay", "()[F");
+    open_source_method = (*env)->GetMethodID(env, cls, "openSource", "(ILjava/lang/String;)I");
+    media_thumbnail_method = (*env)->GetMethodID(env, cls, "loadMediaThumbnail",
+        "(Ljava/lang/String;I)Landroid/graphics/Bitmap;");
+    decode_scaled_method = (*env)->GetMethodID(env, cls, "decodeScaled",
+        "(Ljava/lang/String;IJ[I)Landroid/graphics/Bitmap;");
+    clear_exception(env);
+    jclass bitmap = (*env)->FindClass(env, "android/graphics/Bitmap");
+    if (!clear_exception(env) && bitmap) {
+        bitmap_width_method = (*env)->GetMethodID(env, bitmap, "getWidth", "()I");
+        bitmap_height_method = (*env)->GetMethodID(env, bitmap, "getHeight", "()I");
+        bitmap_copy_method = (*env)->GetMethodID(env, bitmap, "copyPixelsToBuffer", "(Ljava/nio/Buffer;)V");
+        bitmap_recycle_method = (*env)->GetMethodID(env, bitmap, "recycle", "()V");
+        clear_exception(env);
+        (*env)->DeleteLocalRef(env, bitmap);
+    }
     jmethodID path_method = (*env)->GetMethodID(env, cls, "storagePath", "(I)Ljava/lang/String;");
     if (!clear_exception(env) && path_method) {
         for (int i = 0; i < 3; ++i) {
@@ -289,16 +387,106 @@ void nabi_mobile_import_settings(void) {
     release(attached);
 }
 
-bool nabi_mobile_reopen(const unsigned short *text, int length) {
+bool nabi_android_reopen_cached(const unsigned short *text, int length, uint64_t token) {
     if (length < 0) return false;
     bool attached; JNIEnv *env = environment(&attached);
     if (!env) return false;
     jstring value = (*env)->NewString(env, text, length);
-    bool accepted = value && reopen_method && (*env)->CallBooleanMethod(env, activity, reopen_method, value);
+    bool accepted = value && reopen_method && (*env)->CallBooleanMethod(env, activity, reopen_method, value, (jlong)token);
     if (clear_exception(env)) accepted = false;
     if (value) (*env)->DeleteLocalRef(env, value);
     release(attached);
     return accepted;
+}
+
+uint64_t nabi_android_source_epoch(void) {
+    bool attached; JNIEnv *env = environment(&attached);
+    if (!env) return 0;
+    jlong epoch = source_epoch_method ? (*env)->CallLongMethod(env, activity, source_epoch_method) : 0;
+    if (clear_exception(env) || epoch < 0) epoch = 0;
+    release(attached);
+    return (uint64_t)epoch;
+}
+
+typedef uint8_t *(*nabi_alloc)(void *, size_t);
+
+// Copies an ARGB_8888 (premultiplied RGBA bytes) bitmap into a buffer the
+// caller allocates for the exact size, then recycles the bitmap. 0 is success.
+static int copy_bitmap(JNIEnv *env, jobject bitmap, nabi_alloc alloc, void *context,
+        uint32_t *width, uint32_t *height) {
+    if (!bitmap) return 2;
+    int result = 2;
+    if (bitmap_width_method && bitmap_height_method && bitmap_copy_method) {
+        jint w = (*env)->CallIntMethod(env, bitmap, bitmap_width_method);
+        jint h = (*env)->CallIntMethod(env, bitmap, bitmap_height_method);
+        if (!clear_exception(env) && w > 0 && h > 0) {
+            size_t size = (size_t)w * (size_t)h * 4;
+            uint8_t *buffer = alloc(context, size);
+            jobject direct = buffer ? (*env)->NewDirectByteBuffer(env, buffer, (jlong)size) : NULL;
+            if (direct) {
+                (*env)->CallVoidMethod(env, bitmap, bitmap_copy_method, direct);
+                if (!clear_exception(env)) { *width = (uint32_t)w; *height = (uint32_t)h; result = 0; }
+                (*env)->DeleteLocalRef(env, direct);
+            } else clear_exception(env);
+        }
+    }
+    if (bitmap_recycle_method) (*env)->CallVoidMethod(env, bitmap, bitmap_recycle_method);
+    clear_exception(env);
+    (*env)->DeleteLocalRef(env, bitmap);
+    return result;
+}
+
+// Called on Rust decode workers. Returns an owned read-only descriptor or -1.
+int nabi_android_open_source(int kind, const unsigned short *token, size_t length) {
+    bool attached; JNIEnv *env = environment(&attached);
+    if (!env) return -1;
+    jstring value = (*env)->NewString(env, token, (jsize)length);
+    jint fd = value && open_source_method
+        ? (*env)->CallIntMethod(env, activity, open_source_method, (jint)kind, value) : -1;
+    if (clear_exception(env)) fd = -1;
+    if (value) (*env)->DeleteLocalRef(env, value);
+    release(attached);
+    return fd;
+}
+
+int nabi_android_media_thumbnail(const unsigned short *token, size_t length, uint32_t edge,
+        nabi_alloc alloc, void *context, uint32_t *width, uint32_t *height) {
+    bool attached; JNIEnv *env = environment(&attached);
+    if (!env) return 2;
+    jstring value = (*env)->NewString(env, token, (jsize)length);
+    jobject bitmap = value && media_thumbnail_method
+        ? (*env)->CallObjectMethod(env, activity, media_thumbnail_method, value, (jint)edge) : NULL;
+    if (clear_exception(env)) bitmap = NULL;
+    int result = copy_bitmap(env, bitmap, alloc, context, width, height);
+    if (value) (*env)->DeleteLocalRef(env, value);
+    release(attached);
+    return result;
+}
+
+int nabi_android_decode_scaled(const unsigned short *path, size_t path_length, uint32_t max_side, uint64_t max_pixels,
+        nabi_alloc alloc, void *context, uint32_t *width, uint32_t *height, uint32_t *original) {
+    bool attached; JNIEnv *env = environment(&attached);
+    if (!env) return 2;
+    // UTF-16 avoids NewStringUTF's modified-UTF-8 rules for emoji names.
+    jstring value = (*env)->NewString(env, path, (jsize)path_length);
+    jintArray size = (*env)->NewIntArray(env, 2);
+    jobject bitmap = NULL;
+    if (value && size && decode_scaled_method) {
+        bitmap = (*env)->CallObjectMethod(env, activity, decode_scaled_method, value,
+            (jint)max_side, (jlong)max_pixels, size);
+    }
+    if (clear_exception(env)) bitmap = NULL;
+    int result = copy_bitmap(env, bitmap, alloc, context, width, height);
+    if (result == 0) {
+        jint header[2] = {0, 0};
+        (*env)->GetIntArrayRegion(env, size, 0, 2, header);
+        if (clear_exception(env) || header[0] <= 0 || header[1] <= 0) result = 2;
+        else { original[0] = (uint32_t)header[0]; original[1] = (uint32_t)header[1]; }
+    }
+    if (value) (*env)->DeleteLocalRef(env, value);
+    if (size) (*env)->DeleteLocalRef(env, size);
+    release(attached);
+    return result;
 }
 
 bool nabi_mobile_memory(uint64_t *total, uint64_t *available) {

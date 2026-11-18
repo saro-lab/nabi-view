@@ -159,14 +159,18 @@ pub(crate) fn thumbnail_key(image: &Path) -> Option<String> {
     #[cfg(not(any(target_os = "ios", target_os = "android", test)))]
     let local = image.to_owned();
     let file = archive::split(&local).map_or(local, |(archive, _)| archive);
-    let metadata = fs::metadata(file).ok().filter(|m| m.is_file())?;
-    let modified = metadata
-        .modified()
-        .ok()
+    let metadata = fs::metadata(&file).ok().filter(|m| m.is_file())?;
+    let stamp = (metadata.len(), metadata.modified().ok());
+    // This key is also requested by the UI: use listing metadata without
+    // triggering an original download or changing the key after materialization.
+    #[cfg(any(target_os = "ios", target_os = "android", test))]
+    let stamp = crate::core::documents::deferred_stamp(&file).unwrap_or(stamp);
+    let modified = stamp
+        .1
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |time| time.as_nanos());
     let mut bytes = image.as_os_str().as_encoded_bytes().to_vec();
-    bytes.extend(metadata.len().to_le_bytes());
+    bytes.extend(stamp.0.to_le_bytes());
     bytes.extend(modified.to_le_bytes());
     // Never reuse the old JPEGs that flattened transparency over a dark matte.
     bytes.extend(THUMBNAIL_VERSION);
@@ -261,6 +265,19 @@ fn create_thumbnail_with_decoder(
     let Some(generation) = generation else {
         return Ok((image, false));
     };
+    let stored = store_thumbnail_image(&cache, generation, key, &image, current_limit)?;
+    Ok((image, stored))
+}
+
+/// Encodes `image` and publishes it under `key` if `generation` is still
+/// current. Shared by the library list and the viewer's thumbnail strip.
+pub(crate) fn store_thumbnail_image(
+    cache: &crate::core::disk_cache::Cache,
+    generation: u64,
+    key: &str,
+    image: &egui::ColorImage,
+    current_limit: impl FnOnce() -> u64,
+) -> Result<bool, String> {
     let [width, height] = image.size;
     let mut rgba = Vec::with_capacity(width * height * 4);
     for pixel in &image.pixels {
@@ -276,10 +293,9 @@ fn create_thumbnail_with_decoder(
             image::ExtendedColorType::Rgba8,
         )
         .map_err(|e| e.to_string())?;
-    let stored = cache
+    cache
         .store_thumbnail(generation, key, &png, current_limit)
-        .map_err(|e| e.to_string())?;
-    Ok((image, stored))
+        .map_err(|e| e.to_string())
 }
 
 /// Reads a cached thumbnail written by `create_thumbnail`.

@@ -4,10 +4,9 @@ pub(crate) mod licenses;
 use crate::platform::mac_open;
 #[cfg(any(target_os = "ios", target_os = "android"))]
 use crate::platform::mobile;
-use crate::{
-    storage,
-    ui::{mobile as mobile_ui, viewer},
-};
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+use crate::storage;
+use crate::ui::{mobile as mobile_ui, viewer};
 use eframe::egui;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 use std::path::Path;

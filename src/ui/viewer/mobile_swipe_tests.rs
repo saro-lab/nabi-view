@@ -86,6 +86,329 @@ fn bounds(output: &egui::FullOutput, id: egui::TextureId) -> Option<(Rect, Rect)
 }
 
 #[test]
+fn enlarged_drags_pan_without_previewing_or_changing_pages_even_when_pan_is_disabled() {
+    let _mobile = Mobile::enter();
+    for size in [egui::vec2(390., 844.), egui::vec2(1194., 834.)] {
+        for rtl in [false, true] {
+            for pan_enabled in [false, true] {
+                let (ctx, mut app) = viewer();
+                app.settings.rtl = rtl;
+                app.settings.touch.one_finger_pan = pan_enabled;
+                app.settings.spread = size.x > size.y;
+                app.settings.cover = false;
+                app.landscape = size.x > size.y;
+                for picture in app.pictures.values_mut() {
+                    picture.original = [1200, 1800];
+                }
+                app.zoom = 2.;
+                let first = frame(&mut app, &ctx, 0., vec![], size);
+                let canvas = app.presentation.canvas.unwrap();
+                let current = app.pictures[&app.files[0]].handle.id();
+                let original = bounds(&first, current).unwrap().0;
+                let adjacent = app.pictures[&app.files[if app.settings.spread { 2 } else { 1 }]]
+                    .handle
+                    .id();
+                let start = canvas.center();
+                frame(
+                    &mut app,
+                    &ctx,
+                    0.1,
+                    vec![egui::Event::PointerMoved(start), button(start, true)],
+                    size,
+                );
+                let end = start - egui::vec2(100., 0.);
+                let dragged = frame(
+                    &mut app,
+                    &ctx,
+                    0.2,
+                    vec![egui::Event::PointerMoved(end)],
+                    size,
+                );
+                assert!(app.touch_gesture.pan_only());
+                assert!(app.mobile_swipe.is_none());
+                assert!(bounds(&dragged, adjacent).is_none());
+                let changed = bounds(&dragged, current).unwrap().0.center().x - original.center().x;
+                assert!((changed - if pan_enabled { -100. } else { 0. }).abs() < 0.01);
+                frame(
+                    &mut app,
+                    &ctx,
+                    0.3,
+                    vec![button(end, false), egui::Event::PointerGone],
+                    size,
+                );
+                assert_eq!(app.focus_index, 0);
+                assert!(app.mobile_swipe.is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn touch_navigation_uses_rendered_size_instead_of_manual_zoom_flags() {
+    let _mobile = Mobile::enter();
+    for (original, zoom, manual, mode, navigates) in [
+        ([100, 150], 1., Some(1.), "fit", true),
+        ([100, 150], 8., Some(1.), "fit", true),
+        ([100, 150], 1., None, "actual", true),
+        ([100, 150], 2., None, "fit", false),
+        ([1200, 1800], 1., Some(1.), "fit", false),
+        ([1200, 1800], 1., None, "actual", false),
+        ([1200, 1800], 1., None, "fill", false),
+        ([1200, 1800], 1., None, "fit", true),
+    ] {
+        let (ctx, mut app) = viewer();
+        app.settings.view_mode = mode.into();
+        app.zoom = zoom;
+        app.zoom_override = manual;
+        for picture in app.pictures.values_mut() {
+            picture.original = original;
+        }
+        let size = egui::vec2(390., 844.);
+        frame(&mut app, &ctx, 0., vec![], size);
+        let start = app.presentation.canvas.unwrap().center();
+        frame(
+            &mut app,
+            &ctx,
+            0.1,
+            vec![egui::Event::PointerMoved(start), button(start, true)],
+            size,
+        );
+        let end = start - egui::vec2(100., 0.);
+        frame(
+            &mut app,
+            &ctx,
+            0.2,
+            vec![egui::Event::PointerMoved(end)],
+            size,
+        );
+        frame(
+            &mut app,
+            &ctx,
+            0.3,
+            vec![button(end, false), egui::Event::PointerGone],
+            size,
+        );
+        assert_eq!(
+            app.focus_index,
+            usize::from(navigates),
+            "{original:?} zoom={zoom} manual={manual:?} {mode}"
+        );
+    }
+}
+
+#[test]
+fn a_pan_stays_locked_when_zoom_returns_to_fit_or_a_second_finger_lifts() {
+    let _mobile = Mobile::enter();
+    for pinch in [false, true] {
+        let (ctx, mut app) = viewer();
+        for picture in app.pictures.values_mut() {
+            picture.original = [1200, 1800];
+        }
+        app.zoom = 2.;
+        let size = egui::vec2(390., 844.);
+        frame(&mut app, &ctx, 0., vec![], size);
+        let start = app.presentation.canvas.unwrap().center();
+        let touch = |id, phase, pos| egui::Event::Touch {
+            device_id: egui::TouchDeviceId(1),
+            id: egui::TouchId(id),
+            phase,
+            pos,
+            force: None,
+        };
+        frame(
+            &mut app,
+            &ctx,
+            0.1,
+            vec![
+                egui::Event::PointerMoved(start),
+                button(start, true),
+                touch(1, egui::TouchPhase::Start, start),
+            ],
+            size,
+        );
+        let end = start - egui::vec2(100., 0.);
+        frame(
+            &mut app,
+            &ctx,
+            0.2,
+            vec![
+                egui::Event::PointerMoved(end),
+                touch(1, egui::TouchPhase::Move, end),
+            ],
+            size,
+        );
+        if pinch {
+            let second = start + egui::vec2(60., 0.);
+            frame(
+                &mut app,
+                &ctx,
+                0.3,
+                vec![touch(2, egui::TouchPhase::Start, second)],
+                size,
+            );
+            frame(
+                &mut app,
+                &ctx,
+                0.4,
+                vec![touch(
+                    2,
+                    egui::TouchPhase::Move,
+                    second + egui::vec2(80., 0.),
+                )],
+                size,
+            );
+            frame(
+                &mut app,
+                &ctx,
+                0.5,
+                vec![touch(
+                    2,
+                    egui::TouchPhase::End,
+                    second + egui::vec2(80., 0.),
+                )],
+                size,
+            );
+        } else {
+            app.zoom = 1.;
+        }
+        let released = end - egui::vec2(60., 0.);
+        frame(
+            &mut app,
+            &ctx,
+            0.6,
+            vec![
+                egui::Event::PointerMoved(released),
+                touch(1, egui::TouchPhase::Move, released),
+            ],
+            size,
+        );
+        frame(
+            &mut app,
+            &ctx,
+            0.7,
+            vec![
+                button(released, false),
+                touch(1, egui::TouchPhase::End, released),
+                egui::Event::PointerGone,
+            ],
+            size,
+        );
+        assert_eq!(app.focus_index, 0);
+        assert!(app.mobile_swipe.is_none());
+    }
+}
+
+#[test]
+fn pinch_primary_finger_handoff_cannot_restart_as_a_page_swipe() {
+    let _mobile = Mobile::enter();
+    let (ctx, mut app) = viewer();
+    let size = egui::vec2(390., 844.);
+    app.zoom = 2.;
+    frame(&mut app, &ctx, 0., vec![], size);
+    let first = egui::pos2(220., 400.);
+    let second = egui::pos2(280., 400.);
+    let touch = |id, phase, pos| egui::Event::Touch {
+        device_id: egui::TouchDeviceId(1),
+        id: egui::TouchId(id),
+        phase,
+        pos,
+        force: None,
+    };
+    frame(
+        &mut app,
+        &ctx,
+        0.1,
+        vec![
+            egui::Event::PointerMoved(first),
+            button(first, true),
+            touch(1, egui::TouchPhase::Start, first),
+        ],
+        size,
+    );
+    frame(
+        &mut app,
+        &ctx,
+        0.2,
+        vec![touch(2, egui::TouchPhase::Start, second)],
+        size,
+    );
+    // Pinch back to fit, then lift the primary finger while the second stays.
+    app.zoom = 1.;
+    app.zoom_override = None;
+    frame(
+        &mut app,
+        &ctx,
+        0.3,
+        vec![button(first, false), touch(1, egui::TouchPhase::End, first)],
+        size,
+    );
+    assert!(app.touch_gesture.pan_only());
+    frame(
+        &mut app,
+        &ctx,
+        0.4,
+        vec![egui::Event::PointerMoved(second), button(second, true)],
+        size,
+    );
+    let end = second - egui::vec2(120., 0.);
+    frame(
+        &mut app,
+        &ctx,
+        0.5,
+        vec![
+            egui::Event::PointerMoved(end),
+            touch(2, egui::TouchPhase::Move, end),
+        ],
+        size,
+    );
+    frame(
+        &mut app,
+        &ctx,
+        0.6,
+        vec![
+            button(end, false),
+            touch(2, egui::TouchPhase::End, end),
+            egui::Event::PointerGone,
+        ],
+        size,
+    );
+    assert_eq!(app.focus_index, 0);
+    assert!(app.mobile_swipe.is_none());
+    assert!(!app.touch_gesture.active());
+    // A genuinely new touch at fit regains ordinary page navigation.
+    frame(
+        &mut app,
+        &ctx,
+        0.8,
+        vec![
+            egui::Event::PointerMoved(first),
+            button(first, true),
+            touch(3, egui::TouchPhase::Start, first),
+        ],
+        size,
+    );
+    let next = first - egui::vec2(100., 0.);
+    frame(
+        &mut app,
+        &ctx,
+        0.9,
+        vec![
+            egui::Event::PointerMoved(next),
+            touch(3, egui::TouchPhase::Move, next),
+        ],
+        size,
+    );
+    frame(
+        &mut app,
+        &ctx,
+        1.,
+        vec![button(next, false), touch(3, egui::TouchPhase::End, next)],
+        size,
+    );
+    assert_eq!(app.focus_index, 1);
+}
+
+#[test]
 fn swipe_tracks_finger_and_settles_in_both_directions_and_spreads() {
     let _mobile = Mobile::enter();
     for spread in [false, true] {

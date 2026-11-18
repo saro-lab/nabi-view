@@ -20,6 +20,9 @@ fn zip_archive(root: &Path, password: Option<&str>) -> PathBuf {
     let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     let options = match password {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        Some(_) => unreachable!("encrypted fixture"),
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         Some(password) => options.with_aes_encryption(zip::AesMode::Aes256, password),
         None => options,
     };
@@ -33,6 +36,7 @@ fn zip_archive(root: &Path, password: Option<&str>) -> PathBuf {
     crate::core::paths::canonicalize(&path).unwrap()
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 fn sevenz_archive(root: &Path, password: &str) -> PathBuf {
     use sevenz_rust2::{
         ArchiveEntry, ArchiveWriter, EncoderMethod, encoder_options::AesEncoderOptions,
@@ -121,6 +125,7 @@ fn an_archive_opens_like_a_folder_but_refuses_moving_deleting_and_restoring() {
 }
 
 #[test]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 fn an_encrypted_archive_asks_for_its_password_until_it_is_right() {
     let root = tempfile::tempdir().unwrap();
     for archive in [
@@ -148,6 +153,7 @@ fn an_encrypted_archive_asks_for_its_password_until_it_is_right() {
 }
 
 #[test]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 fn cancelling_the_password_returns_to_the_start_screen() {
     let root = tempfile::tempdir().unwrap();
     let archive = zip_archive(root.path(), Some("secret"));
@@ -209,4 +215,25 @@ fn archives_are_remembered_and_bookmarked_at_their_page() {
     let entries = state.library().unwrap();
     assert!(entries.iter().all(|entry| entry.kind != Kind::Recent));
     assert!(entries.iter().any(|entry| !entry.available), "{entries:?}");
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn apple_reports_unsupported_encrypted_archive_without_prompting() {
+    let root = tempfile::tempdir().unwrap();
+    let archive = root.path().join("locked.zip");
+    std::fs::write(
+        &archive,
+        include_bytes!("../../core/archive/fixtures/zipcrypto.zip"),
+    )
+    .unwrap();
+    let mut window = TestWindow::open(Some(archive));
+    window.draw(None);
+    let message = if crate::i18n::current() == crate::i18n::Language::Korean {
+        "macOS와 iOS에서는 암호가 설정된 압축 파일을 열 수 없습니다."
+    } else {
+        "Password-protected archives are not supported"
+    };
+    let text = wait_for_text(&mut window, message);
+    assert!(!text.contains(tr("archive-password")));
 }

@@ -1109,14 +1109,13 @@ fn bare_viewer() -> (Viewer, egui::Context) {
 #[test]
 fn phone_back_closes_the_topmost_layer_before_leaving_the_app() {
     let (mut app, ctx) = bare_viewer();
-    // Back from the empty library returns to the default menu, then leaves.
+    // The start destination is the last stop before leaving the app.
     assert!(app.library.open);
-    assert!(app.handle_back(&ctx));
-    assert!(!app.library.open && app.default_menu_visible());
     assert!(!app.handle_back(&ctx));
+    assert!(app.library.open);
 
     app.files = vec!["1.png".into(), "2.png".into()];
-    app.library.open = true;
+    app.library.open = false;
     app.fullscreen = true;
     app.inspector.open = true;
     app.settings_open = true;
@@ -1136,13 +1135,44 @@ fn phone_back_closes_the_topmost_layer_before_leaving_the_app() {
     assert!(app.handle_back(&ctx));
     assert!(!app.menu_open && app.settings_open);
     assert!(app.handle_back(&ctx));
-    assert!(!app.settings_open && app.library.open);
+    assert!(!app.settings_open && !app.library.open);
     assert!(app.handle_back(&ctx));
-    assert!(!app.library.open && app.inspector.open);
+    assert!(app.library.open && !app.inspector.open && !app.fullscreen);
+    assert_eq!(app.files.len(), 2);
+    assert!(!app.handle_back(&ctx));
+    assert!(app.library.open);
+}
+
+#[test]
+fn returning_home_is_idempotent_and_keeps_the_current_photo_position() {
+    let (mut app, ctx) = bare_viewer();
+    app.files = vec!["1.png".into(), "2.png".into()];
+    app.library.open = false;
+    app.focus_index = 1;
+    app.zoom = 2.;
+    app.pan = egui::vec2(32., -19.);
+    app.slideshow = true;
+    app.held_button = Some((true, 10.));
+    app.touch_gesture.start(egui::pos2(200., 200.));
+    for _ in 0..2 {
+        app.open_mobile_home(&ctx);
+        assert!(app.library.open);
+        assert_eq!(app.focus_index, 1);
+        assert_eq!(app.files.len(), 2);
+        assert_eq!(app.zoom, 2.);
+        assert_eq!(app.pan, egui::vec2(32., -19.));
+        assert!(!app.slideshow && !app.touch_gesture.active());
+        assert!(app.held_button.is_none());
+    }
+}
+
+#[test]
+fn back_from_the_empty_viewer_goes_home_before_leaving() {
+    let (mut app, ctx) = bare_viewer();
+    app.library.open = false;
+    assert!(app.default_menu_visible());
     assert!(app.handle_back(&ctx));
-    assert!(!app.inspector.open && app.fullscreen);
-    assert!(app.handle_back(&ctx));
-    assert!(!app.fullscreen);
+    assert!(app.library.open && !app.default_menu_visible());
     assert!(!app.handle_back(&ctx));
 }
 

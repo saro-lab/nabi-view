@@ -1,4 +1,7 @@
 //! Local image viewer. Platform hosts share the same application and image pipeline.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+extern crate zip_apple as zip;
+
 mod app;
 mod core;
 mod i18n;

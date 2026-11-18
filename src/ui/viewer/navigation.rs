@@ -28,6 +28,13 @@ impl Viewer {
     }
 
     pub(super) fn open_from_user(&mut self, path: PathBuf) -> bool {
+        #[cfg(test)]
+        if let Some(requests) = &mut self.deferred_mobile_open_requests {
+            // Keep native completion under test control while exercising the
+            // real library click and its post-open screen transition.
+            requests.push(path);
+            return true;
+        }
         #[cfg(target_os = "ios")]
         {
             if self.open_ios_source(&path) {
@@ -95,8 +102,9 @@ impl Viewer {
             return;
         }
         #[cfg(target_os = "android")]
-        if crate::platform::mobile::reopen(&path) {
-            self.library.open = false;
+        if self.open_android_source(&path) {
+            // The native worker has only started. Keep the library visible until
+            // accept_mobile_selection() opens its result and resets the view.
             return;
         }
         #[cfg(test)]
@@ -196,6 +204,7 @@ impl Viewer {
         self.thumbs.clear();
         self.thumb_ticket = None;
         self.thumb_errors.clear();
+        self.held_prefetch.clear();
         self.library.open = false;
         self.move_dialog = None;
         self.rename_dialog = None;
@@ -245,6 +254,9 @@ impl Viewer {
     }
 
     pub(super) fn move_page(&mut self, ctx: &egui::Context, forward: bool) {
+        if self.source_list_pending() {
+            return;
+        }
         if self.listing.is_some() {
             if self.pending_steps.len() < MAX_PENDING_STEPS {
                 self.pending_steps.push((forward, NavigationStep::Spread));
@@ -299,6 +311,9 @@ impl Viewer {
     }
 
     pub(super) fn move_single_page(&mut self, ctx: &egui::Context, forward: bool) {
+        if self.source_list_pending() {
+            return;
+        }
         if self.listing.is_some() {
             if self.pending_steps.len() < MAX_PENDING_STEPS {
                 self.pending_steps.push((forward, NavigationStep::Page));
@@ -353,6 +368,18 @@ impl Viewer {
         if self.focus_index != focus_index {
             self.toast = None;
             self.prefetch_blocked.clear();
+            // A step of up to two pages (one spread) sets the reading direction
+            // and keeps background work that is still near; a jump resets both.
+            let len = self.files.len().max(1);
+            let forward = (focus_index % len + len - self.focus_index % len) % len;
+            let backward = (self.focus_index % len + len - focus_index % len) % len;
+            let step = forward <= 2 || backward <= 2;
+            self.backward = step && forward > 2;
+            if !step {
+                self.cancel_prefetch();
+                self.media.clear_thumbnail();
+                self.thumb_ticket = None;
+            }
         }
         self.focus_index = focus_index;
         self.pan = Vec2::ZERO;
@@ -363,5 +390,7 @@ impl Viewer {
         self.zoom_override = None;
         self.zoom_input = None;
         self.slide_deadline = None;
+        // Submit the user's page before this frame can request a new thumbnail.
+        self.queue_images();
     }
 }

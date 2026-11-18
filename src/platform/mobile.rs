@@ -25,7 +25,12 @@ unsafe extern "C" {
     fn nabi_mobile_share(path: *const u16, length: i32);
     fn nabi_mobile_export_settings(path: *const u16, length: i32);
     fn nabi_mobile_import_settings();
+    #[cfg(target_os = "ios")]
     fn nabi_mobile_reopen(id: *const u16, length: i32) -> bool;
+    #[cfg(target_os = "android")]
+    fn nabi_android_reopen_cached(id: *const u16, length: i32, token: u64) -> bool;
+    #[cfg(target_os = "android")]
+    fn nabi_android_source_epoch() -> u64;
 }
 
 /// Upper bound for a picked settings file; the store applies its own limit.
@@ -43,21 +48,51 @@ static CONTEXT: Mutex<Option<egui::Context>> = Mutex::new(None);
 static LOCALE_CHANGED: AtomicBool = AtomicBool::new(false);
 static IMPORT: Mutex<Option<Result<ImportBatch, String>>> = Mutex::new(None);
 static RESULT: Mutex<Option<Result<ImportBatch, String>>> = Mutex::new(None);
+static IMPORT_PENDING: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "ios")]
+static IOS_SEED: Mutex<Option<(ImportBatch, u64)>> = Mutex::new(None);
+#[cfg(target_os = "ios")]
+static IOS_SEED_STARTED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "ios")]
+static IOS_SEED_CANCELLED: AtomicBool = AtomicBool::new(false);
 static SETTINGS: Mutex<Option<Result<PathBuf, String>>> = Mutex::new(None);
 static EXPORT_FAILED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "ios")]
+static SHARE_ERROR: Mutex<Option<String>> = Mutex::new(None);
 static REOPEN: Mutex<Option<PathBuf>> = Mutex::new(None);
+#[cfg(target_os = "android")]
+static ANDROID_REUSED: Mutex<Option<(PathBuf, u64, u64)>> = Mutex::new(None);
+#[cfg(target_os = "android")]
+static ANDROID_OPEN: super::android_open::OpenGate = super::android_open::OpenGate::new();
 #[cfg(target_os = "ios")]
 static IOS_IMPORT: Mutex<crate::core::ios_access::ImportGate> =
     Mutex::new(crate::core::ios_access::ImportGate::new());
+#[cfg(target_os = "ios")]
+static IOS_ACCESS_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "ios")]
+static IOS_IMPORT_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(target_os = "ios")]
 static IOS_COMPLETION: Mutex<
     Option<(
         Option<PathBuf>,
         Option<crate::core::ios_access::AccessIssue>,
+        u64,
     )>,
 > = Mutex::new(None);
 #[cfg(target_os = "ios")]
 static IOS_ACCESS_CHANGED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "ios")]
+static IOS_ACCESS_RESUMED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "ios")]
+static IOS_PHOTO_VALIDATION_PENDING: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "ios")]
+static IOS_PHOTO_VALIDATION_SERIAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "ios")]
+static IOS_PHOTO_VALIDATION_REQUEST: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "ios")]
+static IOS_PHOTO_VALIDATION_RESULT: Mutex<Option<(u64, bool)>> = Mutex::new(None);
 #[cfg(target_os = "ios")]
 static IOS_ACCESS_ACTIONS: Mutex<Vec<(i32, bool)>> = Mutex::new(Vec::new());
 static DISPLAY: Mutex<super::mobile_display::DisplayState> =
@@ -106,6 +141,16 @@ fn init_paths() {
                 }
             }
         }
+        #[cfg(target_os = "ios")]
+        if let Ok(entries) = std::fs::read_dir(paths.cache.join("shares")) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with("share-")
+                    && entry.file_type().is_ok_and(|kind| kind.is_file())
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
     }
     let _ = PATHS.set(paths);
 }
@@ -136,11 +181,13 @@ pub fn shutdown_android() {
     unsafe {
         nabi_android_shutdown();
     }
+    ANDROID_OPEN.cancel(|| IMPORT_PENDING.store(false, Ordering::Release));
     CONTEXT.lock().unwrap().take();
     IMPORT.lock().unwrap().take();
     RESULT.lock().unwrap().take();
     SETTINGS.lock().unwrap().take();
     REOPEN.lock().unwrap().take();
+    ANDROID_REUSED.lock().unwrap().take();
     *DISPLAY.lock().unwrap() = super::mobile_display::DisplayState::new();
     BACK.store(false, Ordering::Relaxed);
     LOCALE_CHANGED.store(false, Ordering::Relaxed);
@@ -196,6 +243,12 @@ unsafe extern "C" fn nabi_mobile_text(
         }
     }
     text.len()
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+extern "C" fn nabi_mobile_is_rtl() -> bool {
+    crate::i18n::native_is_rtl()
 }
 
 #[cfg(target_os = "android")]
@@ -289,7 +342,111 @@ pub fn pick() {
     }
 }
 pub fn take_result() -> Option<Result<ImportBatch, String>> {
-    RESULT.lock().unwrap().take()
+    #[cfg(target_os = "android")]
+    {
+        let request = ANDROID_OPEN.request()?;
+        return ANDROID_OPEN.publish(request, take_import_result).flatten();
+    }
+    #[cfg(not(target_os = "android"))]
+    take_import_result()
+}
+
+fn take_import_result() -> Option<Result<ImportBatch, String>> {
+    let mut slot = RESULT.lock().unwrap();
+    let result = slot.take();
+    if result.is_some() {
+        IMPORT_PENDING.store(false, Ordering::Release);
+    }
+    result
+}
+
+pub fn import_pending() -> bool {
+    IMPORT_PENDING.load(Ordering::Acquire)
+}
+
+/// Called when a selection has been confirmed, before any provider I/O.
+#[unsafe(no_mangle)]
+extern "C" fn nabi_mobile_import_pending() {
+    #[cfg(target_os = "android")]
+    let accepted = ANDROID_OPEN.request().is_some_and(|request| {
+        ANDROID_OPEN
+            .publish(request, || IMPORT_PENDING.store(true, Ordering::Release))
+            .is_some()
+    });
+    #[cfg(target_os = "ios")]
+    let accepted = {
+        let mut gate = IOS_IMPORT.lock().unwrap();
+        if !gate.busy() {
+            start_ios_import(&mut gate, None);
+        }
+        let current = gate.current();
+        if current {
+            IMPORT_PENDING.store(true, Ordering::Release);
+        }
+        current
+    };
+    if accepted {
+        repaint();
+    }
+}
+
+/// A successful Java reservation is the only action that permits another open
+/// after home. Never acquire IMPORT here: a provider may be blocking in read().
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+extern "C" fn nabi_android_request_started() {
+    let abandoned = ANDROID_OPEN.start(|| {
+        IMPORT_PENDING.store(false, Ordering::Release);
+        ANDROID_REUSED.lock().unwrap().take();
+        RESULT.lock().unwrap().take()
+    });
+    discard_android_result(abandoned);
+}
+
+#[cfg(target_os = "android")]
+pub fn cancel_android_open() {
+    let abandoned = ANDROID_OPEN.cancel(|| {
+        IMPORT_PENDING.store(false, Ordering::Release);
+        REOPEN.lock().unwrap().take();
+        ANDROID_REUSED.lock().unwrap().take();
+        RESULT.lock().unwrap().take()
+    });
+    discard_android_result(abandoned);
+}
+
+#[cfg(target_os = "android")]
+fn discard_android_result(abandoned: Option<Result<ImportBatch, String>>) {
+    // A completed folder owns many temporary copies. Returning home must not
+    // synchronously delete them on the viewer/Java UI thread either.
+    if let Some(Ok(batch)) = abandoned {
+        std::thread::spawn(move || {
+            super::worker_priority::background();
+            drop(batch);
+        });
+    }
+}
+
+#[cfg(target_os = "ios")]
+pub fn take_seed() -> Option<ImportBatch> {
+    let gate = IOS_IMPORT.lock().unwrap();
+    let (seed, revision) = IOS_SEED.lock().unwrap().take()?;
+    (gate.current()
+        && revision == access_revision()
+        && seed.ios_access_current(revision, photo_status()))
+    .then_some(seed)
+}
+
+#[cfg(target_os = "ios")]
+pub fn take_seed_cancelled() -> bool {
+    IOS_SEED_CANCELLED.swap(false, Ordering::AcqRel)
+}
+
+#[cfg(target_os = "ios")]
+fn cancel_seed() {
+    IOS_SEED.lock().unwrap().take();
+    if IOS_SEED_STARTED.swap(false, Ordering::AcqRel) {
+        IOS_SEED_CANCELLED.store(true, Ordering::Release);
+    }
 }
 
 #[cfg(target_os = "ios")]
@@ -350,7 +507,7 @@ pub fn access_action(action: i32, source: Option<&Path>) -> bool {
             }) {
                 return false;
             }
-            if !IOS_IMPORT.lock().unwrap().start(Some(path.to_owned())) {
+            if !start_access_import(Some(path.to_owned())) {
                 return false;
             }
             *REOPEN.lock().unwrap() = Some(path.to_owned());
@@ -368,7 +525,10 @@ pub fn access_action(action: i32, source: Option<&Path>) -> bool {
 
 #[cfg(target_os = "ios")]
 pub fn cancel_access_import() {
-    IOS_IMPORT.lock().unwrap().cancel();
+    let mut gate = IOS_IMPORT.lock().unwrap();
+    gate.cancel();
+    IMPORT_PENDING.store(false, Ordering::Release);
+    cancel_seed();
     RESULT.lock().unwrap().take();
     IOS_COMPLETION.lock().unwrap().take();
     REOPEN.lock().unwrap().take();
@@ -383,10 +543,56 @@ pub fn access_import_source() -> Option<PathBuf> {
     IOS_IMPORT.lock().unwrap().source()
 }
 
+/// Only PhotoKit content/selection changes invalidate the content revision.
+/// A retained selection may be reused only while its starting revision matches.
+#[cfg(target_os = "ios")]
+pub fn access_revision() -> u64 {
+    IOS_ACCESS_REVISION.load(Ordering::Acquire)
+}
+
+#[cfg(target_os = "ios")]
+fn start_access_import(source: Option<PathBuf>) -> bool {
+    let mut gate = IOS_IMPORT.lock().unwrap();
+    start_ios_import(&mut gate, source)
+}
+
+#[cfg(target_os = "ios")]
+fn start_ios_import(
+    gate: &mut crate::core::ios_access::ImportGate,
+    source: Option<PathBuf>,
+) -> bool {
+    if !gate.start(source) {
+        return false;
+    }
+    // A completed event from A must not be consumed after request B starts.
+    // finish publishes under this same gate, so clearing is ordered with it.
+    RESULT.lock().unwrap().take();
+    IOS_COMPLETION.lock().unwrap().take();
+    cancel_seed();
+    IOS_IMPORT_REVISION.store(access_revision(), Ordering::Release);
+    true
+}
+
+#[cfg(target_os = "ios")]
+fn finish_access_import(
+    gate: &mut crate::core::ios_access::ImportGate,
+) -> Option<(
+    Option<PathBuf>,
+    Option<crate::core::ios_access::AccessIssue>,
+    u64,
+)> {
+    // The gate remains locked until this revision is copied into the result.
+    // Never stamp completion with the newest revision: a change may have
+    // happened while the provider was enumerating the collection.
+    gate.finish()
+        .map(|(source, issue)| (source, issue, IOS_IMPORT_REVISION.load(Ordering::Acquire)))
+}
+
 #[cfg(target_os = "ios")]
 pub fn take_access_completion() -> Option<(
     Option<PathBuf>,
     Option<crate::core::ios_access::AccessIssue>,
+    u64,
 )> {
     IOS_COMPLETION.lock().unwrap().take()
 }
@@ -397,6 +603,76 @@ pub fn take_access_changed() -> bool {
 }
 
 #[cfg(target_os = "ios")]
+pub fn take_access_resumed() -> bool {
+    IOS_ACCESS_RESUMED.swap(false, Ordering::AcqRel)
+}
+
+#[cfg(target_os = "ios")]
+pub fn photo_validation_pending() -> bool {
+    IOS_PHOTO_VALIDATION_PENDING.load(Ordering::Acquire)
+        || IOS_ACCESS_RESUMED.load(Ordering::Acquire)
+}
+
+#[cfg(target_os = "ios")]
+pub fn cancel_photo_validation() {
+    let mut result = IOS_PHOTO_VALIDATION_RESULT.lock().unwrap();
+    IOS_PHOTO_VALIDATION_REQUEST.store(0, Ordering::Release);
+    result.take();
+    IOS_PHOTO_VALIDATION_PENDING.store(false, Ordering::Release);
+}
+
+#[cfg(target_os = "ios")]
+pub fn validate_photo_source(path: &Path) -> Option<u64> {
+    let (_, id) = crate::core::documents::source_identity(path)?;
+    if !crate::core::photo_library::is_ios(&id) {
+        return None;
+    }
+    let source = std::ffi::CString::new(id).ok()?;
+    let request = IOS_PHOTO_VALIDATION_SERIAL.fetch_add(1, Ordering::Relaxed) + 1;
+    {
+        let mut result = IOS_PHOTO_VALIDATION_RESULT.lock().unwrap();
+        result.take();
+        IOS_PHOTO_VALIDATION_REQUEST.store(request, Ordering::Release);
+        IOS_PHOTO_VALIDATION_PENDING.store(true, Ordering::Release);
+    }
+    unsafe extern "C" {
+        fn nabi_photos_validate(source: *const c_char, request: u64);
+    }
+    unsafe { nabi_photos_validate(source.as_ptr(), request) };
+    Some(request)
+}
+
+#[cfg(target_os = "ios")]
+pub fn take_photo_validation() -> Option<(u64, bool)> {
+    IOS_PHOTO_VALIDATION_RESULT.lock().unwrap().take()
+}
+
+#[cfg(target_os = "ios")]
+#[unsafe(no_mangle)]
+extern "C" fn nabi_mobile_access_resumed() {
+    IOS_PHOTO_VALIDATION_PENDING.store(true, Ordering::Release);
+    IOS_ACCESS_RESUMED.store(true, Ordering::Release);
+    repaint();
+}
+
+#[cfg(target_os = "ios")]
+#[unsafe(no_mangle)]
+extern "C" fn nabi_mobile_photo_validation_result(request: u64, same: bool) {
+    let mut result = IOS_PHOTO_VALIDATION_RESULT.lock().unwrap();
+    if request != IOS_PHOTO_VALIDATION_REQUEST.load(Ordering::Acquire) {
+        return;
+    }
+    *result = Some((request, same));
+    if !same {
+        // The observer may lag behind the fresh metadata query. Invalidate
+        // source/cache guards as soon as this request establishes a change.
+        nabi_mobile_access_changed();
+    }
+    drop(result);
+    repaint();
+}
+
+#[cfg(target_os = "ios")]
 pub fn take_access_actions() -> Vec<(i32, bool)> {
     std::mem::take(&mut *IOS_ACCESS_ACTIONS.lock().unwrap())
 }
@@ -404,6 +680,7 @@ pub fn take_access_actions() -> Vec<(i32, bool)> {
 #[cfg(target_os = "ios")]
 #[unsafe(no_mangle)]
 extern "C" fn nabi_mobile_access_changed() {
+    IOS_ACCESS_REVISION.fetch_add(1, Ordering::AcqRel);
     IOS_ACCESS_CHANGED.store(true, Ordering::Relaxed);
     repaint();
 }
@@ -472,7 +749,76 @@ pub fn pick_folder() {
 
 /// Reopens a locally registered source through its native grant. The result is
 /// asynchronous and uses take_result(), including revoked/unavailable grants.
+#[cfg(target_os = "ios")]
 pub fn reopen(path: &Path) -> bool {
+    reopen_impl(path, 0)
+}
+
+#[cfg(target_os = "android")]
+pub fn reopen_android(path: &Path, token: u64) -> bool {
+    reopen_impl(path, token)
+}
+
+#[cfg(target_os = "android")]
+pub fn android_source_epoch() -> u64 {
+    // Only lifecycle/observer epoch and current full permission are checked here.
+    // MediaStore generation queries run on the native import worker.
+    unsafe { nabi_android_source_epoch() }
+}
+
+#[cfg(target_os = "android")]
+pub fn take_android_reused() -> Option<(PathBuf, u64, u64)> {
+    let request = ANDROID_OPEN.request()?;
+    ANDROID_OPEN
+        .publish(request, || {
+            let result = ANDROID_REUSED.lock().unwrap().take();
+            if result.is_some() {
+                IMPORT_PENDING.store(false, Ordering::Release);
+            }
+            result
+        })
+        .flatten()
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+extern "C" fn nabi_android_source_snapshot(token: u64) {
+    if ANDROID_OPEN.importing().is_none() {
+        return;
+    }
+    if let Some(Ok(batch)) = IMPORT.lock().unwrap().as_mut() {
+        batch.set_android_reuse_token(token);
+    }
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+extern "C" fn nabi_android_source_reused(token: u64, epoch: u64) -> bool {
+    if token == 0 || epoch == 0 {
+        return false;
+    }
+    let Some(request) = ANDROID_OPEN.request() else {
+        return false;
+    };
+    let published = ANDROID_OPEN
+        .publish(request, || {
+            let mut pending = REOPEN.lock().unwrap();
+            let Some(path) = pending.take() else {
+                return false;
+            };
+            *ANDROID_REUSED.lock().unwrap() = Some((path, token, epoch));
+            true
+        })
+        .unwrap_or(false);
+    if published {
+        repaint();
+    }
+    published
+}
+
+fn reopen_impl(path: &Path, token: u64) -> bool {
+    #[cfg(target_os = "ios")]
+    let _ = token;
     if !source_available(path) {
         return false;
     }
@@ -486,7 +832,7 @@ pub fn reopen(path: &Path) -> bool {
         return false;
     }
     #[cfg(target_os = "ios")]
-    if !IOS_IMPORT.lock().unwrap().start(Some(path.to_owned())) {
+    if !start_access_import(Some(path.to_owned())) {
         return true;
     }
     {
@@ -497,18 +843,33 @@ pub fn reopen(path: &Path) -> bool {
         if pending.is_some() {
             return true;
         }
+        // A new request supersedes a completed reuse that UI has not polled yet.
+        // Publish/clear this event while holding the same REOPEN gate.
+        #[cfg(target_os = "android")]
+        ANDROID_REUSED.lock().unwrap().take();
         *pending = Some(path.to_owned());
     }
     let id: Vec<u16> = record.id.encode_utf16().collect();
-    if !unsafe { nabi_mobile_reopen(id.as_ptr(), id.len() as i32) } {
+    #[cfg(target_os = "ios")]
+    let accepted = unsafe { nabi_mobile_reopen(id.as_ptr(), id.len() as i32) };
+    #[cfg(target_os = "android")]
+    let accepted = unsafe { nabi_android_reopen_cached(id.as_ptr(), id.len() as i32, token) };
+    if !accepted {
         #[cfg(target_os = "ios")]
         {
-            *IOS_COMPLETION.lock().unwrap() = IOS_IMPORT.lock().unwrap().finish();
+            let completion = finish_access_import(&mut IOS_IMPORT.lock().unwrap());
+            *IOS_COMPLETION.lock().unwrap() = completion;
         }
         REOPEN.lock().unwrap().take();
-        *RESULT.lock().unwrap() = Some(Err(
-            "Another document operation is still in progress.".into()
-        ));
+        let error = Err("Another document operation is still in progress.".into());
+        #[cfg(target_os = "ios")]
+        {
+            *RESULT.lock().unwrap() = Some(error);
+        }
+        #[cfg(target_os = "android")]
+        if let Some(request) = ANDROID_OPEN.request() {
+            ANDROID_OPEN.publish(request, || *RESULT.lock().unwrap() = Some(error));
+        }
         repaint();
     }
     true
@@ -547,9 +908,64 @@ fn with_utf16(path: &Path, send: impl FnOnce(*const u16, i32)) {
 
 /// Opens the system share sheet for a viewer-owned file.
 pub fn share(path: &Path) {
+    #[cfg(target_os = "ios")]
+    if let Some(source) = crate::core::documents::retain_deferred(path) {
+        let path = path.to_owned();
+        std::thread::spawn(move || {
+            let prepare = || -> Result<PathBuf, String> {
+                source.materialize(&path, &|| true)?;
+                let directory = PATHS
+                    .get()
+                    .ok_or("App cache is unavailable")?
+                    .cache
+                    .join("shares");
+                std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+                let extension = path.extension().unwrap_or_default().to_string_lossy();
+                let shared = tempfile::Builder::new()
+                    .prefix("share-")
+                    .suffix(&format!(".{extension}"))
+                    .tempfile_in(directory)
+                    .map_err(|error| error.to_string())?;
+                std::fs::copy(&path, shared.path()).map_err(|error| error.to_string())?;
+                let (_, path) = shared.keep().map_err(|error| error.to_string())?;
+                Ok(path)
+            };
+            match prepare() {
+                Ok(path) => with_utf16(&path, |text, length| unsafe {
+                    unsafe extern "C" {
+                        fn nabi_mobile_share_owned(path: *const u16, length: i32);
+                    }
+                    nabi_mobile_share_owned(text, length)
+                }),
+                Err(error) => {
+                    *SHARE_ERROR.lock().unwrap() = Some(error);
+                    repaint();
+                }
+            }
+        });
+        return;
+    }
+    // A listed-but-unread source is an empty placeholder until loaded.
+    #[cfg(target_os = "android")]
+    if let Some(source) = crate::core::documents::retain_deferred(path) {
+        let path = path.to_owned();
+        std::thread::spawn(move || {
+            if source.materialize(&path, &|| true).is_ok() {
+                with_utf16(&path, |text, length| unsafe {
+                    nabi_mobile_share(text, length)
+                });
+            }
+        });
+        return;
+    }
     with_utf16(path, |text, length| unsafe {
         nabi_mobile_share(text, length)
     });
+}
+
+#[cfg(target_os = "ios")]
+pub fn take_share_error() -> Option<String> {
+    SHARE_ERROR.lock().unwrap().take()
 }
 
 pub fn settings_export_path() -> Result<PathBuf, String> {
@@ -581,15 +997,19 @@ pub fn take_settings_import() -> Option<Result<PathBuf, String>> {
 }
 
 fn begin_import(folder: bool) -> bool {
+    #[cfg(target_os = "android")]
+    let Some(request) = ANDROID_OPEN.begin() else {
+        return false;
+    };
+    nabi_mobile_import_pending();
     #[cfg(target_os = "ios")]
     {
-        let mut gate = IOS_IMPORT.lock().unwrap();
-        if !gate.busy() {
-            gate.start(None);
-        }
+        let gate = IOS_IMPORT.lock().unwrap();
         if !gate.current() {
             return false;
         }
+        IOS_SEED_STARTED.store(false, Ordering::Release);
+        IOS_SEED.lock().unwrap().take();
     }
     let requested = REOPEN.lock().unwrap().take();
     let mut batch = PATHS
@@ -606,8 +1026,14 @@ fn begin_import(folder: bool) -> bool {
         });
     if let Ok(batch) = &mut batch {
         batch.request_page(requested);
+        #[cfg(target_os = "ios")]
+        batch.set_ios_access_stamp(IOS_IMPORT_REVISION.load(Ordering::Acquire), photo_status());
     }
     let ok = batch.is_ok();
+    #[cfg(target_os = "android")]
+    if !ANDROID_OPEN.current(request) {
+        return false;
+    }
     *IMPORT.lock().unwrap() = Some(batch);
     ok
 }
@@ -623,7 +1049,62 @@ extern "C" fn nabi_mobile_import_begin_folder() -> bool {
     begin_import(true)
 }
 
+/// Returns the NUL-inclusive length of the requested concrete page name. A
+/// source-root request has no name; the native provider chooses its first page.
+#[cfg(target_os = "ios")]
+#[unsafe(no_mangle)]
+unsafe extern "C" fn nabi_mobile_import_requested_name(
+    output: *mut c_char,
+    capacity: usize,
+) -> usize {
+    let pending = IMPORT.lock().unwrap();
+    let Some(name) = pending
+        .as_ref()
+        .and_then(|batch| batch.as_ref().ok())
+        .and_then(ImportBatch::requested_name)
+        .and_then(|name| name.to_str())
+    else {
+        return 0;
+    };
+    let length = name.len() + 1;
+    if !output.is_null() && capacity >= length {
+        unsafe {
+            std::ptr::copy_nonoverlapping(name.as_ptr(), output.cast(), name.len());
+            output.add(name.len()).write(0);
+        }
+    }
+    length
+}
+
+#[cfg(target_os = "ios")]
+#[unsafe(no_mangle)]
+extern "C" fn nabi_mobile_import_seed() -> bool {
+    let gate = IOS_IMPORT.lock().unwrap();
+    let revision = IOS_IMPORT_REVISION.load(Ordering::Acquire);
+    if !gate.current() || revision != access_revision() || !photo_status().readable() {
+        return false;
+    }
+    if IOS_SEED_STARTED.load(Ordering::Acquire) {
+        return true;
+    }
+    let pending = IMPORT.lock().unwrap();
+    if let Some(seed) = pending
+        .as_ref()
+        .and_then(|batch| batch.as_ref().ok())
+        .and_then(ImportBatch::snapshot_seed)
+    {
+        *IOS_SEED.lock().unwrap() = Some((seed, revision));
+        IOS_SEED_STARTED.store(true, Ordering::Release);
+        repaint();
+    }
+    true
+}
+
 fn import_source(id: &str, name: &str) {
+    #[cfg(target_os = "android")]
+    if ANDROID_OPEN.importing().is_none() {
+        return;
+    }
     let mut pending = IMPORT.lock().unwrap();
     if let (Some(Ok(batch)), Some(paths)) = (pending.as_mut(), PATHS.get()) {
         if let Err(error) = batch.set_source(&paths.data.join("document-sources"), id, name) {
@@ -705,6 +1186,10 @@ fn import_fd(fd: i32, name: &str) -> bool {
     }
     // The native picker transfers an owned descriptor. Close it on every path.
     let source = unsafe { File::from_raw_fd(fd) };
+    #[cfg(target_os = "android")]
+    let Some(request) = ANDROID_OPEN.importing() else {
+        return false;
+    };
     #[cfg(target_os = "ios")]
     if !IOS_IMPORT.lock().unwrap().current() {
         return false;
@@ -713,12 +1198,23 @@ fn import_fd(fd: i32, name: &str) -> bool {
         .metadata()
         .ok()
         .and_then(|metadata| metadata.modified().ok());
+    #[cfg(target_os = "android")]
+    let source = ANDROID_OPEN.reader(request, source);
     let mut pending = IMPORT.lock().unwrap();
     let Some(Ok(batch)) = pending.as_mut() else {
         return false;
     };
     match batch.add_with_modified(name, source, modified) {
-        Ok(more) => more,
+        Ok(more) => {
+            #[cfg(target_os = "android")]
+            {
+                more && ANDROID_OPEN.current(request)
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                more
+            }
+        }
         Err(error) => {
             *pending = Some(Err(error));
             false
@@ -738,6 +1234,168 @@ unsafe extern "C" fn nabi_mobile_import_file(fd: i32, name: *const c_char) -> bo
     import_fd(fd, &name)
 }
 
+/// Adds a native folder's metadata without opening or copying its original.
+#[cfg(target_os = "ios")]
+#[unsafe(no_mangle)]
+unsafe extern "C" fn nabi_mobile_import_deferred(
+    name: *const c_char,
+    token: *const c_char,
+    bytes: u64,
+    modified: f64,
+    resource_type: i32,
+    content_modified: f64,
+) -> bool {
+    use std::{
+        ffi::{CString, c_void},
+        os::fd::AsRawFd,
+        sync::Arc,
+        time::{Duration, SystemTime},
+    };
+    unsafe extern "C" {
+        fn nabi_mobile_read_source(
+            source: *const c_char,
+            token: *const c_char,
+            fd: i32,
+            limit: u64,
+            live: unsafe extern "C" fn(*mut c_void) -> bool,
+            context: *mut c_void,
+        ) -> i32;
+    }
+    unsafe extern "C" fn still_live(context: *mut c_void) -> bool {
+        let live = unsafe { &*(context.cast::<&dyn Fn() -> bool>()) };
+        live()
+    }
+    if name.is_null() || token.is_null() || !IOS_IMPORT.lock().unwrap().current() {
+        return false;
+    }
+    let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
+    let token = unsafe { CStr::from_ptr(token) }.to_owned();
+    let mut pending = IMPORT.lock().unwrap();
+    let Some(Ok(batch)) = pending.as_mut() else {
+        return false;
+    };
+    let Some(source) = batch
+        .source()
+        .and_then(|source| CString::new(source.id.clone()).ok())
+    else {
+        return false;
+    };
+    let timestamp = |value: f64| {
+        (value.is_finite() && value > 0.0 && value < 1.0e12)
+            .then(|| SystemTime::UNIX_EPOCH + Duration::from_secs_f64(value))
+    };
+    let modified = timestamp(modified);
+    let revision = IOS_IMPORT_REVISION.load(Ordering::Acquire);
+    let provider_cache = super::ios_photo_cache::from_authorized_import(
+        source.to_str().unwrap_or_default(),
+        &token,
+        &name,
+        resource_type,
+        timestamp(content_modified),
+        revision,
+    )
+    .or_else(|| {
+        // Files-app folders: a stable key, so reopening hits the disk cache.
+        super::document_cache::from_document_folder(
+            source.to_str().unwrap_or_default(),
+            &name,
+            bytes,
+            modified,
+        )
+    });
+    match batch.add_deferred_with_cache(
+        &name,
+        bytes,
+        modified,
+        provider_cache,
+        Arc::new(move |output, limit, live| {
+            let mut live = live;
+            let result = unsafe {
+                nabi_mobile_read_source(
+                    source.as_ptr(),
+                    token.as_ptr(),
+                    output.as_raw_fd(),
+                    limit,
+                    still_live,
+                    (&mut live as *mut &dyn Fn() -> bool).cast(),
+                )
+            };
+            match result {
+                0 => Ok(()),
+                -1 => Err("Cancelled".into()),
+                reason => Err(crate::i18n::tr(
+                    crate::core::ios_access::AccessIssue::from_native(reason).message(),
+                )
+                .into()),
+            }
+        }),
+    ) {
+        Ok(more) => more,
+        Err(error) => {
+            *pending = Some(Err(error));
+            false
+        }
+    }
+}
+
+/// Adds a MediaStore or SAF item by metadata only. Its pixels are read through
+/// the host when a decoder first needs them; the token stays in memory.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+unsafe extern "C" fn nabi_mobile_import_deferred_utf16(
+    name: *const u16,
+    name_length: usize,
+    token: *const u16,
+    token_length: usize,
+    bytes: u64,
+    modified_millis: i64,
+    kind: i32,
+) -> bool {
+    use super::android_media;
+    if name.is_null() || token.is_null() {
+        return false;
+    }
+    let Some(request) = ANDROID_OPEN.importing() else {
+        return false;
+    };
+    let name = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(name, name_length) });
+    let token =
+        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(token, token_length) });
+    if !matches!(
+        kind,
+        android_media::MEDIA_STORE | android_media::DOCUMENT | android_media::MEDIA_STORE_PARTIAL
+    ) || token.is_empty()
+    {
+        return false;
+    }
+    let cache = android_media::provider_cache(kind, &token, modified_millis, bytes);
+    let loader = android_media::loader(kind, token);
+    let mut pending = IMPORT.lock().unwrap();
+    let Some(Ok(batch)) = pending.as_mut() else {
+        return false;
+    };
+    match batch.add_deferred_with_cache(
+        &name,
+        bytes,
+        android_media::modified_time(modified_millis),
+        Some(cache),
+        loader,
+    ) {
+        Ok(more) => more && ANDROID_OPEN.current(request),
+        Err(error) => {
+            *pending = Some(Err(error));
+            false
+        }
+    }
+}
+
+/// Full photo access was lost; earlier MediaStore identities stop matching.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+extern "C" fn nabi_android_media_access_changed() {
+    super::android_media::access_changed();
+}
+
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn nabi_mobile_import_utf16(fd: i32, name: *const u16, length: usize) -> bool {
@@ -750,6 +1408,10 @@ unsafe extern "C" fn nabi_mobile_import_utf16(fd: i32, name: *const u16, length:
 }
 
 fn import_error(error: String) {
+    #[cfg(target_os = "android")]
+    if ANDROID_OPEN.importing().is_none() {
+        return;
+    }
     *IMPORT.lock().unwrap() = Some(Err(error));
 }
 
@@ -774,6 +1436,10 @@ extern "C" fn nabi_mobile_photo_error(reason: i32) {
 
 #[unsafe(no_mangle)]
 extern "C" fn nabi_mobile_import_truncated() {
+    #[cfg(target_os = "android")]
+    if ANDROID_OPEN.importing().is_none() {
+        return;
+    }
     if let Some(Ok(batch)) = IMPORT.lock().unwrap().as_mut() {
         batch.mark_truncated();
     }
@@ -793,41 +1459,106 @@ unsafe extern "C" fn nabi_mobile_import_error(message: *const c_char) {
 
 #[unsafe(no_mangle)]
 extern "C" fn nabi_mobile_import_finish() {
+    #[cfg(target_os = "android")]
+    let request = ANDROID_OPEN.importing();
+    let mut result = IMPORT.lock().unwrap().take();
+    #[cfg(target_os = "android")]
+    let Some(request) = request else {
+        // Dispose the cancelled copies on their import worker, not home's UI.
+        return;
+    };
+    if result.as_ref().is_some_and(|result| {
+        result
+            .as_ref()
+            .is_ok_and(|batch| batch.is_folder() && batch.first().is_none())
+    }) {
+        result = Some(Err("No supported images were found in the folder.".into()));
+    }
+    // Keep the request busy, but never hold its UI-facing lock during JSON
+    // encoding or fsync. Cancellation remains responsive and cannot start a
+    // competing source writer until this native request has drained.
+    let prepared = match result.as_mut() {
+        Some(Ok(batch)) if batch.first().is_some() => match batch.prepare_source_commit() {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                result = Some(Err(error));
+                None
+            }
+        },
+        _ => None,
+    };
+    #[cfg(target_os = "android")]
+    {
+        ANDROID_OPEN.publish(request, || {
+            if let Some(Ok(batch)) = &result {
+                if let Err(error) = batch.commit_prepared_source(prepared) {
+                    result = Some(Err(error));
+                }
+            }
+            if let Some(result) = result.filter(|result| {
+                result
+                    .as_ref()
+                    .map_or(true, |batch| batch.first().is_some())
+            }) {
+                *RESULT.lock().unwrap() = Some(result);
+            } else if RESULT.lock().unwrap().is_none() {
+                IMPORT_PENDING.store(false, Ordering::Release);
+            }
+        });
+        repaint();
+        return;
+    }
     #[cfg(target_os = "ios")]
     let mut gate = IOS_IMPORT.lock().unwrap();
     #[cfg(target_os = "ios")]
     {
+        let photo = gate
+            .source()
+            .is_some_and(|path| crate::core::photo_library::title(&path).is_some());
+        if photo
+            && (IOS_IMPORT_REVISION.load(Ordering::Acquire) != access_revision()
+                || !photo_status().readable())
+        {
+            gate.cancel();
+        }
         if !gate.current() {
             gate.finish();
-            IMPORT.lock().unwrap().take();
+            IMPORT_PENDING.store(false, Ordering::Release);
+            cancel_seed();
             repaint();
             return;
         }
-        *IOS_COMPLETION.lock().unwrap() = gate.finish();
     }
-    if let Some(mut result) = IMPORT.lock().unwrap().take() {
-        if result
-            .as_ref()
-            .is_ok_and(|batch| batch.is_folder() && batch.first().is_none())
-        {
-            result = Err("No supported images were found in the folder.".into());
+    // Only the atomic publication runs under the request gate. A cancelled
+    // request drops its prepared marker instead of replacing saved metadata.
+    #[cfg(target_os = "ios")]
+    if let Some(Ok(batch)) = &result {
+        if let Err(error) = batch.commit_prepared_source(prepared) {
+            result = Some(Err(error));
         }
-        if let Ok(batch) = &mut result {
-            if batch.first().is_some() {
-                if let Err(error) = batch.commit_source() {
-                    result = Err(error);
-                }
-            }
+    }
+    #[cfg(target_os = "ios")]
+    {
+        *IOS_COMPLETION.lock().unwrap() = finish_access_import(&mut gate);
+        if result.as_ref().is_some_and(Result::is_err) {
+            cancel_seed();
+        } else {
+            IOS_SEED.lock().unwrap().take();
         }
-        // A cancelled/empty picker leaves the current selection untouched.
-        if result
+    }
+    // A cancelled/empty picker leaves the current selection untouched.
+    #[cfg(target_os = "ios")]
+    if let Some(result) = result.filter(|result| {
+        result
             .as_ref()
             .map_or(true, |batch| batch.first().is_some())
-        {
-            *RESULT.lock().unwrap() = Some(result);
-            repaint();
-        }
+    }) {
+        *RESULT.lock().unwrap() = Some(result);
+    } else {
+        IMPORT_PENDING.store(false, Ordering::Release);
     }
+    #[cfg(target_os = "ios")]
+    repaint();
 }
 
 #[unsafe(no_mangle)]

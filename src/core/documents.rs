@@ -9,7 +9,7 @@ use std::{
     fs::File,
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::SystemTime,
 };
 
@@ -21,6 +21,16 @@ const FOLDER_BATCH_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 const FOLDER_COUNT_LIMIT: usize = 1000;
 const SOURCE_MARKER: &str = ".nabi-document-source.json";
 const SOURCE_LIMIT: u64 = 1024 * 1024;
+
+#[cfg(any(target_os = "ios", target_os = "android", test))]
+mod deferred;
+#[cfg(any(target_os = "ios", target_os = "android"))]
+pub(crate) use deferred::retain_deferred;
+#[cfg(any(target_os = "ios", target_os = "android", test))]
+pub(crate) use deferred::{
+    ProviderCache, ProviderIdentity, can_warm_thumbnail, deferred_size, deferred_stamp,
+    has_provider_thumbnail, materialize, provider_cache_identity, provider_thumbnail,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -238,8 +248,10 @@ pub(crate) fn source_local_path(path: &Path) -> Option<PathBuf> {
         .map(|root| root.join(relative))
 }
 
+#[derive(Clone)]
 pub(crate) struct ImportBatch {
-    directory: tempfile::TempDir,
+    directory: Arc<tempfile::TempDir>,
+    lease: Arc<BatchLease>,
     canonical_directory: PathBuf,
     files: Vec<PathBuf>,
     sort_metadata: HashMap<PathBuf, FileSortMetadata>,
@@ -249,6 +261,27 @@ pub(crate) struct ImportBatch {
     truncated: bool,
     source: Option<SourceRecord>,
     requested: Option<PathBuf>,
+    seed: bool,
+    #[cfg(any(target_os = "ios", test))]
+    ios_access_stamp: Option<(u64, crate::core::ios_access::PhotoStatus)>,
+    /// Ephemeral Android host token for this exact owned batch. Not an OS grant.
+    #[cfg(any(target_os = "android", test))]
+    android_reuse_token: u64,
+    #[cfg(any(target_os = "ios", target_os = "android", test))]
+    deferred_budget: Arc<Mutex<deferred::Budget>>,
+}
+
+/// A seed and its completed list own the same provider registration. Dropping
+/// either snapshot must not revoke the other's files or deferred capabilities.
+struct BatchLease {
+    directory: Arc<tempfile::TempDir>,
+    canonical_directory: PathBuf,
+    source: Mutex<Option<PathBuf>>,
+}
+
+pub(crate) struct SourceCommit {
+    temporary: tempfile::NamedTempFile,
+    destination: PathBuf,
 }
 
 /// Images removed from the viewer's list are parked here, outside the listed
@@ -271,8 +304,15 @@ impl ImportBatch {
             .map_err(|e| e.to_string())?;
         let canonical_directory =
             crate::core::paths::canonicalize(directory.path()).map_err(|e| e.to_string())?;
+        let directory = Arc::new(directory);
+        let lease = Arc::new(BatchLease {
+            directory: directory.clone(),
+            canonical_directory: canonical_directory.clone(),
+            source: Mutex::new(None),
+        });
         Ok(Self {
             directory,
+            lease,
             canonical_directory,
             files: Vec::new(),
             sort_metadata: HashMap::new(),
@@ -282,6 +322,13 @@ impl ImportBatch {
             truncated: false,
             source: None,
             requested: None,
+            seed: false,
+            #[cfg(any(target_os = "ios", test))]
+            ios_access_stamp: None,
+            #[cfg(any(target_os = "android", test))]
+            android_reuse_token: 0,
+            #[cfg(any(target_os = "ios", target_os = "android", test))]
+            deferred_budget: Arc::new(Mutex::new(deferred::Budget::new(FOLDER_BATCH_LIMIT))),
         })
     }
 
@@ -303,6 +350,85 @@ impl ImportBatch {
     pub fn directory(&self) -> &Path {
         &self.canonical_directory
     }
+
+    pub(crate) fn is_seed(&self) -> bool {
+        self.seed
+    }
+
+    #[cfg(any(target_os = "ios", test))]
+    pub(crate) fn set_ios_access_stamp(
+        &mut self,
+        revision: u64,
+        status: crate::core::ios_access::PhotoStatus,
+    ) {
+        self.ios_access_stamp = Some((revision, status));
+    }
+
+    #[cfg(any(target_os = "ios", test))]
+    pub(crate) fn ios_access_current(
+        &self,
+        revision: u64,
+        status: crate::core::ios_access::PhotoStatus,
+    ) -> bool {
+        self.source
+            .as_ref()
+            .is_none_or(|source| !crate::core::photo_library::is_ios(&source.id))
+            || (status.readable() && self.ios_access_stamp == Some((revision, status)))
+    }
+
+    pub(crate) fn same_import(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.lease, &other.lease)
+    }
+
+    pub(crate) fn files(&self) -> &[PathBuf] {
+        &self.files
+    }
+
+    pub(crate) fn sort_metadata(&self) -> HashMap<PathBuf, FileSortMetadata> {
+        let mut stamps = self.sort_metadata.clone();
+        self.apply_sort_metadata(&mut stamps);
+        stamps
+    }
+
+    #[cfg(any(target_os = "ios", test))]
+    pub(crate) fn requested_name(&self) -> Option<&std::ffi::OsStr> {
+        let relative = self
+            .requested
+            .as_ref()?
+            .strip_prefix(&self.source.as_ref()?.root)
+            .ok()?;
+        (safe_relative(relative) && relative.components().count() == 1)
+            .then(|| relative.as_os_str())
+    }
+
+    /// Only the exact requested page, or the native-selected first page of a
+    /// root request, may become an early display. Never persist this short list.
+    #[cfg(any(target_os = "ios", test))]
+    pub(crate) fn snapshot_seed(&self) -> Option<Self> {
+        let source = self.source.as_ref()?;
+        let path = match self.requested.as_deref() {
+            Some(requested) if requested != source.root => self.local_path(requested)?,
+            _ => self.first()?.to_owned(),
+        };
+        if !self.files.contains(&path) {
+            return None;
+        }
+        let mut seed = self.clone();
+        seed.files = vec![path.clone()];
+        seed.sort_metadata.retain(|candidate, _| candidate == &path);
+        seed.seed = true;
+        seed.publish_source_mapping();
+        Some(seed)
+    }
+
+    fn publish_source_mapping(&self) {
+        if let Some(source) = &self.source {
+            active_sources()
+                .lock()
+                .unwrap()
+                .insert(source.root.clone(), self.canonical_directory.clone());
+        }
+    }
     /// Provider metadata is kept only for the owned copies. In particular, a
     /// missing provider time must replace the staging file's creation-time mtime.
     /// Archive members retain the archive index's own ordering metadata.
@@ -310,6 +436,10 @@ impl ImportBatch {
         for (path, stamp) in stamps {
             if let Some(original) = self.sort_metadata.get(path) {
                 *stamp = *original;
+                #[cfg(any(target_os = "ios", target_os = "android", test))]
+                if let Some(bytes) = deferred_size(path) {
+                    stamp.bytes = bytes;
+                }
             }
         }
     }
@@ -335,6 +465,16 @@ impl ImportBatch {
         self.requested = path;
     }
 
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn android_reuse_token(&self) -> u64 {
+        self.android_reuse_token
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn set_android_reuse_token(&mut self, token: u64) {
+        self.android_reuse_token = token;
+    }
+
     pub fn set_source(&mut self, sources: &Path, id: &str, name: &str) -> Result<(), String> {
         if !valid_id(id) || !sources.is_absolute() {
             return Err("Invalid saved document source.".into());
@@ -353,14 +493,26 @@ impl ImportBatch {
             pages: Vec::new(),
             folder: self.folder,
         });
+        *self.lease.source.lock().unwrap() = self.source.as_ref().map(|source| source.root.clone());
         Ok(())
     }
 
     /// Atomically publishes metadata after a successful bounded import. Source
     /// pixels remain in the cache-owned TempDir and disappear with the batch.
+    #[cfg(test)]
     pub fn commit_source(&mut self) -> Result<(), String> {
+        let prepared = self.prepare_source_commit()?;
+        self.commit_prepared_source(prepared)
+    }
+
+    /// Serialize and sync outside the native request gate. A cancelled request
+    /// can discard this temporary without publishing an obsolete source list.
+    pub(crate) fn prepare_source_commit(&mut self) -> Result<Option<SourceCommit>, String> {
+        if self.seed {
+            return Err("An incomplete source list cannot replace saved metadata.".into());
+        }
         let Some(source) = &mut self.source else {
-            return Ok(());
+            return Ok(None);
         };
         source.pages = self
             .files
@@ -376,16 +528,28 @@ impl ImportBatch {
         let mut temp = tempfile::NamedTempFile::new_in(&source.root).map_err(|e| e.to_string())?;
         serde_json::to_writer(&mut temp, source).map_err(|e| e.to_string())?;
         temp.as_file_mut().sync_all().map_err(|e| e.to_string())?;
-        temp.persist(source.root.join(SOURCE_MARKER))
-            .map_err(|e| e.to_string())?;
-        active_sources()
-            .lock()
-            .unwrap()
-            .insert(source.root.clone(), self.canonical_directory.clone());
+        Ok(Some(SourceCommit {
+            temporary: temp,
+            destination: source.root.join(SOURCE_MARKER),
+        }))
+    }
+
+    pub(crate) fn commit_prepared_source(
+        &self,
+        prepared: Option<SourceCommit>,
+    ) -> Result<(), String> {
+        if let Some(prepared) = prepared {
+            prepared
+                .temporary
+                .persist(prepared.destination)
+                .map_err(|e| e.to_string())?;
+        }
+        self.publish_source_mapping();
         Ok(())
     }
 
     /// Message for images left out of a folder import, if any.
+    #[cfg(any(target_os = "ios", target_os = "android"))]
     pub(crate) fn mark_truncated(&mut self) {
         self.truncated = true;
     }
@@ -438,6 +602,65 @@ impl ImportBatch {
         {
             self.skipped += 1;
         }
+        Ok(true)
+    }
+
+    /// Publishes names before opening native resources. The loader runs only
+    /// on a decode/metadata worker; neither a URI nor a native grant is saved.
+    #[cfg(test)]
+    pub(crate) fn add_deferred(
+        &mut self,
+        name: &str,
+        bytes: u64,
+        modified: Option<SystemTime>,
+        loader: deferred::Loader,
+    ) -> Result<bool, String> {
+        self.add_deferred_with_cache(name, bytes, modified, None, loader)
+    }
+
+    #[cfg(any(target_os = "ios", target_os = "android", test))]
+    pub(crate) fn add_deferred_with_cache(
+        &mut self,
+        name: &str,
+        bytes: u64,
+        modified: Option<SystemTime>,
+        provider_cache: Option<ProviderCache>,
+        loader: deferred::Loader,
+    ) -> Result<bool, String> {
+        if !self.folder || !crate::core::media::is_supported(Path::new(name)) {
+            return Ok(true);
+        }
+        if self.files.len() >= FOLDER_COUNT_LIMIT {
+            self.truncated = true;
+            return Ok(false);
+        }
+        if bytes > FILE_LIMIT {
+            self.skipped += 1;
+            return Ok(true);
+        }
+        // Reuse the bounded import's naming and collision rules without
+        // reading the provider. The one-byte sentinel is immediately removed.
+        let old_bytes = self.bytes;
+        if self
+            .add_limited(name, &[0u8][..], FILE_LIMIT, FOLDER_BATCH_LIMIT, modified)
+            .is_err()
+        {
+            self.skipped += 1;
+            return Ok(true);
+        }
+        self.bytes = old_bytes;
+        let path = self.files.last().unwrap().clone();
+        File::create(&path).map_err(|error| error.to_string())?;
+        self.sort_metadata.get_mut(&path).unwrap().bytes = bytes;
+        deferred::register(
+            path,
+            self.directory.clone(),
+            self.deferred_budget.clone(),
+            bytes,
+            modified,
+            provider_cache,
+            loader,
+        );
         Ok(true)
     }
 
@@ -532,15 +755,17 @@ impl ImportBatch {
     }
 }
 
-impl Drop for ImportBatch {
+impl Drop for BatchLease {
     fn drop(&mut self) {
-        if let Some(source) = &self.source {
+        #[cfg(any(target_os = "ios", target_os = "android", test))]
+        deferred::unregister(&self.canonical_directory);
+        if let Some(source) = self.source.lock().unwrap().as_ref() {
             let mut active = active_sources().lock().unwrap();
             if active
-                .get(&source.root)
+                .get(source)
                 .is_some_and(|path| path == &self.canonical_directory)
             {
-                active.remove(&source.root);
+                active.remove(source);
             }
         }
         if let Some(removed) = removed_directory(self.directory.path()) {
@@ -548,6 +773,10 @@ impl Drop for ImportBatch {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "documents/seed_tests.rs"]
+mod seed_tests;
 
 #[cfg(test)]
 mod tests {

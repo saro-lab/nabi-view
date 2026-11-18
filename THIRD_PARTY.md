@@ -47,6 +47,9 @@ NABI VIEW's separate original source files.
   The MIT-licensed `ds_store` and `mac_alias` helpers and the Chromium
   BSD-style DMG layout recipe retain their notices under `vendor/dmg-layout/`.
   These Python helpers are build tools, not application resources.
+- `vendor/zip-apple` contains MIT-licensed zip 9.5.1 with a feature gate for
+  legacy ZipCrypto. macOS and iOS use this source with both ZIP encryption
+  features disabled. Other platforms use the published zip crate.
 
 ## Notice provenance and review scope
 

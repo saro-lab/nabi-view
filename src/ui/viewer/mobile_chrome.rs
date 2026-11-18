@@ -2,6 +2,31 @@
 use super::*;
 
 impl Viewer {
+    /// Compare the rendered image with its normal view, rather than treating
+    /// every manual percentage as zoomed. A small image at 100% can still fit.
+    pub(super) fn touch_pan_mode(&self, canvas: Vec2, ctx: &egui::Context) -> bool {
+        let (first, last) = self.focus_span();
+        let slot = egui::vec2(canvas.x / if first == last { 1. } else { 2. }, canvas.y);
+        let transform = ImageTransform::from_settings(&self.settings);
+        (first..=last).any(|index| {
+            self.files
+                .get(index)
+                .and_then(|path| self.pictures.get(path))
+                .is_some_and(|picture| {
+                    let size = transform.size(egui::vec2(
+                        picture.original[0] as f32,
+                        picture.original[1] as f32,
+                    ));
+                    let shown = size * self.image_scale(size, slot, ctx);
+                    let normal = size * self.image_scale_for(size, slot, ctx, 1., None);
+                    shown.x > slot.x + 0.001
+                        || shown.y > slot.y + 0.001
+                        || shown.x > normal.x + 0.001
+                        || shown.y > normal.y + 0.001
+                })
+        })
+    }
+
     pub(super) fn touch_canvas(
         &mut self,
         ctx: &egui::Context,
@@ -56,6 +81,7 @@ impl Viewer {
             self.interrupt_mobile_swipe(ctx, response.rect);
         }
         if ctx.input(|i| i.pointer.primary_pressed())
+            && !self.touch_gesture.active()
             && response.contains_pointer()
             && let Some(position) = ctx.pointer_interact_pos()
         {
@@ -63,6 +89,20 @@ impl Viewer {
         }
         if !self.touch_gesture.active() {
             return;
+        }
+        // Some backends release/reassign the primary pointer when its finger
+        // lifts during a pinch. Keep the same gesture locked until all fingers
+        // are up, including when the remaining finger becomes primary.
+        if self.touch_gesture.was_multiple()
+            && ctx.input(|i| !i.any_touches() && !i.pointer.primary_down())
+        {
+            self.touch_gesture.cancel();
+            self.mobile_swipe = None;
+            return;
+        }
+        if self.touch_pan_mode(response.rect.size(), ctx) {
+            self.touch_gesture.lock_pan();
+            self.mobile_swipe = None;
         }
         if let Some(touch) = ctx
             .input(|i| i.multi_touch())
@@ -112,6 +152,9 @@ impl Viewer {
             self.pan += ctx.input(|i| i.pointer.delta());
         }
         if ctx.input(|i| i.pointer.primary_released()) {
+            if self.touch_gesture.was_multiple() && ctx.input(|i| i.any_touches()) {
+                return;
+            }
             let multiple = self.touch_gesture.was_multiple();
             // Native touch-up also sends PointerGone in this frame. The
             // interaction position survives it; latest_pos does not.

@@ -199,3 +199,56 @@ int nabi_decode_image(const char *path, unsigned char **pixels, unsigned int *wi
     }
 }
 void nabi_free_image(unsigned char *pixels) { free(pixels); }
+// Scaled while decoding (ImageIO thumbnail path, EXIF transform applied) and
+// drawn once into a caller-allocated sRGB buffer as straight-alpha RGBA.
+// original receives the upright header size. 0 is success.
+typedef unsigned char *(*nabi_scaled_alloc)(void *, size_t);
+int nabi_decode_image_scaled(const char *path, unsigned int max_side, unsigned long long max_pixels,
+        nabi_scaled_alloc alloc, void *context, unsigned int *width, unsigned int *height,
+        unsigned int *original) {
+    @autoreleasepool {
+        if (!max_side || !max_pixels) return -1;
+        NSURL *url = [NSURL fileURLWithFileSystemRepresentation:path isDirectory:NO relativeToURL:nil];
+        NSDictionary *sourceOptions = @{(__bridge NSString *)kCGImageSourceShouldCache: @NO};
+        CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)url,
+            (__bridge CFDictionaryRef)sourceOptions);
+        if (!source) return -1;
+        NSDictionary *properties = CFBridgingRelease(CGImageSourceCopyPropertiesAtIndex(source, 0, NULL));
+        uint64_t w = [properties[(__bridge NSString *)kCGImagePropertyPixelWidth] unsignedLongLongValue];
+        uint64_t h = [properties[(__bridge NSString *)kCGImagePropertyPixelHeight] unsignedLongLongValue];
+        NSInteger orientation = [properties[(__bridge NSString *)kCGImagePropertyOrientation] integerValue];
+        if (!w || !h || w * h > 256000000ULL) { CFRelease(source); return -2; }
+        double scale = MIN(1.0, MIN((double)max_side / (double)MAX(w, h),
+            sqrt((double)max_pixels / ((double)w * (double)h))));
+        NSUInteger edge = MAX((NSUInteger)1, (NSUInteger)floor((double)MAX(w, h) * scale));
+        NSDictionary *options = @{
+            (__bridge NSString *)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+            (__bridge NSString *)kCGImageSourceCreateThumbnailWithTransform: @YES,
+            (__bridge NSString *)kCGImageSourceShouldCacheImmediately: @YES,
+            (__bridge NSString *)kCGImageSourceThumbnailMaxPixelSize: @(edge),
+        };
+        CGImageRef image = CGImageSourceCreateThumbnailAtIndex(source, 0, (__bridge CFDictionaryRef)options);
+        CFRelease(source);
+        if (!image) return -3;
+        size_t ow = CGImageGetWidth(image), oh = CGImageGetHeight(image);
+        unsigned char *data = ow && oh && ow <= max_side && oh <= max_side ? alloc(context, ow * oh * 4) : NULL;
+        if (!data) { CGImageRelease(image); return -4; }
+        CGColorSpaceRef color = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        CGContextRef bitmap = CGBitmapContextCreate(data, ow, oh, 8, ow * 4, color,
+            kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+        CGColorSpaceRelease(color);
+        if (!bitmap) { CGImageRelease(image); return -4; }
+        CGContextSetBlendMode(bitmap, kCGBlendModeCopy);
+        CGContextDrawImage(bitmap, CGRectMake(0, 0, ow, oh), image);
+        CGContextRelease(bitmap); CGImageRelease(image);
+        for (size_t i = 0; i < ow * oh; ++i) {
+            unsigned a = data[i * 4 + 3];
+            if (a && a < 255) for (int c = 0; c < 3; ++c) data[i * 4 + c] = MIN(255, (data[i * 4 + c] * 255 + a / 2) / a);
+        }
+        // EXIF orientations 5-8 swap the axes.
+        BOOL swapped = orientation >= 5 && orientation <= 8;
+        *width = (unsigned int)ow; *height = (unsigned int)oh;
+        original[0] = (unsigned int)(swapped ? h : w); original[1] = (unsigned int)(swapped ? w : h);
+        return 0;
+    }
+}

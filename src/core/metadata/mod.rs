@@ -105,6 +105,8 @@ fn utc_time(time: SystemTime) -> Option<String> {
 }
 
 pub fn read(path: &Path) -> Result<Metadata, String> {
+    #[cfg(any(target_os = "ios", target_os = "android", test))]
+    crate::core::documents::materialize(path, &|| true)?;
     #[cfg(all(target_os = "macos", not(test)))]
     let access = crate::platform::mac_access::resolve(path)?;
     #[cfg(all(target_os = "macos", not(test)))]

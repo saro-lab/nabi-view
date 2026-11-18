@@ -71,6 +71,7 @@
   "toggle-thumbnails": "แสดง/ซ่อนภาพขนาดย่อ",
   "hide-or-show-controls": "ซ่อนหรือแสดงตัวควบคุม",
   "remember-recent-items": "บันทึกประวัติการเปิด",
+  "prepare-recent-and-bookmarked-folders": "เตรียมโฟลเดอร์ล่าสุดและที่บุ๊กมาร์กไว้ล่วงหน้า",
   "clear-recent-items": "ล้างประวัติการเปิด",
   "export-settings": "ส่งออกการตั้งค่า",
   "import-settings": "นำเข้าการตั้งค่า",

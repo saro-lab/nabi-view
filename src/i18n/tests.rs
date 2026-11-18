@@ -67,6 +67,26 @@ fn translation_fallback_and_named_values_do_not_reinterpret_user_text() {
 }
 
 #[test]
+fn native_dialog_direction_and_text_follow_the_published_viewer_language() {
+    // Java's UI thread has no Rust CURRENT catalog. Simulate the publication
+    // performed by set_language on native builds without changing other host
+    // tests' thread-local language preferences.
+    for (index, language) in Language::ALL.iter().skip(1).enumerate() {
+        NATIVE_CURRENT.store(index, std::sync::atomic::Ordering::Relaxed);
+        let expected_rtl = language.is_rtl();
+        let expected_text = catalog(index)["settings"].clone();
+        std::thread::spawn(move || {
+            assert_eq!(current(), Language::English);
+            assert_eq!(native_is_rtl(), expected_rtl);
+            assert_eq!(native_tr("settings"), expected_text);
+        })
+        .join()
+        .unwrap();
+    }
+    NATIVE_CURRENT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[test]
 fn ui_direction_is_independent_of_image_reading_direction() {
     let settings = crate::core::settings::Settings::default();
     for language in Language::ALL.iter().skip(1) {

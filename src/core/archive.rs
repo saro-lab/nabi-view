@@ -9,6 +9,7 @@ use std::{
     fs,
     io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
     time::{Duration, SystemTime},
 };
 
@@ -24,9 +25,13 @@ const STALE_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     /// The archive is encrypted and no password was given.
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     PasswordRequired,
     /// The given password does not decrypt the archive.
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     WrongPassword,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    EncryptedUnsupported,
     Cancelled,
     Failed(String),
 }
@@ -34,8 +39,14 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             Self::PasswordRequired => f.write_str("The archive needs a password."),
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             Self::WrongPassword => f.write_str("The password is incorrect."),
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            Self::EncryptedUnsupported => {
+                f.write_str("Password-protected archives are not supported on macOS or iOS.")
+            }
             Self::Cancelled => f.write_str("Cancelled"),
             Self::Failed(error) => write!(f, "Could not open the archive. {error}"),
         }
@@ -76,6 +87,8 @@ pub struct Page {
 /// files are deleted when this is dropped.
 pub struct Extracted {
     dir: Option<tempfile::TempDir>,
+    /// Canonical folder whose pages are registered in `origins()`.
+    registered: Option<PathBuf>,
     pub pages: Vec<Page>,
     /// Images left out because of size or count limits.
     pub skipped: usize,
@@ -90,6 +103,12 @@ impl Extracted {
 
 impl Drop for Extracted {
     fn drop(&mut self) {
+        if let Some(registered) = self.registered.take() {
+            origins()
+                .lock()
+                .unwrap()
+                .retain(|file, _| !file.starts_with(&registered));
+        }
         let Some(dir) = self.dir.take() else { return };
         let path = dir.keep();
         if fs::remove_dir_all(&path).is_ok() {
@@ -106,6 +125,49 @@ impl Drop for Extracted {
                     }
                 }
             });
+    }
+}
+
+/// Extracted pages by canonical file path: the archive and the path inside it.
+/// Caches key a page by this origin, so a new extraction folder still hits.
+fn origins() -> &'static Mutex<HashMap<PathBuf, (PathBuf, PathBuf)>> {
+    static ORIGINS: OnceLock<Mutex<HashMap<PathBuf, (PathBuf, PathBuf)>>> = OnceLock::new();
+    ORIGINS.get_or_init(Default::default)
+}
+
+/// The archive file and inner path of an extracted page, while it exists.
+/// `archive/inner` for an extracted page, as saved state names it.
+pub(crate) fn logical_page(file: &Path) -> Option<PathBuf> {
+    let file = crate::core::paths::canonicalize(file).ok()?;
+    page_origin(&file).map(|(archive, inner)| archive.join(inner))
+}
+
+/// Expects a canonical path, as cache keys use.
+pub(crate) fn page_origin(file: &Path) -> Option<(PathBuf, PathBuf)> {
+    origins().lock().unwrap().get(file).cloned()
+}
+
+fn registered(
+    archive: &Path,
+    dir: tempfile::TempDir,
+    pages: Vec<Page>,
+    skipped: usize,
+) -> Extracted {
+    let folder = crate::core::paths::canonicalize(dir.path()).ok();
+    let archive = crate::core::paths::canonicalize(archive).ok();
+    if let (Some(_), Some(archive)) = (&folder, &archive) {
+        let mut origins = origins().lock().unwrap();
+        for page in &pages {
+            if let Ok(file) = crate::core::paths::canonicalize(&page.file) {
+                origins.insert(file, (archive.clone(), page.inner.clone()));
+            }
+        }
+    }
+    Extracted {
+        dir: Some(dir),
+        registered: folder.filter(|_| archive.is_some()),
+        pages,
+        skipped,
     }
 }
 
@@ -126,11 +188,7 @@ pub fn extract(
         mut pages, skipped, ..
     } = writer;
     pages.sort_by(|a, b| crate::core::media::compare_paths(&a.inner, &b.inner));
-    Ok(Extracted {
-        dir: Some(dir),
-        pages,
-        skipped,
-    })
+    Ok(registered(archive, dir, pages, skipped))
 }
 
 /// Extracts a single page, for a thumbnail of an archive that is not open.
@@ -146,11 +204,7 @@ pub fn extract_page(archive: &Path, inner: &Path) -> Result<Extracted, Error> {
     if pages.is_empty() {
         return Err(Error::Failed("The page is not in the archive.".into()));
     }
-    Ok(Extracted {
-        dir: Some(dir),
-        pages,
-        skipped: 0,
-    })
+    Ok(registered(archive, dir, pages, 0))
 }
 
 /// The first image in the archive, read from its file list without extracting.
@@ -209,6 +263,7 @@ fn read_archive(
 
 fn read_zip(
     file: fs::File,
+    #[cfg_attr(any(target_os = "macos", target_os = "ios"), allow(unused_variables))]
     password: Option<&str>,
     writer: &mut Writer,
     wanted: &dyn Fn(&Path) -> bool,
@@ -230,20 +285,31 @@ fn read_zip(
             images.push((index, inner, entry.encrypted(), entry.size()));
         }
     }
-    // Ask once, before anything is written.
+    // Check protection before writing any image.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    if images.iter().any(|image| image.2) {
+        return Err(Error::EncryptedUnsupported);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     if password.is_none() && images.iter().any(|image| image.2) {
         return Err(Error::PasswordRequired);
     }
-    for (index, inner, encrypted, size) in images {
+    for (index, inner, _encrypted, size) in images {
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let encrypted = _encrypted;
         if writer.full() {
             break;
         }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let entry = zip.by_index(index);
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         let entry = match (encrypted, password) {
             (true, Some(password)) => zip.by_index_decrypt(index, password.as_bytes()),
             _ => zip.by_index(index),
         };
         let mut entry = match entry {
             Ok(entry) => entry,
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             Err(zip::result::ZipError::InvalidPassword) => return Err(Error::WrongPassword),
             Err(_) => {
                 writer.skipped += 1;
@@ -257,6 +323,7 @@ fn read_zip(
             .map(|time| (u128::from(time.datepart()) << 16) | u128::from(time.timepart()));
         match writer.add(inner, size, modified, &mut entry) {
             Ok(()) => {}
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             Err(Error::Failed(_)) if encrypted => return Err(Error::WrongPassword),
             Err(Error::Failed(_)) => writer.skipped += 1,
             Err(error) => return Err(error),
@@ -267,12 +334,27 @@ fn read_zip(
 
 fn read_7z(
     file: fs::File,
+    #[cfg_attr(any(target_os = "macos", target_os = "ios"), allow(unused_variables))]
     password: Option<&str>,
     writer: &mut Writer,
     wanted: &dyn Fn(&Path) -> bool,
 ) -> Result<(), Error> {
     use sevenz_rust2::{ArchiveReader, EntryDecision, Error as SevenError, Password};
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let key = Password::empty();
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     let key = password.map_or_else(Password::empty, Password::new);
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let failed = |error: SevenError| match error {
+        SevenError::PasswordRequired => Error::EncryptedUnsupported,
+        SevenError::UnsupportedCompressionMethod(ref method)
+            if method == sevenz_rust2::EncoderMethod::AES256_SHA256.name() =>
+        {
+            Error::EncryptedUnsupported
+        }
+        _ => Error::Failed(error.to_string()),
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     let failed = |error: SevenError| match error {
         SevenError::PasswordRequired if password.is_none() => Error::PasswordRequired,
         SevenError::PasswordRequired | SevenError::MaybeBadPassword(_) => Error::WrongPassword,
@@ -284,6 +366,11 @@ fn read_7z(
     };
     let mut reader = ArchiveReader::new(BufReader::new(file), key).map_err(&failed)?;
     let archive = reader.archive();
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    if (0..archive.files.len()).any(|index| archive.is_file_encrypted(index)) {
+        return Err(Error::EncryptedUnsupported);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     if password.is_none()
         && (0..archive.files.len()).any(|index| {
             let entry = &archive.files[index];

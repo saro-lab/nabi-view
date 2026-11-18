@@ -79,6 +79,7 @@ pub(crate) struct ImportGate {
 }
 
 impl ImportGate {
+    #[cfg(target_os = "ios")]
     pub(crate) const fn new() -> Self {
         Self {
             generation: 0,
@@ -98,9 +99,11 @@ impl ImportGate {
     pub(crate) fn busy(&self) -> bool {
         self.active.is_some()
     }
+    #[cfg(target_os = "ios")]
     pub(crate) fn source(&self) -> Option<PathBuf> {
         self.active.as_ref().and_then(|(_, source)| source.clone())
     }
+    #[cfg(target_os = "ios")]
     pub(crate) fn identify(&mut self, path: PathBuf) {
         if self.current()
             && let Some((_, source)) = &mut self.active

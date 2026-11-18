@@ -46,10 +46,13 @@ final class PhotoFolders {
             this.folder = folder; this.uri = uri; this.id = id; this.name = name;
         }
     }
-    static List<Folder> list(ContentResolver resolver) {
+    static List<Folder> list(ContentResolver resolver, android.os.CancellationSignal cancellation) {
+        cancellation.throwIfCanceled();
         LinkedHashMap<String, Folder> folders = new LinkedHashMap<>();
-        try (Cursor cursor = resolver.query(IMAGES, new String[]{VOLUME, PATH}, null, null, null)) {
+        try (Cursor cursor = resolver.query(IMAGES, new String[]{VOLUME, PATH}, null, null, null, cancellation)) {
+            if (cursor == null) throw new IllegalStateException("Photo folders unavailable");
             while (cursor != null && cursor.moveToNext()) {
+                cancellation.throwIfCanceled();
                 String volume = cursor.getString(0), path = cursor.getString(1);
                 if (volume == null || path == null) continue;
                 String key = volume + "\n" + path;
@@ -62,6 +65,7 @@ final class PhotoFolders {
                 folder.count++;
             }
         }
+        cancellation.throwIfCanceled();
         List<Folder> result = new ArrayList<>(folders.values());
         result.sort((a, b) -> {
             int path = a.path.compareToIgnoreCase(b.path);
@@ -69,8 +73,10 @@ final class PhotoFolders {
         });
         return result;
     }
+    /** Columns: _ID, DISPLAY_NAME, SIZE, DATE_MODIFIED (seconds). */
     static Cursor images(ContentResolver resolver, Folder folder) {
-        return resolver.query(folder.collection(), new String[]{ID, NAME}, PATH + " = ?",
+        return resolver.query(folder.collection(), new String[]{ID, NAME, MediaStore.MediaColumns.SIZE,
+                MediaStore.MediaColumns.DATE_MODIFIED}, PATH + " = ?",
             new String[]{folder.path}, NAME + " ASC, " + ID + " ASC");
     }
     /** Only metadata from the granted URI or Android's equivalent MediaStore URI.

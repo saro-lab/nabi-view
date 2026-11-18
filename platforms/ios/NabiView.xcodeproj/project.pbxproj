@@ -91,7 +91,7 @@
                 PRODUCT_NAME = "NABI VIEW";
                 EXECUTABLE_NAME = "nabi-view";
                 PRODUCT_BUNDLE_IDENTIFIER = saro.nabi.view;
-                MARKETING_VERSION = 1.2.0;
+                MARKETING_VERSION = 1.2.2;
                 CURRENT_PROJECT_VERSION = 1;
                 ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
                 ALWAYS_SEARCH_USER_PATHS = NO;
@@ -116,7 +116,7 @@
                 PRODUCT_NAME = "NABI VIEW";
                 EXECUTABLE_NAME = "nabi-view";
                 PRODUCT_BUNDLE_IDENTIFIER = saro.nabi.view;
-                MARKETING_VERSION = 1.2.0;
+                MARKETING_VERSION = 1.2.2;
                 CURRENT_PROJECT_VERSION = 1;
                 ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
                 ALWAYS_SEARCH_USER_PATHS = NO;

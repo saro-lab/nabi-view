@@ -188,6 +188,7 @@ validate_app() {
     app_id=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$1/Contents/Info.plist")
     [ "$app_id" = dev.nabi.NabiView ] || { echo "Unexpected bundle at $1" >&2; exit 1; }
     codesign --verify --strict "$1"
+    "$python" build/check-apple-apis.py "$1"
 }
 if [ "$dmg_only" = true ]; then
     validate_app "$output"
@@ -277,6 +278,7 @@ else
     install -m 644 target/notices/THIRD_PARTY_NOTICES.txt "$app/Contents/Resources/THIRD_PARTY_NOTICES.txt"
     install -m 644 LICENSE THIRD_PARTY.md "$app/Contents/Resources/"
     "$python" build/package-previews.py macos --target "$target" --app "$app" --no-build
+    "$python" build/check-apple-apis.py "$app"
     codesign --force --sign - "$app"
     codesign --verify --strict "$app"
 fi

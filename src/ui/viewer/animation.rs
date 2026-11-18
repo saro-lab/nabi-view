@@ -5,6 +5,7 @@ impl Viewer {
         if !self.slideshow
             || self.files.is_empty()
             || self.listing.is_some()
+            || self.source_list_pending()
             || self.overlay_open()
             || self.file_job.is_some()
             || self.zoom_input.is_some()

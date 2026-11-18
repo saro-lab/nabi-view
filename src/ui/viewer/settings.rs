@@ -652,6 +652,17 @@ impl Viewer {
             ui.heading(tr("recent"));
             self.history_settings(ui, ctx);
             self.move_history_settings(ui);
+            ui.add_space(10.);
+            // Bookmarks and recent folders are prepared on disk while idle.
+            settings_row(ui, tr("prepare-recent-and-bookmarked-folders"), 32., |ui| {
+                if ui
+                    .checkbox(&mut self.settings.prefill_library, "")
+                    .hover_text(tr("prepare-recent-and-bookmarked-folders"))
+                    .changed()
+                {
+                    self.save();
+                }
+            });
         }
     }
 
@@ -698,6 +709,9 @@ impl Viewer {
         let clear = ui
             .add_enabled(!status.busy, egui::Button::new(tr("clear-disk-cache")))
             .clicked();
+        if clear {
+            self.library.clear_thumbnails();
+        }
         if status.cleared {
             ui.label(tr("cache-cleared"));
         }

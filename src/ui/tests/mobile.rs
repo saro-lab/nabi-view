@@ -307,7 +307,7 @@ fn phone_bars_stay_visible_and_fullscreen_taps_restore_them() {
 }
 
 #[test]
-fn phone_horizontal_swipes_change_pages_even_when_zoomed_or_fullscreen() {
+fn phone_horizontal_drags_pan_when_zoomed_and_swipe_at_fit_or_fullscreen() {
     let _phone = PhonePreview::enter();
     let mut window = TestWindow::sample();
     window.screen_size = egui::vec2(390., 844.);
@@ -319,7 +319,7 @@ fn phone_horizontal_swipes_change_pages_even_when_zoomed_or_fullscreen() {
     drag_touch(&mut window, egui::pos2(110., 400.), egui::vec2(160., -5.));
     window.wait_for("1 / 5");
 
-    // The fit view can be zoomed, but a clear horizontal swipe still advances.
+    // Enlarged photos keep the same page for both vertical and horizontal pan.
     for _ in 0..4 {
         window.draw(Some(Key::Equals));
     }
@@ -329,10 +329,16 @@ fn phone_horizontal_swipes_change_pages_even_when_zoomed_or_fullscreen() {
     let panned = window.photo_rects().1;
     assert!(panned.center().y > zoomed.center().y + 50.);
     assert!(window.draw(None).0.contains("1 / 5"));
-    let previous = window.photo_texture();
     drag_touch(&mut window, start, egui::vec2(-160., 0.));
-    window.wait_for("2 / 5");
-    window.wait_for_texture_replacement(previous);
+    let horizontally_panned = window.photo_rects().1;
+    assert!(horizontally_panned.center().x < panned.center().x - 100.);
+    assert!((horizontally_panned.width() - panned.width()).abs() < 1.);
+    assert!((horizontally_panned.height() - panned.height()).abs() < 1.);
+    assert!(window.draw(None).0.contains("1 / 5"));
+
+    // A new drag after returning to fit regains page navigation.
+    window.draw(Some(Key::Num0));
+    window.draw(None);
     assert!(
         window
             .photo_rects()
@@ -340,7 +346,12 @@ fn phone_horizontal_swipes_change_pages_even_when_zoomed_or_fullscreen() {
             .expand(1.)
             .contains_rect(window.photo_rects().1)
     );
+    let previous = window.photo_texture();
+    drag_touch(&mut window, start, egui::vec2(-160., 0.));
+    window.wait_for("2 / 5");
+    window.wait_for_texture_replacement(previous);
 
+    // Fullscreen keeps the fit-mode swipe and does not treat it as an exit tap.
     window.draw(Some(Key::F));
     window.draw(None);
     drag_touch(&mut window, start, egui::vec2(-160., 0.));

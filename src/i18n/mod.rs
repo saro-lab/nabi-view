@@ -12,7 +12,7 @@ static CATALOGS: [OnceLock<BTreeMap<String, String>>; catalogs::SOURCES.len()] =
 thread_local! { static CURRENT: Cell<usize> = const { Cell::new(0) }; }
 // Android owns a separate Java UI thread for native permission/folder dialogs.
 // Its text must follow the Rust viewer, not that thread's default catalog.
-#[cfg(any(target_os = "ios", target_os = "android"))]
+#[cfg(any(target_os = "ios", target_os = "android", test))]
 static NATIVE_CURRENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 fn catalog(index: usize) -> &'static BTreeMap<String, String> {
     CATALOGS[index].get_or_init(|| {
@@ -57,12 +57,16 @@ fn message_id(key: &str) -> &str {
 pub fn tr(key: &str) -> &str {
     translate_at(CURRENT.get(), key)
 }
-#[cfg(any(target_os = "ios", target_os = "android"))]
+#[cfg(any(target_os = "ios", target_os = "android", test))]
 pub(crate) fn native_tr(key: &str) -> &str {
     translate_at(
         NATIVE_CURRENT.load(std::sync::atomic::Ordering::Relaxed),
         key,
     )
+}
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn native_is_rtl() -> bool {
+    Language::ALL[NATIVE_CURRENT.load(std::sync::atomic::Ordering::Relaxed) + 1].is_rtl()
 }
 fn translate_at(index: usize, key: &str) -> &str {
     let mut key = key;

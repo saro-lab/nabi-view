@@ -5,22 +5,22 @@ use std::cmp::Ordering;
 pub(super) struct Sorting {
     pub stamps: HashMap<PathBuf, media::FileSortMetadata>,
     applied: Option<(String, bool)>,
+    #[cfg(any(target_os = "ios", target_os = "android", test))]
+    pub deferred_size_pending: bool,
 }
 
 struct Key {
     path: PathBuf,
     name: PathBuf,
     folded: String,
+    bytes: Option<u64>,
     stamp: Option<media::FileSortMetadata>,
 }
 
 fn compare(a: &Key, b: &Key, by: &str, descending: bool) -> Ordering {
     let natural = || media::compare_paths(&a.name, &b.name).then_with(|| a.path.cmp(&b.path));
     let numeric = match by {
-        "size" => Some((
-            a.stamp.map(|value| value.bytes as u128),
-            b.stamp.map(|value| value.bytes as u128),
-        )),
+        "size" => Some((a.bytes.map(u128::from), b.bytes.map(u128::from))),
         "modified" => Some((
             a.stamp.and_then(|value| value.modified),
             b.stamp.and_then(|value| value.modified),
@@ -68,10 +68,23 @@ impl Viewer {
                 let name = self.archives.sort_name(&path).to_owned();
                 let folded = name.to_string_lossy().to_lowercase();
                 let stamp = self.sorting.stamps.get(&path).copied();
+                let bytes = stamp.map(|value| value.bytes);
+                #[cfg(any(target_os = "ios", target_os = "android", test))]
+                let bytes = if self.settings.sort_by == "size"
+                    && crate::core::documents::deferred_stamp(&path)
+                        .is_some_and(|(bytes, _)| bytes == 0)
+                {
+                    // PhotoKit lists names without original byte counts. Keep
+                    // unread sizes last in either direction, not as zero bytes.
+                    crate::core::documents::deferred_size(&path)
+                } else {
+                    bytes
+                };
                 Key {
                     path,
                     name,
                     folded,
+                    bytes,
                     stamp,
                 }
             })
@@ -94,17 +107,32 @@ impl Viewer {
             return;
         }
         self.sorting.applied = Some((self.settings.sort_by.clone(), self.settings.sort_descending));
+        #[cfg(any(target_os = "ios", target_os = "android", test))]
+        {
+            self.sorting.deferred_size_pending = false;
+        }
         self.check_navigation = None;
         self.spread_shifted = false;
+        self.resort_preserving_focus();
+    }
+
+    pub(super) fn resort_preserving_focus(&mut self) {
         if self.random || self.files.len() < 2 {
             return;
         }
+        let files = self.sorted_files(self.files.clone());
+        if files == self.files {
+            return;
+        }
         let focused = self.files.get(self.focus_index).cloned();
-        let files = std::mem::take(&mut self.files);
-        self.files = self.sorted_files(files);
+        self.files = files;
         self.focus_index = focused
             .and_then(|path| self.files.iter().position(|candidate| candidate == &path))
             .unwrap_or(0);
+        self.check_navigation = None;
+        self.spread_shifted = false;
+        self.mobile_swipe = None;
+        self.touch_gesture.cancel();
         self.span_cache.get_mut().take();
         self.cancel_prefetch();
     }
@@ -118,6 +146,7 @@ mod tests {
             path: name.into(),
             name: name.into(),
             folded: name.to_lowercase(),
+            bytes: Some(bytes),
             stamp: Some(media::FileSortMetadata { bytes, modified }),
         }
     }

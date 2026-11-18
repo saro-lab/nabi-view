@@ -1474,7 +1474,7 @@ fn recent_removes_unreadable_folders_even_when_they_exist() {
     fs::write(folder.join("1.png"), b"image").unwrap();
     store.record_folder(&folder, 10).unwrap();
     let permissions = fs::metadata(&folder).unwrap().permissions();
-    fs::set_permissions(&folder, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o0)).unwrap();
     let denied = fs::read_dir(&folder).is_err();
     let recent = store.recent();
     // Restore permissions before assertions so the fixture can always be removed.
@@ -2241,7 +2241,7 @@ fn new_display_preferences_round_trip_default_old_files_and_merge_independently(
     assert_eq!(old.background_rgb, [0, 0, 0]);
     assert!(old.transparency_checker && old.disk_cache_enabled);
     assert_eq!(old.metadata_font_size, 12);
-    assert_eq!(old.disk_cache_mb, 1024);
+    assert_eq!(old.disk_cache_mb, Settings::default().disk_cache_mb);
     first.save(&old).unwrap();
     let mut a = first.load().unwrap();
     let mut b = second.load().unwrap();

@@ -11,23 +11,30 @@
 #include <stdbool.h>
 #include <os/proc.h>
 #include <mach/mach.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 extern bool nabi_mobile_import_begin(void);
 extern bool nabi_mobile_import_begin_folder(void);
+extern void nabi_mobile_import_pending(void);
 extern void nabi_mobile_settings_import(int fd);
 extern void nabi_mobile_export_result(bool saved);
 extern bool nabi_mobile_import_file(int fd, const char *name);
+extern bool nabi_mobile_import_deferred(const char *name, const char *token, uint64_t bytes, double modified,
+                                        int resource_type, double content_modified);
 extern void nabi_mobile_import_error(const char *message);
 extern void nabi_mobile_import_finish(void);
 extern void nabi_mobile_import_source(const char *id, const char *name);
 extern void nabi_mobile_window_mode_changed(int state);
 extern void nabi_mobile_access_changed(void);
+extern void nabi_mobile_access_resumed(void);
 extern void nabi_mobile_access_action_result(int action, bool success);
 extern void nabi_mobile_photo_error(int reason);
 extern size_t nabi_mobile_text(const char *key, unsigned short *output, size_t capacity);
 extern int nabi_mobile_photo_status(void);
 extern bool nabi_photos_is_collection(NSString *identifier);
 extern void nabi_photos_open(NSString *identifier, void (^completion)(void));
+extern int nabi_photos_read(NSString *token, int fd, uint64_t limit, bool (*live)(void *), void *context);
 
 // iOS 27 requires scene-based lifecycle adoption. UIKit creates the single
 // window scene from Info.plist; winit attaches its own window and root view
@@ -38,7 +45,7 @@ extern void nabi_photos_open(NSString *identifier, void (^completion)(void));
 @implementation NabiSceneDelegate
 - (void)sceneDidBecomeActive:(UIScene *)scene {
     (void)scene;
-    nabi_mobile_access_changed();
+    nabi_mobile_access_resumed();
 }
 @end
 
@@ -357,21 +364,31 @@ static NSString *nabi_text(const char *key) {
         : [NSString stringWithUTF8String:key];
 }
 
-void nabi_mobile_share(const unsigned short *text, int length) {
+static void nabi_share(const unsigned short *text, int length, BOOL disposable) {
     if (length < 0) return;
     NSString *path = [[NSString alloc] initWithCharacters:text length:(NSUInteger)length];
     dispatch_async(dispatch_get_main_queue(), ^{
         UIViewController *presenter = nabi_presenter();
-        if (!presenter) return;
+        if (!presenter) {
+            if (disposable) [NSFileManager.defaultManager removeItemAtPath:path error:nil];
+            return;
+        }
         UIActivityViewController *sheet = [[UIActivityViewController alloc]
             initWithActivityItems:@[[NSURL fileURLWithPath:path]] applicationActivities:nil];
         // iPad presents the sheet as a popover anchored above the bottom bar.
         CGRect bounds = presenter.view.bounds;
         sheet.popoverPresentationController.sourceView = presenter.view;
         sheet.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(bounds), CGRectGetMaxY(bounds) - 48., 1., 1.);
+        if (disposable) sheet.completionWithItemsHandler = ^(UIActivityType type, BOOL completed, NSArray *items, NSError *error) {
+            (void)type; (void)completed; (void)items; (void)error;
+            [NSFileManager.defaultManager removeItemAtPath:path error:nil];
+        };
         [presenter presentViewController:sheet animated:YES completion:nil];
     });
 }
+
+void nabi_mobile_share(const unsigned short *text, int length) { nabi_share(text, length, NO); }
+void nabi_mobile_share_owned(const unsigned short *text, int length) { nabi_share(text, length, YES); }
 
 void nabi_mobile_safe_area(float *out) {
     UIWindow *window = nabi_window();
@@ -467,6 +484,69 @@ static void nabi_report_source(NSString *identifier, NSString *fallback) {
     nabi_mobile_import_source(identifier.UTF8String, name.UTF8String);
 }
 
+// Called only on Rust workers. Native grants remain in the host and are
+// resolved for each requested file; no original URL reaches source markers.
+int nabi_mobile_read_source(const char *source, const char *item, int output, uint64_t limit,
+                            bool (*live)(void *), void *context) {
+    @autoreleasepool {
+        if (!source || !item || !live || !live(context)) return -1;
+        NSString *identifier = [NSString stringWithUTF8String:source];
+        NSString *token = [NSString stringWithUTF8String:item];
+        if (!nabi_valid_source_id(identifier) || !token.length) return 6;
+        if (nabi_photos_is_collection(identifier)) return nabi_photos_read(token, output, limit, live, context);
+        // Tokens are one enumerated child name, never an arbitrary path.
+        if (![token.lastPathComponent isEqualToString:token] || [@[@".", @".."] containsObject:token]) return 6;
+        NSDictionary *record = nabi_grants()[identifier];
+        NSArray *bookmarks = [record isKindOfClass:NSDictionary.class] ? record[@"bookmarks"] : nil;
+        if (![record[@"folder"] boolValue] || ![bookmarks isKindOfClass:NSArray.class] || bookmarks.count != 1 ||
+            ![bookmarks.firstObject isKindOfClass:NSData.class]) return 6;
+        BOOL stale = NO;
+        NSURL *folder = [NSURL URLByResolvingBookmarkData:bookmarks.firstObject options:NSURLBookmarkResolutionWithoutUI
+            relativeToURL:nil bookmarkDataIsStale:&stale error:nil];
+        if (!folder) return 6;
+        BOOL access = [folder startAccessingSecurityScopedResource];
+        NSURL *url = [folder URLByAppendingPathComponent:token isDirectory:NO];
+        NSFileCoordinator *coordinator = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
+        NSError *error = nil;
+        __block int result = 7;
+        [coordinator coordinateReadingItemAtURL:url options:0 error:&error byAccessor:^(NSURL *readURL) {
+            if (!live(context)) { result = -1; return; }
+            int fd = open(readURL.fileSystemRepresentation, O_RDONLY | O_CLOEXEC);
+            if (fd < 0) { result = nabi_document_error(nil, errno); return; }
+            struct stat info;
+            if (fstat(fd, &info) < 0 || !S_ISREG(info.st_mode) || info.st_size < 0 || (uint64_t)info.st_size > limit) {
+                close(fd); return;
+            }
+            uint8_t buffer[64 * 1024];
+            uint64_t bytes = 0;
+            NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:15];
+            while (live(context) && deadline.timeIntervalSinceNow > 0) {
+                ssize_t count = read(fd, buffer, sizeof(buffer));
+                if (count < 0 && errno == EINTR) continue;
+                if (count < 0 || (uint64_t)count > limit - bytes) break;
+                if (count == 0) { result = bytes ? 0 : 7; break; }
+                size_t offset = 0;
+                while (offset < (size_t)count) {
+                    ssize_t written = write(output, buffer + offset, (size_t)count - offset);
+                    if (written < 0 && errno == EINTR) continue;
+                    if (written <= 0) break;
+                    offset += (size_t)written;
+                }
+                if (offset != (size_t)count) break;
+                bytes += (uint64_t)count;
+            }
+            if (!live(context)) result = -1;
+            if (result == 0) {
+                struct timespec times[2] = {info.st_atimespec, info.st_mtimespec};
+                futimens(output, times);
+            }
+            close(fd);
+        }];
+        if (access) [folder stopAccessingSecurityScopedResource];
+        return error ? nabi_document_error(error, 0) : result;
+    }
+}
+
 static void nabi_import_folder(NSURL *url, NSString *identifier) {
     BOOL access = [url startAccessingSecurityScopedResource];
     __block NSError *listError = nil;
@@ -475,7 +555,8 @@ static void nabi_import_folder(NSURL *url, NSString *identifier) {
     NSFileCoordinator *listing = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
     [listing coordinateReadingItemAtURL:url options:0 error:&coordinationError byAccessor:^(NSURL *readURL) {
         items = [NSFileManager.defaultManager contentsOfDirectoryAtURL:readURL
-            includingPropertiesForKeys:@[NSURLIsRegularFileKey] options:NSDirectoryEnumerationSkipsHiddenFiles error:&listError];
+            includingPropertiesForKeys:@[NSURLIsRegularFileKey, NSURLFileSizeKey, NSURLContentModificationDateKey]
+            options:NSDirectoryEnumerationSkipsHiddenFiles error:&listError];
     }];
     if (!nabi_mobile_import_begin_folder()) items = @[];
     nabi_report_source(identifier, url.lastPathComponent);
@@ -486,6 +567,16 @@ static void nabi_import_folder(NSURL *url, NSString *identifier) {
         NSNumber *regular = nil;
         [item getResourceValue:&regular forKey:NSURLIsRegularFileKey error:nil];
         if (!regular.boolValue) continue;
+        if (identifier) {
+            NSNumber *size = nil;
+            NSDate *modified = nil;
+            [item getResourceValue:&size forKey:NSURLFileSizeKey error:nil];
+            [item getResourceValue:&modified forKey:NSURLContentModificationDateKey error:nil];
+            readable++;
+            if (!nabi_mobile_import_deferred(item.lastPathComponent.UTF8String, item.lastPathComponent.UTF8String,
+                                            size.unsignedLongLongValue, modified.timeIntervalSince1970, 0, 0)) break;
+            continue;
+        }
         // Rust consumes and closes the descriptor and skips unsupported files.
         __block BOOL more = YES;
         __block int fileError = 0;
@@ -562,6 +653,7 @@ static void nabi_import_documents(NSArray<NSURL *> *urls, NSString *identifier) 
         return;
     }
     void (^import)(void) = ^{
+        nabi_mobile_import_pending();
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             NSString *identifier = nabi_save_source(selection, folder, reconnecting);
             if (reconnecting && !identifier) {
@@ -617,6 +709,7 @@ bool nabi_mobile_reopen(const unsigned short *text, int length) {
             });
             return;
         }
+        nabi_mobile_import_pending();
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             @autoreleasepool {
                 NSMutableDictionary *grants = nabi_grants();
@@ -845,6 +938,59 @@ int nabi_decode_image(const char *path, unsigned char **pixels, unsigned int *wi
     }
 }
 void nabi_free_image(unsigned char *pixels) { free(pixels); }
+// Scaled while decoding (ImageIO thumbnail path, EXIF transform applied) and
+// drawn once into a caller-allocated sRGB buffer as straight-alpha RGBA.
+// original receives the upright header size. 0 is success.
+typedef unsigned char *(*nabi_scaled_alloc)(void *, size_t);
+int nabi_decode_image_scaled(const char *path, unsigned int max_side, unsigned long long max_pixels,
+        nabi_scaled_alloc alloc, void *context, unsigned int *width, unsigned int *height,
+        unsigned int *original) {
+    @autoreleasepool {
+        if (!max_side || !max_pixels) return -1;
+        NSURL *url = [NSURL fileURLWithFileSystemRepresentation:path isDirectory:NO relativeToURL:nil];
+        NSDictionary *sourceOptions = @{(__bridge NSString *)kCGImageSourceShouldCache: @NO};
+        CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)url,
+            (__bridge CFDictionaryRef)sourceOptions);
+        if (!source) return -1;
+        NSDictionary *properties = CFBridgingRelease(CGImageSourceCopyPropertiesAtIndex(source, 0, NULL));
+        uint64_t w = [properties[(__bridge NSString *)kCGImagePropertyPixelWidth] unsignedLongLongValue];
+        uint64_t h = [properties[(__bridge NSString *)kCGImagePropertyPixelHeight] unsignedLongLongValue];
+        NSInteger orientation = [properties[(__bridge NSString *)kCGImagePropertyOrientation] integerValue];
+        if (!w || !h || w * h > 256000000ULL) { CFRelease(source); return -2; }
+        double scale = MIN(1.0, MIN((double)max_side / (double)MAX(w, h),
+            sqrt((double)max_pixels / ((double)w * (double)h))));
+        NSUInteger edge = MAX((NSUInteger)1, (NSUInteger)floor((double)MAX(w, h) * scale));
+        NSDictionary *options = @{
+            (__bridge NSString *)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+            (__bridge NSString *)kCGImageSourceCreateThumbnailWithTransform: @YES,
+            (__bridge NSString *)kCGImageSourceShouldCacheImmediately: @YES,
+            (__bridge NSString *)kCGImageSourceThumbnailMaxPixelSize: @(edge),
+        };
+        CGImageRef image = CGImageSourceCreateThumbnailAtIndex(source, 0, (__bridge CFDictionaryRef)options);
+        CFRelease(source);
+        if (!image) return -3;
+        size_t ow = CGImageGetWidth(image), oh = CGImageGetHeight(image);
+        unsigned char *data = ow && oh && ow <= max_side && oh <= max_side ? alloc(context, ow * oh * 4) : NULL;
+        if (!data) { CGImageRelease(image); return -4; }
+        CGColorSpaceRef color = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        CGContextRef bitmap = CGBitmapContextCreate(data, ow, oh, 8, ow * 4, color,
+            kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+        CGColorSpaceRelease(color);
+        if (!bitmap) { CGImageRelease(image); return -4; }
+        CGContextSetBlendMode(bitmap, kCGBlendModeCopy);
+        CGContextDrawImage(bitmap, CGRectMake(0, 0, ow, oh), image);
+        CGContextRelease(bitmap); CGImageRelease(image);
+        for (size_t i = 0; i < ow * oh; ++i) {
+            unsigned a = data[i * 4 + 3];
+            if (a && a < 255) for (int c = 0; c < 3; ++c) data[i * 4 + c] = MIN(255, (data[i * 4 + c] * 255 + a / 2) / a);
+        }
+        // EXIF orientations 5-8 swap the axes.
+        BOOL swapped = orientation >= 5 && orientation <= 8;
+        *width = (unsigned int)ow; *height = (unsigned int)oh;
+        original[0] = (unsigned int)(swapped ? h : w); original[1] = (unsigned int)(swapped ? w : h);
+        return 0;
+    }
+}
 
 void nabi_mobile_copy_text(const unsigned short *text, int length) {
     if (length < 0) return;

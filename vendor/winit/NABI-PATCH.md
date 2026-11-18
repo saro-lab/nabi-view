@@ -37,3 +37,12 @@ the application host. Technical review: 2026-11-15.
 
 UIKit migration reference:
 https://developer.apple.com/documentation/uikit/transitioning-to-the-uikit-scene-based-life-cycle
+
+On macOS, make background blur unsupported (a no-op) and remove the private
+WindowServer FFI declarations and their now-unused imports. Upstream 0.30.13
+links those APIs even when the application never enables blur. Nabi View uses
+an opaque window and does not request this effect. No runtime symbol lookup or
+hidden private API fallback is used. Modified files:
+`src/platform_impl/macos/ffi.rs`, `src/platform_impl/macos/window_delegate.rs`.
+Technical review: 2026-11-18. App Review Guideline 2.5.1:
+https://developer.apple.com/app-store/review/guidelines/#software-requirements

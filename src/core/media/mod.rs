@@ -5,6 +5,7 @@ pub(crate) mod animation;
 pub(crate) mod animation_fixtures;
 pub(crate) mod avif;
 pub(crate) mod color;
+mod jpeg;
 mod persistent;
 pub(crate) mod regions;
 use std::{
@@ -101,18 +102,68 @@ pub enum MediaEvent {
         path: PathBuf,
         result: Result<FolderUpdate, String>,
     },
+    /// A disk-only prefetch: the display entry is on disk, no pixels returned.
+    Warmed {
+        id: u64,
+        path: PathBuf,
+        result: Result<(), String>,
+    },
+}
+
+/// Order of speculative work, most urgent first. Jobs sharing a decoder run
+/// in this order; `Lead` and above keep running when the current page changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Urgency {
+    /// A strip thumbnail currently on screen.
+    VisibleThumbnail,
+    /// The next page or spread in the reading direction.
+    Lead,
+    /// Thumbnails around the current page.
+    RangeThumbnail,
+    /// The page or spread just behind the current one.
+    Opposite,
+    /// Further pages of the working set.
+    #[default]
+    Ahead,
 }
 
 struct Job {
     id: u64,
     path: PathBuf,
     max_side: u32,
+    urgency: Urgency,
+    /// Decode only to fill the disk cache; skip when an entry already exists.
+    disk_only: bool,
+}
+
+/// Display cache sizes. A request decodes at the smallest tier that covers it
+/// (larger requests keep their own size), so a resized window hits the cache.
+const DISPLAY_TIERS: [u32; 3] = [1024, 2048, 4096];
+
+pub(crate) fn display_tier(max_side: u32) -> u32 {
+    DISPLAY_TIERS
+        .into_iter()
+        .find(|&tier| tier >= max_side)
+        .unwrap_or(max_side)
+}
+
+/// Thumbnails that reduced JPEG decoding serves run on their own decoder, so
+/// at most two full-size decodes (visible and background) overlap.
+fn reduced_thumbnail(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            ["jpg", "jpeg", "jfif"]
+                .iter()
+                .any(|e| ext.eq_ignore_ascii_case(e))
+        })
 }
 
 #[derive(Default)]
 struct Queues {
     pending: [Option<Job>; 5],
     ready: [Option<MediaEvent>; 6],
+    visible_active: bool,
     closed: bool,
 }
 
@@ -123,21 +174,21 @@ struct Shared {
     current: [AtomicU64; 5],
     visible_epoch: AtomicU64,
     thumbnail_epoch: AtomicU64,
+    /// Folder generation listed once without the change poll.
+    unwatched: AtomicU64,
     next_id: AtomicU64,
     disk_cache: Mutex<Option<crate::core::disk_cache::Cache>>,
     folder_stamps: Mutex<(u64, HashMap<PathBuf, FileSortMetadata>)>,
 }
 
-/// Two visible image slots share one decoder; directory discovery runs independently.
+/// Visible images and speculative work each have one decoder. A slow thumbnail
+/// cannot hold the current page behind a non-interruptible codec call.
 pub struct Media(Arc<Shared>);
 
 impl Media {
     pub fn new(ctx: egui::Context) -> Self {
         let shared = Arc::new(Shared::default());
-        {
-            let (shared, ctx) = (Arc::clone(&shared), ctx.clone());
-            thread::spawn(move || worker(shared, ctx, &[0, 1, THUMB_SLOT, PREFETCH_SLOT]));
-        }
+        spawn_decode_workers(&shared, &ctx, decode);
         {
             let (shared, ctx) = (Arc::clone(&shared), ctx.clone());
             thread::spawn(move || folder_worker(shared, ctx));
@@ -151,11 +202,20 @@ impl Media {
 
     pub fn request_image_in_slot(&self, slot: usize, path: PathBuf, max_side: u32) -> u64 {
         assert!(slot < FOLDER_SLOT);
-        self.submit(slot, path, max_side)
+        self.submit(slot, path, max_side, Urgency::VisibleThumbnail, false)
     }
 
     pub fn request_folder(&self, dir: PathBuf) -> u64 {
-        self.submit(FOLDER_SLOT, dir, 0)
+        self.submit(FOLDER_SLOT, dir, 0, Urgency::VisibleThumbnail, false)
+    }
+
+    /// Stops polling folder generation `id` after its listing. Mobile imports
+    /// are app-owned copies: provider changes arrive as a new import instead.
+    #[cfg(any(target_os = "ios", target_os = "android", test))]
+    pub fn stop_folder_watch(&self, id: u64) {
+        let _q = self.0.queues.lock().unwrap();
+        self.0.unwatched.store(id, AtomicOrdering::Relaxed);
+        self.0.changed.notify_all();
     }
 
     /// Memory-only metadata captured by the folder worker. Call on folder
@@ -169,16 +229,51 @@ impl Media {
         }
     }
 
+    #[cfg(test)]
     pub fn request_thumbnail(&self, path: PathBuf, max_side: u32) -> u64 {
-        self.submit(THUMB_SLOT, path, max_side.clamp(1, 256))
+        self.request_thumbnail_with(path, max_side, Urgency::VisibleThumbnail)
+    }
+
+    pub fn request_thumbnail_with(&self, path: PathBuf, max_side: u32, urgency: Urgency) -> u64 {
+        self.submit(THUMB_SLOT, path, max_side.clamp(1, 256), urgency, false)
     }
 
     pub fn clear_thumbnail(&self) {
         self.cancel(THUMB_SLOT);
     }
 
+    #[cfg(test)]
     pub fn request_prefetch(&self, path: PathBuf, max_side: u32) -> u64 {
-        self.submit(PREFETCH_SLOT, path, max_side)
+        self.request_prefetch_with(path, max_side, Urgency::Ahead)
+    }
+
+    pub fn request_prefetch_with(&self, path: PathBuf, max_side: u32, urgency: Urgency) -> u64 {
+        self.submit(PREFETCH_SLOT, path, max_side, urgency, false)
+    }
+
+    /// Fills the disk cache for a page outside the memory working set.
+    /// Answers with `MediaEvent::Warmed` in the prefetch slot.
+    pub fn request_disk_warm(&self, path: PathBuf, max_side: u32, urgency: Urgency) -> u64 {
+        self.submit(PREFETCH_SLOT, path, max_side, urgency, true)
+    }
+
+    /// Fills the shared thumbnail store for a page that is not on screen.
+    /// Answers with `MediaEvent::Warmed` in the thumbnail slot.
+    pub fn request_thumbnail_warm(&self, path: PathBuf) -> u64 {
+        self.submit(
+            THUMB_SLOT,
+            path,
+            crate::core::library::THUMBNAIL_EDGE,
+            Urgency::RangeThumbnail,
+            true,
+        )
+    }
+
+    /// Share of the disk cache limit in use, when this process knows it.
+    pub(crate) fn disk_cache_share(&self) -> Option<f64> {
+        let cache = self.0.disk_cache.lock().unwrap().clone()?;
+        let bytes = cache.estimated_bytes()?;
+        (cache.limit() > 0).then(|| bytes as f64 / cache.limit() as f64)
     }
 
     pub fn clear_prefetch(&self) {
@@ -195,19 +290,35 @@ impl Media {
         self.0.current[slot].store(0, AtomicOrdering::Relaxed);
         q.pending[slot] = None;
         q.ready[slot] = None;
+        self.0.changed.notify_all();
     }
 
-    fn submit(&self, slot: usize, path: PathBuf, max_side: u32) -> u64 {
+    fn submit(
+        &self,
+        slot: usize,
+        path: PathBuf,
+        max_side: u32,
+        urgency: Urgency,
+        disk_only: bool,
+    ) -> u64 {
         let mut q = self.0.queues.lock().unwrap();
         let id = self.0.next_id.fetch_add(1, AtomicOrdering::Relaxed) + 1;
         self.0.current[slot].store(id, AtomicOrdering::Relaxed);
         if slot < FOLDER_SLOT {
             self.0.visible_epoch.fetch_add(1, AtomicOrdering::Relaxed);
         }
-        if slot == THUMB_SLOT {
+        // Only an on-screen thumbnail that shares the background decoder
+        // interrupts speculative display work; reduced JPEGs run beside it.
+        if slot == THUMB_SLOT && urgency == Urgency::VisibleThumbnail && !reduced_thumbnail(&path) {
             self.0.thumbnail_epoch.fetch_add(1, AtomicOrdering::Relaxed);
         }
-        q.pending[slot] = Some(Job { id, path, max_side });
+        q.pending[slot] = Some(Job {
+            id,
+            path,
+            max_side,
+            urgency,
+            disk_only,
+        });
         q.ready[slot] = None;
         if slot == FOLDER_SLOT {
             q.ready[WATCH_SLOT] = None;
@@ -238,8 +349,89 @@ impl Drop for Media {
     }
 }
 
-fn worker(shared: Arc<Shared>, ctx: egui::Context, slots: &[usize]) {
-    let writer = persistent::Writer::new();
+#[derive(Clone, Copy)]
+enum DecodeLane {
+    Visible,
+    Background,
+    /// Reduced JPEG thumbnails only, beside the full-size background decoder.
+    Thumbnail,
+}
+
+impl DecodeLane {
+    fn next_slot(self, queues: &Queues) -> Option<usize> {
+        if matches!(self, Self::Visible) {
+            return [0, 1]
+                .into_iter()
+                .filter_map(|slot| queues.pending[slot].as_ref().map(|job| (job.id, slot)))
+                .min()
+                .map(|(_, slot)| slot);
+        }
+        // Do not start more speculative work while either current page is
+        // pending/running. Only work already in a codec may overlap.
+        if queues.visible_active || queues.pending[..FOLDER_SLOT].iter().any(Option::is_some) {
+            return None;
+        }
+        [THUMB_SLOT, PREFETCH_SLOT]
+            .into_iter()
+            .filter_map(|slot| {
+                let job = queues.pending[slot].as_ref()?;
+                let reduced = slot == THUMB_SLOT && reduced_thumbnail(&job.path);
+                (reduced == matches!(self, Self::Thumbnail)).then_some((
+                    job.urgency,
+                    slot == PREFETCH_SLOT,
+                    job.id,
+                    slot,
+                ))
+            })
+            .min()
+            .map(|(.., slot)| slot)
+    }
+}
+
+fn spawn_decode_workers<F>(shared: &Arc<Shared>, ctx: &egui::Context, decode_frame: F)
+where
+    F: Fn(&Path, u32, &dyn Fn() -> bool) -> Result<Frame, String> + Send + Sync + 'static,
+{
+    // One disk writer with a small priority queue serves both decoders.
+    let writer = Arc::new(persistent::Writer::new());
+    let decode_frame = Arc::new(decode_frame);
+    for lane in [
+        DecodeLane::Visible,
+        DecodeLane::Background,
+        DecodeLane::Thumbnail,
+    ] {
+        let (shared, ctx, writer, decode_frame) = (
+            Arc::clone(shared),
+            ctx.clone(),
+            Arc::clone(&writer),
+            Arc::clone(&decode_frame),
+        );
+        thread::Builder::new()
+            .name(
+                match lane {
+                    DecodeLane::Visible => "nabi-visible",
+                    DecodeLane::Background => "nabi-background",
+                    DecodeLane::Thumbnail => "nabi-thumbnail",
+                }
+                .into(),
+            )
+            .spawn(move || worker(shared, ctx, lane, writer, decode_frame))
+            .expect("image decoder worker");
+    }
+}
+
+fn worker<F>(
+    shared: Arc<Shared>,
+    ctx: egui::Context,
+    lane: DecodeLane,
+    writer: Arc<persistent::Writer>,
+    decode_frame: Arc<F>,
+) where
+    F: Fn(&Path, u32, &dyn Fn() -> bool) -> Result<Frame, String>,
+{
+    if !matches!(lane, DecodeLane::Visible) {
+        crate::platform::worker_priority::background();
+    }
     loop {
         let (slot, job, visible_epoch, thumbnail_epoch) = {
             let mut q = shared.queues.lock().unwrap();
@@ -247,26 +439,10 @@ fn worker(shared: Arc<Shared>, ctx: egui::Context, slots: &[usize]) {
                 if q.closed {
                     return;
                 }
-                let next = slots
-                    .iter()
-                    .copied()
-                    .filter_map(|s| {
-                        q.pending[s].as_ref().map(|job| {
-                            (
-                                if s == PREFETCH_SLOT {
-                                    2
-                                } else if s == THUMB_SLOT {
-                                    1
-                                } else {
-                                    0
-                                },
-                                job.id,
-                                s,
-                            )
-                        })
-                    })
-                    .min();
-                if let Some((_, _, slot)) = next {
+                if let Some(slot) = lane.next_slot(&q) {
+                    if slot < FOLDER_SLOT {
+                        q.visible_active = true;
+                    }
                     break (
                         slot,
                         q.pending[slot].take().unwrap(),
@@ -279,67 +455,211 @@ fn worker(shared: Arc<Shared>, ctx: egui::Context, slots: &[usize]) {
         };
         let id = job.id;
         let live = || shared.current[slot].load(AtomicOrdering::Relaxed) == id;
+        // The on-screen strip and the next page keep their decoder; wider
+        // speculative work yields the CPU and resumes later.
+        let preemptible = slot >= THUMB_SLOT && job.urgency > Urgency::Lead;
         let preempted = || {
-            (slot >= THUMB_SLOT
-                && shared.visible_epoch.load(AtomicOrdering::Relaxed) != visible_epoch)
-                || (slot == PREFETCH_SLOT
-                    && shared.thumbnail_epoch.load(AtomicOrdering::Relaxed) != thumbnail_epoch)
+            preemptible
+                && (shared.visible_epoch.load(AtomicOrdering::Relaxed) != visible_epoch
+                    || (slot == PREFETCH_SLOT
+                        && shared.thumbnail_epoch.load(AtomicOrdering::Relaxed) != thumbnail_epoch))
         };
-        let cache = shared.disk_cache.lock().unwrap().clone();
-        let cache_key = cache
-            .as_ref()
-            .and_then(|cache| cache.key(&job.path, job.max_side));
-        let cached = cache
-            .as_ref()
-            .zip(cache_key.as_ref())
-            .and_then(|(cache, key)| cache.load(key));
-        let result = if let Some(cached) = cached {
-            Ok(Frame {
-                hdr: None,
-                animation: None,
-                image: cached.image,
-                original_size: cached.original_size,
-            })
-        } else {
-            let result = decode(&job.path, job.max_side, &|| live() && !preempted());
-            if live()
-                && !preempted()
-                && let Ok(frame) = &result
-                && frame.animation.is_none()
-                && frame.hdr.is_none()
-                && let Some((cache, key)) = cache.zip(cache_key)
+        let result: Result<Option<Frame>, String> = (|| {
+            #[cfg(any(target_os = "ios", target_os = "android", test))]
+            let provider_thumbnail =
+                slot == THUMB_SLOT && crate::core::documents::has_provider_thumbnail(&job.path);
+            // Still wanted, regardless of preemption: a finished result is kept.
+            let usable = || {
+                live() && {
+                    #[cfg(any(target_os = "ios", target_os = "android", test))]
+                    {
+                        crate::core::documents::provider_cache_identity(&job.path).is_ok()
+                    }
+                    #[cfg(not(any(target_os = "ios", target_os = "android", test)))]
+                    {
+                        true
+                    }
+                }
+            };
+            let active = || usable() && !preempted();
+            // Current authorized provider metadata can identify a display cache
+            // without copying its original. Other providers retain local keys.
+            #[cfg(any(target_os = "ios", target_os = "android", test))]
+            if !provider_thumbnail
+                && !matches!(
+                    crate::core::documents::provider_cache_identity(&job.path),
+                    Ok(Some(_))
+                )
             {
-                writer.store(cache, key, frame);
+                crate::core::documents::materialize(&job.path, &active)?;
             }
-            result
-        };
-        if slot >= THUMB_SLOT {
+            #[cfg(not(any(target_os = "ios", target_os = "android", test)))]
+            let provider_thumbnail = false;
+            let cache = shared.disk_cache.lock().unwrap().clone();
+            let cache_current = || *shared.disk_cache.lock().unwrap() == cache;
+            // Display work decodes at a fixed tier, so resizing the window
+            // reuses entries; thumbnails keep their own small size.
+            let side = if slot == THUMB_SLOT {
+                job.max_side
+            } else {
+                display_tier(job.max_side)
+            };
+            // Strip thumbnails live in the library's thumbnail store, so a page
+            // and the cover of its recent/bookmark entry decode only once.
+            let thumbnail = cache
+                .as_ref()
+                .filter(|_| slot == THUMB_SLOT && !provider_thumbnail)
+                .and_then(|cache| {
+                    // An archive page keys by `archive/inner`, like library covers.
+                    let logical = crate::core::archive::logical_page(&job.path);
+                    crate::core::library::thumbnail_key(logical.as_deref().unwrap_or(&job.path))
+                        .map(|key| (cache.thumbnail_dir(), key, cache.current_generation()))
+                });
+            // Cache reads take no lock, so the visible lane never waits for
+            // (or skips the cache because of) background writes and pruning.
+            let cache_key = cache
+                .as_ref()
+                .filter(|_| slot != THUMB_SLOT || provider_thumbnail)
+                .and_then(|cache| {
+                    #[cfg(any(target_os = "ios", target_os = "android", test))]
+                    if provider_thumbnail {
+                        return cache.provider_thumbnail_key(&job.path, job.max_side);
+                    }
+                    cache.key(&job.path, side)
+                });
+            if job.disk_only {
+                if let Some((dir, key, _)) = &thumbnail {
+                    if crate::core::library::thumbnail_file(dir, key).is_file() {
+                        return Ok(None);
+                    }
+                } else {
+                    let Some((cache, key)) = cache.as_ref().zip(cache_key.as_ref()) else {
+                        return Err("The disk cache is off.".into());
+                    };
+                    if cache.contains(key) {
+                        return Ok(None);
+                    }
+                }
+            }
+            let cached = if let Some((dir, key, _)) = &thumbnail {
+                crate::core::library::load_thumbnail(dir, key)
+                    .ok()
+                    .map(|image| Frame {
+                        original_size: [image.size[0] as u32, image.size[1] as u32],
+                        image,
+                        animation: None,
+                        hdr: None,
+                    })
+            } else {
+                cache
+                    .as_ref()
+                    .zip(cache_key.as_ref())
+                    .and_then(|(cache, key)| cache.load(key))
+                    .or_else(|| {
+                        // A larger tier from a bigger window is better than
+                        // decoding the original again.
+                        let cache = cache.as_ref().filter(|_| slot != THUMB_SLOT)?;
+                        DISPLAY_TIERS
+                            .into_iter()
+                            .filter(|&tier| tier > side)
+                            .find_map(|tier| cache.load(&cache.key(&job.path, tier)?))
+                    })
+                    .map(|cached| Frame {
+                        hdr: None,
+                        animation: None,
+                        image: cached.image,
+                        original_size: cached.original_size,
+                    })
+            }
+            .filter(|_| usable() && cache_current());
+            if let Some(cached) = cached {
+                Ok(Some(cached))
+            } else {
+                // A stable-key miss still materializes through the guarded
+                // loader before the decoder touches a private placeholder.
+                let result = (|| {
+                    #[cfg(any(target_os = "ios", target_os = "android", test))]
+                    {
+                        if provider_thumbnail {
+                            let image = crate::core::documents::provider_thumbnail(
+                                &job.path,
+                                job.max_side,
+                                &active,
+                            )?;
+                            return Ok(Frame {
+                                original_size: [image.size[0] as u32, image.size[1] as u32],
+                                image,
+                                animation: None,
+                                hdr: None,
+                            });
+                        }
+                        crate::core::documents::materialize(&job.path, &active)?;
+                    }
+                    decode_frame(&job.path, side, &active)
+                })();
+                // A finished decode is stored even when it was preempted or
+                // superseded meanwhile: the work is already paid for.
+                if cache_current()
+                    && let Ok(frame) = &result
+                    && let Some(((_, key, generation), cache)) =
+                        thumbnail.as_ref().zip(cache.as_ref())
+                {
+                    // Like the library list: the first (SDR) frame is the thumbnail.
+                    let _ = crate::core::library::store_thumbnail_image(
+                        cache,
+                        *generation,
+                        key,
+                        &frame.image,
+                        || cache.limit(),
+                    );
+                } else if cache_current()
+                    && let Ok(frame) = &result
+                    && frame.animation.is_none()
+                    && frame.hdr.is_none()
+                    && let Some((cache, key)) = cache.clone().zip(cache_key)
+                {
+                    let priority = match slot {
+                        THUMB_SLOT => persistent::Priority::Thumbnail,
+                        PREFETCH_SLOT => persistent::Priority::Prefetch,
+                        _ => persistent::Priority::Visible,
+                    };
+                    writer.store(cache, key, frame, priority);
+                }
+                if !usable() {
+                    return Err("Cancelled".into());
+                }
+                result.map(|frame| (!job.disk_only).then_some(frame))
+            }
+        })();
+        // Only an interrupted decode starts over; a finished one is published.
+        if slot >= THUMB_SLOT && result.is_err() {
             let mut q = shared.queues.lock().unwrap();
             if live() && preempted() && !q.closed {
                 q.pending[slot] = Some(job);
                 continue;
             }
         }
-        let event = if slot == THUMB_SLOT {
-            MediaEvent::Thumbnail {
+        let event = if job.disk_only {
+            MediaEvent::Warmed {
                 id,
                 path: job.path,
-                result,
-            }
-        } else if slot == PREFETCH_SLOT {
-            MediaEvent::Prefetched {
-                id,
-                path: job.path,
-                result,
+                result: result.map(drop),
             }
         } else {
-            MediaEvent::Image {
-                id,
-                path: job.path,
-                result,
+            let result =
+                result.and_then(|frame| frame.ok_or_else(|| "No image was decoded.".to_owned()));
+            let path = job.path;
+            match slot {
+                THUMB_SLOT => MediaEvent::Thumbnail { id, path, result },
+                PREFETCH_SLOT => MediaEvent::Prefetched { id, path, result },
+                _ => MediaEvent::Image { id, path, result },
             }
         };
         let mut q = shared.queues.lock().unwrap();
+        if slot < FOLDER_SLOT {
+            q.visible_active = false;
+            shared.changed.notify_all();
+        }
         if live() && !q.closed {
             q.ready[slot] = Some(event);
             drop(q);
@@ -405,6 +725,21 @@ fn scan_snapshot(dir: &Path, live: &dyn Fn() -> bool) -> Result<FolderSnapshot, 
             Err(_) => continue,
         };
         if metadata.is_file() {
+            #[cfg(any(target_os = "ios", target_os = "android", test))]
+            if let Some((bytes, modified)) = crate::core::documents::deferred_stamp(&path) {
+                // Filling an app-owned placeholder is not a source edit. Keep
+                // its listing identity stable while workers fetch its pixels.
+                stamps.insert(
+                    path.clone(),
+                    FileStamp {
+                        bytes,
+                        modified,
+                        created: None,
+                    },
+                );
+                files.push(path);
+                continue;
+            }
             stamps.insert(
                 path.clone(),
                 FileStamp {
@@ -475,6 +810,14 @@ fn folder_worker(shared: Arc<Shared>, ctx: egui::Context) {
                     previous = None;
                     last_error = None;
                     break true;
+                }
+                if active
+                    .as_ref()
+                    .is_some_and(|job| shared.unwatched.load(AtomicOrdering::Relaxed) == job.id)
+                {
+                    // The listing was published; this folder is not watched.
+                    active = None;
+                    continue;
                 }
                 if active.is_some() {
                     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -670,12 +1013,82 @@ fn output_size(w: u32, h: u32, max_side: u32) -> [u32; 2] {
     ]
 }
 
+/// Android's ImageDecoder scales while decoding (and reads HEIC/HEIF, which
+/// the Rust decoders cannot here). Display keeps the Rust path for formats
+/// with animation, alpha regions or HDR; thumbnails take only the first frame.
+/// None falls back to the Rust decoders.
+#[cfg(target_os = "android")]
+fn android_decode(
+    path: &Path,
+    extension: &str,
+    max_side: u32,
+    live: &dyn Fn() -> bool,
+) -> Result<Option<Frame>, String> {
+    let thumbnail = max_side <= crate::core::library::THUMBNAIL_EDGE;
+    let eligible = match extension {
+        "jpg" | "jpeg" | "jfif" | "heic" | "heif" => true,
+        "png" | "webp" | "bmp" => thumbnail,
+        _ => false,
+    };
+    if !eligible {
+        return Ok(None);
+    }
+    if !live() {
+        return Err("Cancelled".into());
+    }
+    let Some((image, original)) =
+        crate::platform::android_media::decode_scaled(path, max_side, MAX_OUTPUT_PIXELS)
+    else {
+        return Ok(None);
+    };
+    if !live() {
+        return Err("Cancelled".into());
+    }
+    Ok(Some(Frame {
+        hdr: None,
+        animation: None,
+        original_size: upright_original(original, image.size),
+        image,
+    }))
+}
+
+/// The OS decoder applies EXIF orientation to its output; report the original
+/// size in the same orientation even if the header size was pre-rotation.
+#[cfg(any(target_os = "android", test))]
+fn upright_original(original: [u32; 2], output: [usize; 2]) -> [u32; 2] {
+    let landscape = |w: u64, h: u64| w > h;
+    let [ow, oh] = original;
+    let [w, h] = output;
+    if w != h && ow != oh && landscape(w as u64, h as u64) != landscape(ow.into(), oh.into()) {
+        [oh, ow]
+    } else {
+        original
+    }
+}
+
+/// OS-decoded pixels through the same color management as the Rust path.
+fn scaled_frame(scaled: crate::platform::platform_image::Scaled) -> Result<Frame, String> {
+    let image = color::to_srgb(
+        DynamicImage::ImageRgba8(scaled.image),
+        scaled.icc.as_deref(),
+    )?;
+    let (image, hdr) = color::display(image);
+    Ok(Frame {
+        hdr,
+        animation: None,
+        image,
+        original_size: scaled.original,
+    })
+}
+
 /// Decodes the first frame outside the viewer's queues, for cached thumbnails.
 pub(crate) fn decode_still(path: &Path, max_side: u32) -> Result<Frame, String> {
     decode(path, max_side, &|| true)
 }
 
 fn decode(path: &Path, max_side: u32, live: &dyn Fn() -> bool) -> Result<Frame, String> {
+    #[cfg(any(target_os = "ios", target_os = "android", test))]
+    crate::core::documents::materialize(path, live)?;
     #[cfg(all(target_os = "macos", not(test)))]
     let access = crate::platform::mac_access::resolve(path)?;
     #[cfg(all(target_os = "macos", not(test)))]
@@ -689,6 +1102,10 @@ fn decode(path: &Path, max_side: u32, live: &dyn Fn() -> bool) -> Result<Frame, 
         .and_then(|x| x.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
+    #[cfg(target_os = "android")]
+    if let Some(frame) = android_decode(path, &extension, max_side, live)? {
+        return Ok(frame);
+    }
     if extension == "png"
         && let Some(frame) = regions::png_preview(path, max_side, live)?
     {
@@ -701,6 +1118,15 @@ fn decode(path: &Path, max_side: u32, live: &dyn Fn() -> bool) -> Result<Frame, 
         extension.as_str(),
         "heic" | "heif" | "dng" | "cr2" | "cr3" | "nef" | "arw" | "raf"
     ) {
+        // The OS codec scales while decoding and applies EXIF orientation.
+        if let Some(scaled) =
+            crate::platform::platform_image::decode_scaled(path, max_side, MAX_OUTPUT_PIXELS)?
+        {
+            if !live() {
+                return Err("Cancelled".into());
+            }
+            return scaled_frame(scaled);
+        }
         let image = crate::platform::platform_image::decode(path)?;
         if !live() {
             return Err("Cancelled".into());
@@ -750,6 +1176,24 @@ fn decode(path: &Path, max_side: u32, live: &dyn Fn() -> bool) -> Result<Frame, 
             ),
             original_size: [size.width(), size.height()],
         });
+    }
+    // OS codecs scale in the decoder. WIC decodes JPEG about twice as fast as
+    // the Rust paths (O5 A/B, Windows); ImageIO is assumed similar (unmeasured).
+    // Embedded profiles go through the same color management.
+    #[cfg(any(windows, target_os = "macos", target_os = "ios"))]
+    if matches!(extension.as_str(), "jpg" | "jpeg" | "jfif")
+        && let Some(scaled) =
+            crate::platform::platform_image::decode_scaled(path, max_side, MAX_OUTPUT_PIXELS)?
+    {
+        if !live() {
+            return Err("Cancelled".into());
+        }
+        return scaled_frame(scaled);
+    }
+    if matches!(extension.as_str(), "jpg" | "jpeg" | "jfif")
+        && let Some(frame) = jpeg::decode_scaled(path, max_side, live)?
+    {
+        return Ok(frame);
     }
     let file = fs::File::open(path).map_err(|e| e.to_string())?;
     let reader = CancelReader { file, live };
@@ -803,13 +1247,27 @@ fn decode(path: &Path, max_side: u32, live: &dyn Fn() -> bool) -> Result<Frame, 
     let orientation = decoder
         .orientation()
         .unwrap_or(image::metadata::Orientation::NoTransforms);
-    let [out_w, out_h] = output_size(w, h, max_side);
     let image =
         DynamicImage::from_decoder(decoder).map_err(|e| format!("Image decoding failed. {e}"))?;
+    finish_still(image, [w, h], max_side, icc.as_deref(), orientation, live)
+}
+
+/// Shared tail of still decoders: `image` may already be reduced (for example
+/// by DCT scaling) but `original` is the stored, pre-orientation source size.
+fn finish_still(
+    image: DynamicImage,
+    original: [u32; 2],
+    max_side: u32,
+    icc: Option<&[u8]>,
+    orientation: image::metadata::Orientation,
+    live: &dyn Fn() -> bool,
+) -> Result<Frame, String> {
     if !live() {
         return Err("Cancelled".into());
     }
-    let mut image = if (out_w, out_h) == (w, h) {
+    let [w, h] = original;
+    let [out_w, out_h] = output_size(w, h, max_side);
+    let mut image = if image.dimensions() == (out_w, out_h) {
         image
     } else {
         image.thumbnail_exact(out_w, out_h)
@@ -817,7 +1275,7 @@ fn decode(path: &Path, max_side: u32, live: &dyn Fn() -> bool) -> Result<Frame, 
     if !live() {
         return Err("Cancelled".into());
     }
-    image = color::to_srgb(image, icc.as_deref())?;
+    image = color::to_srgb(image, icc)?;
     image.apply_orientation(orientation);
     let original_size = match orientation {
         image::metadata::Orientation::Rotate90

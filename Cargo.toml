@@ -1,6 +1,6 @@
 [package]
 name = "nabi-view"
-version = "1.2.0"
+version = "1.2.2"
 edition = "2024"
 rust-version = "1.99"
 build = "build/cargo.rs"
@@ -11,7 +11,7 @@ homepage = "https://lab.saro.me/app/nabi-view"
 [workspace]
 members = ["platforms/android/rust", "platforms/preview/rust", "vendor/epaint", "vendor/egui-wgpu"]
 default-members = ["."]
-exclude = ["vendor/winit"]
+exclude = ["vendor/winit", "vendor/zip-apple"]
 resolver = "3"
 
 [dependencies]
@@ -34,12 +34,20 @@ rusqlite = { version = "0.42.0", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["arbitrary_precision"] }
 tempfile = "3.27.0"
-zip = { version = "9.5.1", default-features = false, features = ["aes-crypto", "deflate-flate2", "deflate64", "bzip2", "lzma", "xz", "ppmd"] }
-sevenz-rust2 = { version = "0.25.0", default-features = false, features = ["aes256", "bzip2", "ppmd", "deflate"] }
+sevenz-rust2 = { version = "0.25.0", default-features = false, features = ["bzip2", "ppmd", "deflate"] }
+jpeg-decoder = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 # Tests write 7z fixtures; the app only reads archives.
-sevenz-rust2 = { version = "0.25.0", default-features = false, features = ["aes256", "compress"] }
+sevenz-rust2 = { version = "0.25.0", default-features = false, features = ["compress"] }
+
+# Apple binaries keep plain archive support without AES or legacy ZipCrypto.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+zip_apple = { package = "zip-apple", path = "vendor/zip-apple", default-features = false, features = ["deflate-flate2", "deflate64", "bzip2", "lzma", "xz", "ppmd"] }
+
+[target.'cfg(not(any(target_os = "macos", target_os = "ios")))'.dependencies]
+zip = { version = "9.5.1", default-features = false, features = ["aes-crypto", "deflate-flate2", "deflate64", "bzip2", "lzma", "xz", "ppmd"] }
+sevenz-rust2 = { version = "0.25.0", default-features = false, features = ["aes256"] }
 
 [profile.release]
 strip = "debuginfo"
@@ -66,7 +74,7 @@ winit = { path = "vendor/winit" }
 winit = { version = "0.30.13", default-features = false }
 # The latest Windows SDK crate's COM macro requires its matching core ABI.
 windows-core = "=0.62.2"
-windows = { version = "0.62.2", features = ["Win32_Devices_Display", "Win32_Graphics_Imaging", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Com", "Win32_System_Power", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_UI_Shell_Common"] }
+windows = { version = "0.62.2", features = ["Win32_Devices_Display", "Win32_Graphics_Imaging", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Power", "Win32_System_Variant", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_UI_Shell_Common"] }
 wgpu = { version = "30.0.1", default-features = false, features = ["dx12"] }
 
 [target.'cfg(unix)'.dev-dependencies]

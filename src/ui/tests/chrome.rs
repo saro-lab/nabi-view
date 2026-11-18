@@ -17,6 +17,69 @@ fn hover_icon(window: &mut TestWindow, icon: &str) -> String {
 }
 
 #[test]
+fn mobile_brand_opens_recent_and_bookmarks_with_a_full_touch_target() {
+    let _phone = PhonePreview::enter();
+    for language in [
+        crate::i18n::Language::English,
+        crate::i18n::Language::Arabic,
+    ] {
+        let mut window = TestWindow::sample_with_settings(&Settings {
+            language,
+            ..Default::default()
+        });
+        window.screen_size = egui::vec2(390., 844.);
+        window.wait_for("1 / 5");
+        window.time += 0.3;
+        window.draw(Some(Key::ArrowRight));
+        window.wait_for("2 / 5");
+        let fitted = window.photo_rects().1;
+        window.draw(Some(Key::Equals));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            window.draw(None);
+            if window.photo_rects().1.width() > fitted.width() + 1. {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "zoomed photo was not drawn"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let photo = window.photo_rects().1;
+        let home = window.titlebar_icon("home").rect;
+        assert!(home.width() >= 44. && home.height() >= 44.);
+        // Press the edge of the target, outside the 24px icon itself.
+        window.click(home.left_center() + egui::vec2(3., 0.));
+        let text = window.draw(None).0;
+        assert!(
+            text.contains(tr("recent")) && text.contains(tr("bookmarks")),
+            "{text}"
+        );
+        let close = window
+            .ctx
+            .read_response(egui::Id::unique(("titlebar", "library-close")))
+            .unwrap();
+        window.click(close.rect.center());
+        window.wait_for("2 / 5");
+        assert_eq!(window.photo_rects().1, photo);
+    }
+}
+
+#[test]
+fn desktop_brand_keeps_its_existing_non_navigation_behavior() {
+    let mut window = TestWindow::sample();
+    window.reveal_controls();
+    window.wait_for("1 / 5");
+    assert!(
+        window
+            .ctx
+            .read_response(egui::Id::unique(("titlebar", "home")))
+            .is_none()
+    );
+}
+
+#[test]
 fn chrome_tooltips_show_current_native_shortcuts_on_a_smaller_second_line() {
     let settings = Settings {
         language: crate::i18n::Language::English,
