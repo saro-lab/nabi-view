@@ -75,6 +75,12 @@
 
 static NabiFullscreen *controller;
 
+void nabi_minimize_window(void) {
+    NSCAssert(NSThread.isMainThread, @"Minimize must run on the main thread");
+    NSWindow *window = NSApp.keyWindow ?: NSApp.mainWindow;
+    [window miniaturize:nil];
+}
+
 bool nabi_set_fullscreen(bool enabled, bool blackout) {
     NSCAssert(NSThread.isMainThread, @"Fullscreen must run on the main thread");
     if (!controller) controller = [NabiFullscreen new];

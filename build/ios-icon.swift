@@ -10,32 +10,13 @@ func fail(_ message: String) -> Never {
 guard (3...4).contains(CommandLine.arguments.count),
       let source = NSImage(contentsOfFile: CommandLine.arguments[1]),
       let input = source.cgImage(forProposedRect: nil, context: nil, hints: nil),
-      let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
-      let sourceContext = CGContext(data: nil, width: input.width, height: input.height,
-        bitsPerComponent: 8, bytesPerRow: input.width * 4, space: colorSpace,
-        bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue)
-      else { fail("Usage: swift build/ios-icon.swift SOURCE.png AppIcon.png [AppIconTinted.png]") }
+      input.width == 1024, input.height == 1024,
+      let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+      else { fail("Pass the shared 1024px icon, AppIcon.png and optional AppIconTinted.png") }
 
-sourceContext.draw(input, in: CGRect(x: 0, y: 0, width: input.width, height: input.height))
-guard let data = sourceContext.data?.assumingMemoryBound(to: UInt8.self),
-      let decoded = sourceContext.makeImage() else { fail("Cannot decode source icon") }
-var minX = input.width, minY = input.height, maxX = -1, maxY = -1
-for y in 0..<input.height {
-    for x in 0..<input.width where data[y * sourceContext.bytesPerRow + x * 4 + 3] != 0 {
-        minX = min(minX, x); minY = min(minY, y)
-        maxX = max(maxX, x); maxY = max(maxY, y)
-    }
-}
-guard maxX >= minX, maxY >= minY else { fail("Source icon is fully transparent") }
-let bounds = CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
-guard let artwork = decoded.cropping(to: bounds) else { fail("Cannot crop source icon") }
-
-// Center the visible artwork, not the source canvas. Leave room for the system mask.
-let size = 1024
-let scale = 820 / max(bounds.width, bounds.height)
-let width = bounds.width * scale, height = bounds.height * scale
-let placement = CGRect(x: (CGFloat(size) - width) / 2, y: (CGFloat(size) - height) / 2,
-    width: width, height: height)
+// The shared master already sets size and alignment for every platform.
+let size = input.width
+let placement = CGRect(x: 0, y: 0, width: size, height: size)
 
 func writePNG(_ context: CGContext, to path: String) throws {
     guard let output = context.makeImage(),
@@ -50,7 +31,7 @@ guard let light = CGContext(data: nil, width: size, height: size, bitsPerCompone
 light.setFillColor(CGColor(gray: 1, alpha: 1))
 light.fill(CGRect(x: 0, y: 0, width: size, height: size))
 light.interpolationQuality = .high
-light.draw(artwork, in: placement)
+light.draw(input, in: placement)
 try writePNG(light, to: CommandLine.arguments[2])
 
 if CommandLine.arguments.count == 4 {
@@ -61,9 +42,8 @@ if CommandLine.arguments.count == 4 {
     tinted.setFillColor(CGColor(gray: 0, alpha: 1))
     tinted.fill(CGRect(x: 0, y: 0, width: size, height: size))
     tinted.interpolationQuality = .high
-    tinted.clip(to: placement, mask: artwork)
+    tinted.clip(to: placement, mask: input)
     tinted.setFillColor(CGColor(gray: 1, alpha: 1))
     tinted.fill(placement)
     try writePNG(tinted, to: CommandLine.arguments[3])
 }
-print("Source alpha bounds: \(bounds); centered icon artwork: \(placement)")

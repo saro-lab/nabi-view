@@ -24,6 +24,7 @@ unsafe extern "C" {
     ) -> i32;
     fn nabi_access_resolve(
         path: *const c_char,
+        library_check: bool,
         result: *mut *mut c_char,
         handle: *mut *mut c_void,
         error: *mut *mut c_char,
@@ -210,7 +211,18 @@ pub(crate) fn sandboxed() -> bool {
     unsafe { nabi_access_is_sandboxed() }
 }
 pub(crate) fn resolve(path: &Path) -> Result<Access, String> {
+    resolve_path(path, false)
+}
+/// Holds the same scope as opening. If Foundation reports a missing bookmark
+/// target, the returned last-known path is only for a fresh filesystem check.
+pub(crate) fn resolve_for_library_check(path: &Path) -> Result<Access, String> {
+    resolve_path(path, true)
+}
+fn resolve_path(path: &Path, library_check: bool) -> Result<Access, String> {
     if !CONFIGURED.load(Ordering::Acquire) {
+        if library_check {
+            return Err("Document permission storage is unavailable.".into());
+        }
         return Ok(Access {
             path: path.to_owned(),
             handle: std::ptr::null_mut(),
@@ -222,7 +234,16 @@ pub(crate) fn resolve(path: &Path) -> Result<Access, String> {
         std::ptr::null_mut(),
         std::ptr::null_mut(),
     );
-    if unsafe { nabi_access_resolve(input.as_ptr(), &mut result, &mut handle, &mut message) } != 0 {
+    if unsafe {
+        nabi_access_resolve(
+            input.as_ptr(),
+            library_check,
+            &mut result,
+            &mut handle,
+            &mut message,
+        )
+    } != 0
+    {
         unsafe { nabi_access_release(handle) };
         let _ = take_path(result);
         return Err(error(message));
@@ -340,11 +361,20 @@ mod tests {
         );
         assert_eq!(std::fs::read(&grant.path).unwrap(), b"read only original");
         drop(grant);
+        let check = resolve_for_library_check(&photos).unwrap();
+        assert_eq!(
+            check.path.canonicalize().unwrap(),
+            moved.canonicalize().unwrap()
+        );
+        drop(check);
         forget(&photos, &[photos.clone()]).unwrap();
         assert!(has_grant(&first));
         std::fs::remove_file(moved.join("first.png")).unwrap();
         std::fs::remove_dir(&moved).unwrap();
         assert!(resolve(&first).is_err());
+        let check = resolve_for_library_check(&photos).unwrap();
+        assert_eq!(check.path.file_name(), moved.file_name());
+        assert!(!check.path.try_exists().unwrap());
         assert!(has_grant(&first)); // An unavailable root does not erase saved access.
         forget(&photos, &[]).unwrap();
         assert!(!has_grant(&first));

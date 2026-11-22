@@ -560,6 +560,12 @@ impl Viewer {
         if !self.library.open {
             return;
         }
+        // A folder may have been removed in the file manager while this list was open.
+        if ctx.input(|input| input.events.contains(&egui::Event::WindowFocused(true))) {
+            let tab = self.library.tab;
+            self.reload_library();
+            self.library.tab = tab;
+        }
         let mut close = false;
         let mut action = None;
         let mut opened = None;
@@ -671,6 +677,21 @@ impl Viewer {
         }
         if let Some(index) = opened {
             let entry = &self.library.items[index].entry;
+            // A macOS grant for the saved page can still resolve after a move.
+            if self
+                .store
+                .as_ref()
+                .is_some_and(|store| store.library_source_missing(&entry.folder))
+                && entry
+                    .image
+                    .as_deref()
+                    .is_none_or(|path| !library::page_exists(path))
+            {
+                // Refresh both lists, including a second row for this same folder.
+                self.reload_library();
+                self.release_held_input();
+                return;
+            }
             #[cfg(all(target_os = "macos", not(test)))]
             let target = Some(entry.image.clone().unwrap_or_else(|| entry.folder.clone()));
             #[cfg(not(all(target_os = "macos", not(test))))]
@@ -710,9 +731,6 @@ impl Viewer {
                     // closing it at native request acceptance flashes the empty menu.
                     self.library.open = false;
                 }
-            } else if entry.kind == Kind::Recent {
-                // Access or folder contents may have changed since opening the list.
-                removed = Some(index);
             } else {
                 self.library.items[index].entry.available = false;
                 self.last_error = tr("folder-unavailable").into();

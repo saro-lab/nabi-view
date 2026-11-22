@@ -62,6 +62,10 @@ static NSString *currentPath(NSURL *url) {
 static void fail(char **error, NSString *message) {
     if (error) *error = strdup((message ?: @"Could not access this document. Choose it again.").UTF8String);
 }
+static BOOL missingFileError(NSError *error) {
+    return [error.domain isEqualToString:NSCocoaErrorDomain] &&
+        (error.code == NSFileNoSuchFileError || error.code == NSFileReadNoSuchFileError);
+}
 static int lockRegistry(char **error) {
     if (!registryPath) return -1;
     NSString *lock = [registryPath stringByAppendingString:@".lock"];
@@ -74,8 +78,12 @@ static int lockRegistry(char **error) {
     return descriptor;
 }
 static NSMutableDictionary *loadRegistry(char **error) {
-    NSDictionary *attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:registryPath error:nil];
-    if (!attributes) return [NSMutableDictionary dictionary];
+    NSError *cause = nil;
+    NSDictionary *attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:registryPath error:&cause];
+    if (!attributes) {
+        if (missingFileError(cause)) return [NSMutableDictionary dictionary];
+        fail(error, @"Saved document permissions could not be read."); return nil;
+    }
     if (![attributes[NSFileType] isEqual:NSFileTypeRegular] || [attributes[NSFileSize] unsignedLongLongValue] > maxRegistryBytes) {
         fail(error, @"Saved document permissions exceed the storage limit."); return nil;
     }
@@ -299,7 +307,7 @@ bool nabi_access_temporary(const char *path) {
         return temporaryLeases[fileURL(path).path.stringByStandardizingPath] != nil;
     }}
 }
-int nabi_access_resolve(const char *path, char **resolved, void **handle, char **error) {
+int nabi_access_resolve(const char *path, bool libraryCheck, char **resolved, void **handle, char **error) {
     @autoreleasepool { @synchronized(NabiReadLease.class) {
         if (!resolved || !handle || !path) return 1;
         *resolved = NULL; *handle = NULL;
@@ -308,6 +316,10 @@ int nabi_access_resolve(const char *path, char **resolved, void **handle, char *
         NSString *wanted = requested.path.stringByStandardizingPath;
         int lock = registryPath ? lockRegistry(error) : -1;
         NSMutableDictionary *entries = lock >= 0 ? loadRegistry(error) : nil;
+        if (libraryCheck && registryPath && !entries) {
+            if (lock >= 0) { flock(lock, LOCK_UN); close(lock); }
+            return 1;
+        }
         NSString *selected = nil, *matched = nil;
         for (NSString *key in entries) {
             for (NSString *prefix in @[key, entries[key][@"resolved"]]) {
@@ -322,11 +334,22 @@ int nabi_access_resolve(const char *path, char **resolved, void **handle, char *
         if (selected) {
             NSURLBookmarkResolutionOptions options = NSURLBookmarkResolutionWithoutUI | NSURLBookmarkResolutionWithoutMounting;
             if (sandboxed()) options |= NSURLBookmarkResolutionWithSecurityScope;
-            url = [NSURL URLByResolvingBookmarkData:entries[selected][@"bookmark"] options:options relativeToURL:nil bookmarkDataIsStale:&stale error:nil];
+            NSError *cause = nil;
+            url = [NSURL URLByResolvingBookmarkData:entries[selected][@"bookmark"] options:options relativeToURL:nil bookmarkDataIsStale:&stale error:&cause];
+            if (libraryCheck && !url && missingFileError(cause)) {
+                // The bookmark root itself may have been deleted or its volume
+                // detached. Rust checks both the last resolved path and volume.
+                NSString *suffix = [wanted substringFromIndex:matched.length];
+                NSString *last = [entries[selected][@"resolved"] stringByAppendingString:suffix];
+                *resolved = strdup(last.fileSystemRepresentation);
+                flock(lock, LOCK_UN); close(lock);
+                return *resolved ? 0 : 1;
+            }
         }
         NabiReadLease *lease = [NabiReadLease new];
         lease.url = url; lease.started = url && [url startAccessingSecurityScopedResource];
-        if (!url || (sandboxed() && !readable(url)) || (selected && !readable(url))) {
+        BOOL needsReadAccess = selected != nil || (!libraryCheck && sandboxed());
+        if (!url || (needsReadAccess && !readable(url))) {
             if (lock >= 0) { flock(lock, LOCK_UN); close(lock); }
             fail(error, @"Access to this file or folder was lost. Choose it again to restore access."); return 1;
         }
@@ -353,7 +376,7 @@ int nabi_access_resolve(const char *path, char **resolved, void **handle, char *
         if (lock >= 0) { flock(lock, LOCK_UN); close(lock); }
         *resolved = strdup([[NSFileManager defaultManager] fileSystemRepresentationWithPath:destination]);
         *handle = (__bridge_retained void *)lease;
-        if (temporary) [temporaryLeases removeObjectForKey:wanted];
+        if (temporary && !libraryCheck) [temporaryLeases removeObjectForKey:wanted];
         return *resolved ? 0 : 1;
     }}
 }

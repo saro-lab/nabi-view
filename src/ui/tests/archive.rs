@@ -209,12 +209,10 @@ fn archives_are_remembered_and_bookmarked_at_their_page() {
     reopened.reveal_controls();
     reopened.wait_for("2 / 3");
 
-    // A deleted archive leaves the recent list and marks its bookmark.
+    // Deleting the archive removes its saved page from both lists.
     drop(reopened);
     std::fs::remove_file(&archive).unwrap();
-    let entries = state.library().unwrap();
-    assert!(entries.iter().all(|entry| entry.kind != Kind::Recent));
-    assert!(entries.iter().any(|entry| !entry.available), "{entries:?}");
+    assert!(state.library().unwrap().is_empty());
 }
 
 #[test]

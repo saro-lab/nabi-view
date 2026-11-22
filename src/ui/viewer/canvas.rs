@@ -312,7 +312,6 @@ impl Viewer {
                             let source_px_per_texel = p.original[0] as f32 / p.handle.size_vec2().x;
                             let needs_detail = factor * ppp * source_px_per_texel > 1.02
                                 && source_px_per_texel > 1.02;
-                            let mut detailed = false;
                             if needs_detail && p.animation.is_none() {
                                 if let Some(layer) = self.details.paint(
                                     col,
@@ -327,27 +326,8 @@ impl Viewer {
                                     self.settings.transparency_checker,
                                     1. / source_px_per_texel,
                                 ) {
-                                    detailed = layer.rect.contains_rect(rect.intersect(slot))
-                                        && layer.rect.width() / rect.width() * size.x
-                                            <= image_transform.size(layer.handle.size_vec2()).x
-                                                * 1.02;
                                     presented.push(layer);
                                 }
-                            }
-                            if needs_detail && !detailed {
-                                let tag = Rect::from_min_size(
-                                    slot.left_bottom() + egui::vec2(10., -32.),
-                                    egui::vec2(127., 22.),
-                                );
-                                ui.painter()
-                                    .rect_filled(tag, 3., Color32::from_black_alpha(200));
-                                ui.painter().text(
-                                    tag.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    tr("reduced-preview"),
-                                    FontId::proportional(12.),
-                                    INK,
-                                );
                             }
                         } else {
                             let error = self.failures.get(path);

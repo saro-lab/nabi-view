@@ -1193,9 +1193,13 @@ fn clamp_zoom_percent(percent: f32) -> f32 {
 }
 
 fn chrome_drag(ui: &mut egui::Ui, rect: Rect) {
+    if let Some(response) = chrome_drag_target(ui, rect) {
+        window_frame::drag(ui.ctx(), &response);
+    }
+}
+
+fn chrome_drag_target(ui: &mut egui::Ui, rect: Rect) -> Option<egui::Response> {
     // Register behind the controls, so their click/drag interactions take priority.
-    // Even a small real movement can drag blank space, but a click or stationary
-    // hold (especially the click that activates the window) must not start it.
     let response = ui.interact(
         rect,
         ui.scope_id().with("window-drag"),
@@ -1216,12 +1220,10 @@ fn chrome_drag(ui: &mut egui::Ui, rect: Rect) {
         ui.ctx()
             .data_mut(|data| data.insert_temp(blocked_id, blocked));
     }
-    if !ui
+    let blocked = ui
         .ctx()
-        .data(|data| data.get_temp::<bool>(blocked_id).unwrap_or(false))
-    {
-        window_frame::drag(ui.ctx(), &response);
-    }
+        .data(|data| data.get_temp::<bool>(blocked_id).unwrap_or(false));
+    (!blocked).then_some(response)
 }
 
 fn uv() -> Rect {

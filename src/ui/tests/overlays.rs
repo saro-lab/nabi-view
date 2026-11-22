@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn recent_overlay_drops_emptied_folder_and_opens_first_image() {
+fn recent_overlay_keeps_emptied_folder_and_opens_first_image() {
     let mut window = TestWindow::open(None);
     let store = Store::in_directories(
         window._storage.path().join("config"),
@@ -50,7 +50,13 @@ fn recent_overlay_drops_emptied_folder_and_opens_first_image() {
         window
             .ctx
             .read_response(egui::Id::unique(("recent-folder", &emptied)))
-            .is_none()
+            .is_some()
+    );
+    assert!(
+        window
+            .draw(None)
+            .0
+            .contains(crate::i18n::tr("folder-unavailable"))
     );
     let row = window
         .ctx
@@ -70,22 +76,29 @@ fn recent_overlay_drops_emptied_folder_and_opens_first_image() {
         window._storage.path().join("config"),
         window._storage.path().join("state"),
     );
-    assert_eq!(store.recent().unwrap(), [album]);
+    assert_eq!(store.recent().unwrap(), [album, emptied]);
 }
 
 #[test]
-fn recent_overlay_prunes_unavailable_items_on_display_and_click() {
+fn library_prunes_missing_folders_on_display_focus_and_click() {
     let mut window = TestWindow::open(None);
     let store = Store::in_directories(
         window._storage.path().join("config"),
         window._storage.path().join("state"),
     );
     let root = tempfile::tempdir().unwrap();
-    let folders = ["missing-at-start", "missing-on-reopen", "missing-on-click"].map(|name| {
+    let folders = [
+        "missing-at-start",
+        "missing-on-reopen",
+        "missing-on-focus",
+        "missing-on-click",
+    ]
+    .map(|name| {
         let path = root.path().join(name);
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("1.png"), b"image").unwrap();
         store.record_folder(&path, 10).unwrap();
+        store.add_bookmark(&path.join("1.png"), name).unwrap();
         path.canonicalize()
             .map(crate::core::paths::simplified)
             .unwrap()
@@ -126,21 +139,38 @@ fn recent_overlay_prunes_unavailable_items_on_display_and_click() {
             .read_response(egui::Id::unique(("recent-folder", &folders[1])))
             .is_none()
     );
+    std::fs::remove_dir_all(&folders[2]).unwrap();
+    window.draw_events(vec![Event::WindowFocused(true)], egui::Modifiers::NONE);
+    for _ in 0..2 {
+        window.draw(None);
+    }
+    for folder in &folders[..3] {
+        for kind in ["recent-folder", "bookmark-folder"] {
+            assert!(
+                window
+                    .ctx
+                    .read_response(egui::Id::unique((kind, folder)))
+                    .is_none()
+            );
+        }
+    }
     let row = window
         .ctx
-        .read_response(egui::Id::unique(("recent-folder", &folders[2])))
+        .read_response(egui::Id::unique(("bookmark-folder", &folders[3])))
         .unwrap();
-    std::fs::remove_dir_all(&folders[2]).unwrap();
+    std::fs::remove_dir_all(&folders[3]).unwrap();
     window.click(row.rect.center());
     for _ in 0..4 {
         window.draw(None);
     }
-    assert!(
-        window
-            .ctx
-            .read_response(egui::Id::unique(("recent-folder", &folders[2])))
-            .is_none()
-    );
+    for kind in ["recent-folder", "bookmark-folder"] {
+        assert!(
+            window
+                .ctx
+                .read_response(egui::Id::unique((kind, &folders[3])))
+                .is_none()
+        );
+    }
     assert!(window.draw(None).0.contains(crate::i18n::test_tr(
         "Recently opened items will appear here."
     )));
@@ -154,7 +184,7 @@ fn recent_overlay_prunes_unavailable_items_on_display_and_click() {
         window._storage.path().join("config"),
         window._storage.path().join("state"),
     );
-    assert!(store.recent().unwrap().is_empty());
+    assert!(store.library().unwrap().is_empty());
 }
 
 #[test]
@@ -748,13 +778,13 @@ fn empty_menu_returns_from_settings_and_library_and_stays_on_backdrop_click() {
         window.draw(None);
     }
     let position = egui::pos2(540., 380.);
-    let secondary_click = |window: &mut TestWindow| {
+    let middle_click = |window: &mut TestWindow| {
         window.pointer(position.x, position.y);
         for pressed in [true, false] {
             window.draw_events(
                 vec![Event::PointerButton {
                     pos: position,
-                    button: egui::PointerButton::Secondary,
+                    button: egui::PointerButton::Middle,
                     pressed,
                     modifiers: egui::Modifiers::NONE,
                 }],
@@ -765,8 +795,8 @@ fn empty_menu_returns_from_settings_and_library_and_stays_on_backdrop_click() {
             window.draw(None);
         }
     };
-    // The start overlay must not let a right click open another layer underneath.
-    secondary_click(&mut window);
+    // The start overlay must not let a middle click open the menu underneath.
+    middle_click(&mut window);
     assert!(
         window
             .ctx

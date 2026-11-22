@@ -138,7 +138,7 @@ fn mouse_section_sits_above_shortcuts_and_saves_each_gesture() {
     choose_shortcut_action(&mut window, tr("move-image"), tr("move-window"));
     assert_eq!(saved_viewer_settings(&window).mouse.drag, "window");
     choose_shortcut_action(&mut window, tr("recent-and-bookmarks"), tr("no-action"));
-    assert_eq!(saved_viewer_settings(&window).mouse.middle_click, "none");
+    assert_eq!(saved_viewer_settings(&window).mouse.right_click, "none");
 
     window.click(window.label_position(tr("restore-default")));
     assert_eq!(
@@ -413,20 +413,20 @@ fn default_buttons_open_menu_and_library_and_turn_pages() {
     press(&mut window, center, egui::PointerButton::Extra1, 1);
     assert!(window.draw(None).0.contains("1 / 5"));
 
-    press(&mut window, center, egui::PointerButton::Middle, 1);
+    press(&mut window, center, egui::PointerButton::Secondary, 1);
     assert!(
         library_open(&mut window),
-        "Middle click did not open the library"
+        "Right click did not open the library"
     );
     // The same button closes it again from over the library screen.
-    press(&mut window, center, egui::PointerButton::Middle, 1);
+    press(&mut window, center, egui::PointerButton::Secondary, 1);
     assert!(
         !library_open(&mut window),
-        "Middle click did not close the library"
+        "Right click did not close the library"
     );
 
     assert!(!menu_open(&window));
-    press(&mut window, center, egui::PointerButton::Secondary, 1);
+    press(&mut window, center, egui::PointerButton::Middle, 1);
     assert!(menu_open(&window));
     assert!(!window.started_window_drag());
 }
@@ -466,4 +466,38 @@ fn clicks_run_any_assigned_command_or_nothing() {
         egui::PointerButton::Primary,
         2
     )));
+}
+
+#[test]
+fn titlebar_double_click_toggles_maximize_and_minimize_button_handles_its_own_clicks() {
+    use egui::ViewportCommand::{Close, Fullscreen, Maximized, Minimized, StartDrag};
+
+    let mut window = viewer(MouseSettings::default());
+    let filename = window.label_position("01 Alpine Light.png");
+    let blank = egui::pos2(window.screen_size.x / 2., filename.y);
+    let minimize = window.titlebar_icon("minimize").rect.center();
+    for (position, maximized, clicks, expected) in [
+        (blank, false, 1, vec![]),
+        (blank, false, 2, vec![Maximized(true)]),
+        (blank, true, 2, vec![Maximized(false)]),
+        (filename, false, 2, vec![Maximized(true)]),
+        (minimize, false, 2, vec![Minimized(true), Minimized(true)]),
+    ] {
+        window.maximized = maximized;
+        window.time += 1.; // Start a new click sequence.
+        let commands = press(&mut window, position, egui::PointerButton::Primary, clicks);
+        let actions: Vec<_> = commands
+            .into_iter()
+            .filter(|cmd| {
+                matches!(
+                    cmd,
+                    Close | Fullscreen(_) | Maximized(_) | Minimized(_) | StartDrag
+                )
+            })
+            .collect();
+        assert_eq!(
+            actions, expected,
+            "clicks={clicks} at {position:?} with maximized={maximized}"
+        );
+    }
 }

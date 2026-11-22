@@ -56,7 +56,7 @@ pub struct Entry {
     pub name: Option<String>,
     /// Cache key of the thumbnail last written for this entry.
     pub thumbnail: Option<String>,
-    /// Bookmarks stay listed while their folder cannot be opened.
+    /// An existing folder can be unavailable, for example when access is denied.
     pub available: bool,
 }
 

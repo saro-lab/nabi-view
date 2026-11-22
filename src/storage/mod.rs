@@ -21,7 +21,7 @@ pub struct Store {
     database: PathBuf,
     cache: PathBuf,
     thumbnails_migrated: OnceLock<()>,
-    #[cfg(any(target_os = "ios", test))]
+    #[cfg(any(target_os = "ios", target_os = "android", test))]
     mobile_sources: OnceLock<PathBuf>,
     // What this instance showed its user, which can differ from the disk
     // after another process changes a preference.
@@ -74,7 +74,7 @@ impl Store {
             database: state.join("state.sqlite"),
             cache: cache.join("v1"),
             thumbnails_migrated: OnceLock::new(),
-            #[cfg(any(target_os = "ios", test))]
+            #[cfg(any(target_os = "ios", target_os = "android", test))]
             mobile_sources: OnceLock::new(),
             baseline: Mutex::new(Settings::default()),
         }
@@ -92,31 +92,21 @@ impl Store {
         sources: &Path,
         defaults: &[(&str, &str)],
     ) -> Result<(), String> {
-        #[cfg(any(target_os = "ios", test))]
-        let resolved_sources = {
-            if !sources.is_absolute()
-                || sources.file_name() != Some(std::ffi::OsStr::new("document-sources"))
-            {
-                return Err("Invalid saved document source directory.".into());
-            }
-            let sources = crate::core::paths::canonicalize(sources)
-                .or_else(|_| {
-                    crate::core::paths::canonicalize(sources.parent().unwrap())
-                        .map(|parent| parent.join("document-sources"))
-                })
-                .map_err(|e| e.to_string())?;
-            if self
-                .mobile_sources
-                .get()
-                .is_some_and(|registered| registered != &sources)
-            {
-                return Err("Saved document source directory changed while running.".into());
-            }
-            let _ = self.mobile_sources.set(sources.clone());
-            sources
-        };
-        #[cfg(any(target_os = "ios", test))]
-        let sources = resolved_sources.as_path();
+        if !sources.is_absolute()
+            || sources.file_name() != Some(std::ffi::OsStr::new("document-sources"))
+        {
+            return Err("Invalid saved document source directory.".into());
+        }
+        let sources = crate::core::paths::canonicalize(sources)
+            .or_else(|_| {
+                crate::core::paths::canonicalize(sources.parent().unwrap())
+                    .map(|parent| parent.join("document-sources"))
+            })
+            .map_err(|e| e.to_string())?;
+        let registered = self.mobile_sources.get_or_init(|| sources.clone());
+        if registered != &sources {
+            return Err("Saved document source directory changed while running.".into());
+        }
         if self.database.try_exists().map_err(|e| e.to_string())? {
             #[cfg(any(target_os = "ios", test))]
             return self.migrate_mobile_sources();
@@ -125,7 +115,7 @@ impl Store {
         }
         let folders = defaults
             .iter()
-            .map(|(id, _)| crate::core::photo_library::create_source(sources, id))
+            .map(|(id, _)| crate::core::photo_library::create_source(&sources, id))
             .collect::<Result<Vec<_>, _>>()?;
         let mut conn = self.connection()?;
         let tx = conn
@@ -817,9 +807,28 @@ impl Store {
         Ok(())
     }
 
-    /// Recent folders, newest first, then bookmarks, newest first. Recent
-    /// folders that can no longer be opened are removed; bookmarks stay and
-    /// are marked unavailable until the user removes them.
+    /// A mobile source directory identifies a provider selection. Its local
+    /// marker can disappear independently of the user's documents or photos.
+    pub(crate) fn library_source_missing(&self, folder: &Path) -> bool {
+        #[cfg(any(target_os = "ios", all(test, not(target_os = "android"))))]
+        if crate::core::documents::source_identity(folder).is_some() {
+            return false;
+        }
+        #[cfg(target_os = "android")]
+        if let Some((source, _)) = crate::core::documents::source_identity(folder)
+            && source == folder
+            && self
+                .mobile_sources
+                .get()
+                .is_some_and(|sources| source.parent() == Some(sources))
+        {
+            return false;
+        }
+        crate::platform::library_path::is_missing(folder)
+    }
+
+    /// Recent folders, then bookmarks, each newest first. Remove entries for
+    /// missing containers and keep temporarily unreadable ones in both lists.
     pub fn library(&self) -> Result<Vec<Entry>, String> {
         self.migrate_thumbnails()?;
         if !self.database.try_exists().map_err(|e| e.to_string())? {
@@ -829,6 +838,11 @@ impl Store {
         self.migrate_mobile_sources()?;
         let mut conn = self.connection()?;
         simplify_stored_paths(&mut conn, "library", "kind")?;
+        let data_version = |conn: &Connection| {
+            conn.query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+                .map_err(|e| e.to_string())
+        };
+        let snapshot_version = data_version(&conn)?;
         type Row = (
             i64,
             i64,
@@ -861,9 +875,8 @@ impl Store {
         };
 
         // Check access only when loading the list, not on every rendered frame.
-        // An accessible folder without supported images is not a usable entry.
         let mut entries = Vec::with_capacity(rows.len());
-        let mut unavailable = Vec::new();
+        let mut missing = Vec::new();
         for (id, kind, path, image, name, thumbnail) in rows {
             let Some(kind) = Kind::from_code(kind) else {
                 continue;
@@ -897,21 +910,17 @@ impl Store {
             let image = saved
                 .or_else(|| library::first_image(&folder))
                 .or_else(|| library::is_archive_file(&folder).then(|| folder.clone()));
-            if image.is_none()
-                && kind == Kind::Recent
-                && !protected
-                && !collection
-                && !mobile_source
-            {
-                unavailable.push((id, path));
+            let available = collection
+                || image.as_ref().is_some_and(|path| {
+                    (!protected && !mobile_source) || library::page_exists(path)
+                });
+            if !available && self.library_source_missing(&folder) {
+                missing.push((id, path));
                 continue;
             }
             entries.push(Entry {
                 kind,
-                available: collection
-                    || image.as_ref().is_some_and(|path| {
-                        (!protected && !mobile_source) || library::page_exists(path)
-                    }),
+                available,
                 folder,
                 image,
                 name,
@@ -919,14 +928,20 @@ impl Store {
             });
         }
         // Do not hold a database write lock while checking filesystem access.
-        if !unavailable.is_empty() {
-            let tx = conn.transaction().map_err(|e| e.to_string())?;
-            for (id, path) in unavailable {
-                tx.execute(
-                    "DELETE FROM library WHERE id = ?1 AND path = ?2",
-                    params![id, path],
-                )
+        if !missing.is_empty() {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|e| e.to_string())?;
+            // Another window can reopen a restored folder or update a bookmark
+            // in place. Leave a changed database for the next fresh list scan.
+            if data_version(&tx)? == snapshot_version {
+                for (id, path) in missing {
+                    tx.execute(
+                        "DELETE FROM library WHERE id = ?1 AND path = ?2",
+                        params![id, path],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
             }
             tx.commit().map_err(|e| e.to_string())?;
         }

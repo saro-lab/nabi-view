@@ -11,6 +11,8 @@ use std::{
 unsafe extern "C" {
     fn nabi_install_open_documents();
     #[cfg(not(test))]
+    fn nabi_minimize_window();
+    #[cfg(not(test))]
     fn nabi_set_fullscreen(enabled: bool, blackout: bool) -> bool;
     fn nabi_launch_window(bundle: *const c_char, path: *const c_char) -> bool;
     fn nabi_configure_menu();
@@ -249,6 +251,13 @@ mod tests {
         requests.open("late.jpg".into());
         assert!(requests.pending.is_empty());
     }
+}
+
+// egui-winit 0.37 keeps its minimized flag set after a Dock restore.
+// Let AppKit minimize the window and report visibility through occlusion events.
+#[cfg(not(test))]
+pub fn minimize() {
+    unsafe { nabi_minimize_window() };
 }
 
 /// Called only from the native UI thread. Returns the actual fullscreen state.

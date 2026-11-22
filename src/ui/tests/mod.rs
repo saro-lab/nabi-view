@@ -34,6 +34,7 @@ struct TestWindow {
     clipboard_writes: Vec<String>,
     time: f64,
     focused: bool,
+    maximized: bool,
     screen_size: egui::Vec2,
     monitor_size: Option<egui::Vec2>,
     /// Native display scale (e.g. 1.25 for 125% on Windows).
@@ -132,6 +133,7 @@ impl TestWindow {
             clipboard_writes: Vec::new(),
             time: 0.,
             focused: true,
+            maximized: false,
             screen_size: egui::vec2(1080., 760.),
             monitor_size: Some(egui::vec2(1920., 1080.)),
             scale: 1.,
@@ -338,6 +340,7 @@ impl TestWindow {
             ..Default::default()
         };
         let viewport = input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap();
+        viewport.maximized = Some(self.maximized);
         viewport.monitor_size = self.monitor_size;
         viewport.native_pixels_per_point = Some(self.scale);
         // eframe gives the application the native events before egui starts its

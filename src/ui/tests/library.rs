@@ -194,12 +194,7 @@ fn narrow_library_switches_lists_with_tabs_and_edits_bookmarks() {
     window.draw(None);
     assert!(row(&window, "recent", &recent).is_none());
     assert!(row(&window, "bookmark", &marked).is_some());
-    // A missing folder stays listed until the user removes it.
-    let text = window.draw(None).0;
-    assert!(
-        text.contains("Gone") && text.contains(tr("folder-unavailable")),
-        "{text}"
-    );
+    assert!(row(&window, "bookmark", &gone).is_none());
 
     let rename = window
         .ctx
@@ -213,18 +208,18 @@ fn narrow_library_switches_lists_with_tabs_and_edits_bookmarks() {
     window.draw(None);
     let state = store(&window);
     let titles: Vec<_> = bookmarks(&state).iter().map(Entry::title).collect();
-    assert_eq!(titles, ["Gone", "Trips"]);
+    assert_eq!(titles, ["Trips"]);
     assert!(window.draw(None).0.contains("Trips"));
 
     let remove = window
         .ctx
-        .read_response(egui::Id::unique(("bookmark-remove", &gone)))
+        .read_response(egui::Id::unique(("bookmark-remove", &marked)))
         .unwrap();
     window.click(remove.rect.center());
     window.draw(None);
-    assert_eq!(bookmarks(&state).len(), 1);
+    assert!(bookmarks(&state).is_empty());
     assert!(marked.join("1.png").is_file());
-    assert!(row(&window, "bookmark", &gone).is_none());
+    assert!(row(&window, "bookmark", &marked).is_none());
 }
 
 #[test]

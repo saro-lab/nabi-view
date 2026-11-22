@@ -49,6 +49,12 @@ fn mobile_brand_opens_recent_and_bookmarks_with_a_full_touch_target() {
         let photo = window.photo_rects().1;
         let home = window.titlebar_icon("home").rect;
         assert!(home.width() >= 44. && home.height() >= 44.);
+        assert!(
+            window
+                .ctx
+                .read_response(egui::Id::unique(("titlebar", "minimize")))
+                .is_none()
+        );
         // Press the edge of the target, outside the 24px icon itself.
         window.click(home.left_center() + egui::vec2(3., 0.));
         let text = window.draw(None).0;
@@ -162,22 +168,39 @@ fn chrome_tooltips_show_current_native_shortcuts_on_a_smaller_second_line() {
 }
 
 #[test]
-fn close_button_gap_matches_the_brand_icon_gap() {
-    let mut window = TestWindow::sample();
-    window.reveal_controls();
-    window.wait_for("1 / 5");
-    // Narrow windows use smaller buttons; the close button must still hug the edge.
-    for width in [1080., 800., 699., 640., 560.] {
-        window.screen_size.x = width;
-        window.draw(None);
+fn minimize_stays_immediately_left_of_close_in_both_layout_directions() {
+    use crate::i18n::Language;
+
+    for language in [Language::English, Language::Arabic] {
+        let rtl = language.is_rtl();
+        let mut window = TestWindow::sample_with_settings(&Settings {
+            language,
+            ..Default::default()
+        });
         window.reveal_controls();
-        let close = window.titlebar_icon("close").rect;
-        // The X glyph spans 6px either side of the button center.
-        let gap = width - (close.center().x + 6.);
-        assert!(
-            (gap - 14.).abs() <= 1.,
-            "close glyph is {gap}px from the edge at {width}px"
-        );
+        window.wait_for("1 / 5");
+        for width in [1080., 800., 699., 640., 560.] {
+            window.screen_size.x = width;
+            window.draw(None);
+            window.reveal_controls();
+            let minimize = window.titlebar_icon("minimize").rect;
+            let close = window.titlebar_icon("close").rect;
+            let gap = close.left() - minimize.right();
+            assert!(
+                (0. ..minimize.width()).contains(&gap),
+                "{minimize:?}, {close:?}"
+            );
+            assert!(window.ctx.viewport_rect().contains_rect(minimize));
+            assert!(window.ctx.viewport_rect().contains_rect(close));
+            if !rtl {
+                // The X glyph spans 6px either side of the button center.
+                let gap = width - (close.center().x + 6.);
+                assert!(
+                    (gap - 14.).abs() <= 1.,
+                    "close glyph is {gap}px from the edge at {width}px"
+                );
+            }
+        }
     }
 }
 

@@ -934,6 +934,7 @@ fn mobile_source_migration_merges_duplicates_and_keeps_missing_sources() {
     let missing = root.join("old/document-sources/12345678-missing");
     let current_missing = root.join("document-sources/12345678-current");
     let unrelated = root.join("ordinary-folder/nabi-ios-favorites");
+    fs::create_dir_all(&unrelated).unwrap();
     for (id, kind, path, name, page) in [
         (
             10,
@@ -1430,72 +1431,83 @@ fn clear_data_removes_device_state_but_keeps_preferences() {
 }
 
 #[test]
-fn recent_removes_unavailable_paths_from_persisted_history() {
+fn missing_containers_are_removed_from_both_lists_and_stay_removed_after_restart() {
     let root = tempfile::tempdir().unwrap();
     let store = isolated(root.path());
     let folders = ["first", "missing", "replaced", "last"].map(|name| {
-        let path = root.path().join(name);
-        fs::create_dir(&path).unwrap();
-        fs::write(path.join("1.png"), b"image").unwrap();
-        let path = path
-            .canonicalize()
-            .map(crate::core::paths::simplified)
-            .unwrap();
+        let path = image_folder(root.path(), name, &["1.png"]);
         store.record_folder(&path, 10).unwrap();
+        store.add_bookmark(&path.join("1.png"), name).unwrap();
         path
     });
+    let archive = root.path().join("book.zip");
+    let zip = include_bytes!("../core/archive/fixtures/aes.zip");
+    fs::write(&archive, zip).unwrap();
+    store.record_folder(&archive, 10).unwrap();
+    store.add_bookmark(&archive.join("1.png"), "Book").unwrap();
+    fs::remove_file(&archive).unwrap();
     fs::remove_dir_all(&folders[1]).unwrap();
     fs::remove_dir_all(&folders[2]).unwrap();
     fs::write(&folders[2], b"not a folder").unwrap();
 
-    let expected = [folders[3].clone(), folders[0].clone()];
-    assert_eq!(store.recent().unwrap(), expected);
+    let entries = store.library().unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| (e.kind, &e.folder))
+            .collect::<Vec<_>>(),
+        [
+            (Kind::Recent, &folders[3]),
+            (Kind::Recent, &folders[0]),
+            (Kind::Bookmark, &folders[3]),
+            (Kind::Bookmark, &folders[0]),
+        ]
+    );
     assert_eq!(fs::read(&folders[2]).unwrap(), b"not a folder");
 
-    // Restoring access must not resurrect a deleted history record.
+    // Recreating the originals cannot resurrect a removed record.
+    fs::write(&archive, zip).unwrap();
     fs::create_dir(&folders[1]).unwrap();
     fs::remove_file(&folders[2]).unwrap();
     fs::create_dir(&folders[2]).unwrap();
     for path in &folders[1..=2] {
         fs::write(path.join("1.png"), b"image").unwrap();
     }
-    assert_eq!(isolated(root.path()).recent().unwrap(), expected);
+    assert_eq!(isolated(root.path()).library().unwrap(), entries);
 }
 
 #[cfg(unix)]
 #[test]
-fn recent_removes_unreadable_folders_even_when_they_exist() {
+fn inaccessible_sources_keep_both_records_and_recover_after_permission_returns() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = tempfile::tempdir().unwrap();
     let store = isolated(root.path());
-    let folder = root.path().join("unreadable");
-    fs::create_dir(&folder).unwrap();
-    fs::write(folder.join("1.png"), b"image").unwrap();
+    let parent = root.path().join("unreadable");
+    fs::create_dir(&parent).unwrap();
+    let folder = image_folder(&parent, "album", &["1.png", "2.png"]);
     store.record_folder(&folder, 10).unwrap();
-    let permissions = fs::metadata(&folder).unwrap().permissions();
-    fs::set_permissions(&folder, fs::Permissions::from_mode(0o0)).unwrap();
-    let denied = fs::read_dir(&folder).is_err();
-    let recent = store.recent();
-    // Restore permissions before assertions so the fixture can always be removed.
-    fs::set_permissions(&folder, permissions).unwrap();
+    store.remember_page(&folder.join("2.png")).unwrap();
+    store.add_bookmark(&folder.join("1.png"), "Trips").unwrap();
+    store
+        .set_thumbnail(Kind::Bookmark, &folder, &"a".repeat(32))
+        .unwrap();
+    let before = store.library().unwrap();
+    let permissions = fs::metadata(&parent).unwrap().permissions();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o0)).unwrap();
+    let denied = fs::metadata(&folder).is_err();
+    let during = store.library();
+    fs::set_permissions(&parent, permissions).unwrap();
+    let during = during.unwrap();
+    assert_eq!(during.len(), 2);
     if denied {
-        assert!(recent.unwrap().is_empty());
-        assert!(isolated(root.path()).recent().unwrap().is_empty());
-    } else {
-        // Elevated test runners may retain access despite the permission bits.
-        assert_eq!(
-            recent.unwrap(),
-            [folder
-                .canonicalize()
-                .map(crate::core::paths::simplified)
-                .unwrap()]
-        );
+        assert!(during.iter().all(|entry| !entry.available));
     }
+    assert_eq!(isolated(root.path()).library().unwrap(), before);
 }
 
 #[test]
-fn recent_removes_folders_without_images_and_keeps_their_contents() {
+fn recent_keeps_folders_without_images_and_recovers_when_images_return() {
     let root = tempfile::tempdir().unwrap();
     let store = isolated(root.path());
     let folders = ["empty", "notes-only", "nested-only", "images"].map(|name| {
@@ -1512,7 +1524,10 @@ fn recent_removes_folders_without_images_and_keeps_their_contents() {
     fs::write(nested.join("1.png"), b"nested image").unwrap();
     fs::write(folders[3].join("1.PNG"), b"image").unwrap();
 
-    assert_eq!(store.recent().unwrap(), [folders[3].clone()]);
+    let entries = store.library().unwrap();
+    assert_eq!(entries.len(), 4);
+    assert!(entries[0].available);
+    assert!(entries[1..].iter().all(|entry| !entry.available));
     assert!(folders.iter().all(|path| path.is_dir()));
     assert_eq!(
         fs::read(folders[1].join("notes.txt")).unwrap(),
@@ -1520,14 +1535,12 @@ fn recent_removes_folders_without_images_and_keeps_their_contents() {
     );
     assert!(nested.join("1.png").is_file());
 
-    // Adding an image later must not resurrect the removed records.
     for folder in &folders[..3] {
         fs::write(folder.join("2.png"), b"image").unwrap();
     }
-    assert_eq!(
-        isolated(root.path()).recent().unwrap(),
-        [folders[3].clone()]
-    );
+    let restored = isolated(root.path()).library().unwrap();
+    assert_eq!(restored.len(), 4);
+    assert!(restored.iter().all(|entry| entry.available));
 }
 
 #[test]
@@ -1903,14 +1916,16 @@ fn bookmarks_are_folders_with_an_image_title_and_stay_when_unavailable() {
         ]
     );
 
-    // An emptied or missing folder stays bookmarked, unlike a recent folder.
+    // An emptied folder stays in both lists; a missing folder leaves both.
     for image in ["1.png", "2.png"] {
         fs::remove_file(comics.join(image)).unwrap();
     }
     fs::remove_dir_all(&photos).unwrap();
     let entries = store.library().unwrap();
     assert_eq!(entries.len(), 2);
-    assert!(entries.iter().all(|entry| entry.kind == Kind::Bookmark));
+    assert_eq!(entries[0].kind, Kind::Recent);
+    assert_eq!(entries[1].kind, Kind::Bookmark);
+    assert!(entries.iter().all(|entry| entry.folder == comics));
     assert!(
         entries
             .iter()
@@ -1926,12 +1941,12 @@ fn bookmarks_are_folders_with_an_image_title_and_stay_when_unavailable() {
     assert!(comics_entry.available);
     assert_eq!(comics_entry.image, Some(comics.join("3.png")));
 
-    // Clearing recent items or device data keeps bookmarks; removal is explicit.
+    // Clearing recent items or device data keeps existing bookmarks.
     store.clear_recent().unwrap();
     store.clear_data().unwrap();
-    assert_eq!(store.library().unwrap().len(), 2);
-    store.remove_entry(Kind::Bookmark, &photos).unwrap();
     assert_eq!(store.library().unwrap().len(), 1);
+    store.remove_entry(Kind::Bookmark, &comics).unwrap();
+    assert!(store.library().unwrap().is_empty());
 }
 
 #[test]
@@ -2048,8 +2063,8 @@ fn mouse_gestures_default_for_old_files_and_repair_unknown_values_per_gesture() 
         (
             "zoom",
             "none",
-            "menu",
             "recent",
+            "menu",
             "fullscreen",
             "prev",
             "next",

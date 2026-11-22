@@ -61,7 +61,7 @@ fn safe_relative(path: &Path) -> bool {
 
 /// Identifies an app-owned source without treating its marker as an OS grant.
 /// The host must additionally check that this root belongs to its current data directory.
-#[cfg(any(target_os = "ios", test))]
+#[cfg(any(target_os = "ios", target_os = "android", test))]
 pub(crate) fn source_identity(path: &Path) -> Option<(PathBuf, String)> {
     if !path.is_absolute()
         || path

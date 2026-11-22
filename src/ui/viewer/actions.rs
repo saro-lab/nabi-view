@@ -106,7 +106,12 @@ impl Viewer {
                     Err(error) => self.last_error = error,
                 }
             }
-            "minimize" => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+            "minimize" => {
+                #[cfg(all(target_os = "macos", not(test)))]
+                crate::platform::mac_open::minimize();
+                #[cfg(any(not(target_os = "macos"), test))]
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
             "maximize" => {
                 if self.fullscreen {
                     return;

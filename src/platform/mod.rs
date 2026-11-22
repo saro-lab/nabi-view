@@ -10,6 +10,7 @@ pub(crate) mod document_cache;
 pub(crate) mod fonts;
 #[cfg(target_os = "ios")]
 mod ios_photo_cache;
+pub(crate) mod library_path;
 pub(crate) mod locale;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac_access;

@@ -73,26 +73,36 @@ impl Viewer {
             .fixed_pos(screen.left_top())
             .movable(false)
             .show(ctx, |ui| {
-                if !mobile {
-                    chrome_drag(
+                if !mobile
+                    && !self.fullscreen
+                    && let Some(bar) = chrome_drag_target(
                         ui,
                         Rect::from_min_size(
                             screen.left_top(),
                             egui::vec2(screen.width(), TOP_BAR_HEIGHT),
                         ),
-                    );
+                    )
+                {
+                    if bar.double_clicked() {
+                        self.run("maximize", ctx);
+                    } else if bar.dragged_by(egui::PointerButton::Primary) {
+                        window_frame::drag(ctx, &bar);
+                    }
                 }
                 ui.style_mut().interaction.selectable_labels = false;
-                // The close glyph sits inside a 28-32px button, so a smaller trailing
-                // margin keeps its visible gap equal to the brand icon's 14px.
-                // The X spans 12px of its button: leave 14px beside the glyph itself.
-                let trail = (14. - (chrome_icons::size(ui) - 12.) / 2.).round() as i8;
+                let rtl = crate::i18n::is_rtl();
+                let mut window_buttons = [("minimize", "minimize"), ("close", "close-window")];
+                if rtl {
+                    window_buttons.reverse(); // Keep minimize physically left of close.
+                }
+                let window_buttons = window_buttons
+                    .into_iter()
+                    .filter(|(_, id)| command_supported(id));
+                // Match the outer glyph's visible margin to the brand icon's 14pt.
+                let outer_glyph = if rtl { 16. } else { 12. };
+                let trail = (14. - (chrome_icons::size(ui) - outer_glyph) / 2.).round() as i8;
                 let (lead, trail): (i8, i8) = if mobile { (14, 14) } else { (14, trail) };
-                let (left, right) = if crate::i18n::is_rtl() {
-                    (trail, lead)
-                } else {
-                    (lead, trail)
-                };
+                let (left, right) = if rtl { (trail, lead) } else { (lead, trail) };
                 let margin = egui::Margin {
                     left,
                     right,
@@ -124,12 +134,10 @@ impl Viewer {
                                         Color32::WHITE,
                                     );
                                 }
-                                // Reserve exactly the trailing buttons (pin, menu, settings,
-                                // plus orientation and/or close), which shrink on narrow
-                                // windows, so the last one stays on the right edge.
+                                // Reserve trailing controls before truncating the filename.
                                 let count = 3
                                     + usize::from(self.orientation_available())
-                                    + usize::from(command_supported("close-window"));
+                                    + window_buttons.clone().count();
                                 let buttons = count as f32
                                     * (chrome_icons::size(ui) + ui.spacing().item_spacing.x);
                                 let title_width = (ui.available_width() - buttons).max(20.);
@@ -162,30 +170,18 @@ impl Viewer {
                                                 .truncate()
                                                 .sense(if limited {
                                                     egui::Sense::click()
-                                                } else if mobile {
-                                                    egui::Sense::hover()
                                                 } else {
-                                                    egui::Sense::click_and_drag()
+                                                    egui::Sense::hover()
                                                 }),
                                             )
                                         },
                                     )
-                                    .inner
-                                    .hover_text(&filename);
+                                    .inner;
                                 #[cfg(target_os = "ios")]
                                 if limited && title.clicked() {
                                     self.show_ios_photo_access();
                                 }
-                                if !mobile {
-                                    if !self.fullscreen
-                                        && title.drag_started_by(egui::PointerButton::Primary)
-                                    {
-                                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                                    }
-                                    if title.double_clicked() {
-                                        self.run("maximize", ctx);
-                                    }
-                                }
+                                title.hover_text(&filename);
 
                                 if self.orientation_available()
                                     && chrome_icons::button_with_shortcut(
@@ -238,17 +234,18 @@ impl Viewer {
                                 {
                                     self.run("settings", ctx);
                                 }
-                                if command_supported("close-window")
-                                    && chrome_icons::button_with_shortcut(
+                                for (icon, command) in window_buttons {
+                                    if chrome_icons::button_with_shortcut(
                                         ui,
-                                        "close",
-                                        "close-window",
+                                        icon,
+                                        command,
                                         false,
-                                        &self.shortcut_text("close-window"),
+                                        &self.shortcut_text(command),
                                     )
                                     .clicked()
-                                {
-                                    self.run("close-window", ctx);
+                                    {
+                                        self.run(command, ctx);
+                                    }
                                 }
                             },
                         );
